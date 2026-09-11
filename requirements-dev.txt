@@ -1,0 +1,4 @@
+# Development-only dependencies. Not needed to run TK-Boost.
+#   pip install -r requirements-dev.txt
+
+pytest>=8.0

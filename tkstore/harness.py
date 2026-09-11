@@ -13,6 +13,7 @@ from . import config
 import csv
 from src.executors.factory import make_executor
 from src.utils.agent_utils import infer_engine, load_external_knowledge
+from src.utils.db_paths import DbPathNotFound, get_database_path
 
 
 def load_snowflake_schema_context(db_name: str) -> Optional[str]:
@@ -1064,6 +1065,34 @@ def generate_rules_from_diff(
     return out.strip() if out else None
 
 
+def _resolve_db_path_or_cred(
+    instance_id: str,
+    db_id: Optional[str],
+    engine: str,
+    *,
+    db_root: Optional[str] = None,
+    repo_root: Optional[str] = None,
+) -> Optional[str]:
+    """Database path (SQLite) or credential file (BigQuery / Snowflake) for an instance.
+
+    SQLite resolution is delegated to `src.utils.db_paths` so the harness shares
+    one implementation with the agent runner and the CTE refiner.
+    """
+    if engine == "sqlite":
+        try:
+            return get_database_path(
+                instance_id, db_id, db_root=db_root, repo_root=repo_root
+            )
+        except DbPathNotFound as exc:
+            print(f"⚠️  {exc}")
+            return None
+    if engine == "snowflake":
+        return "src/executors/snowflake_credential.json"
+    if engine in ("bq", "bigquery"):
+        return "src/executors/bigquery_credential.json"
+    return None
+
+
 def run_diff_for_instance(instance_id: str, outputs_dir: str, jsonl_path: Optional[str] = None, db_path: Optional[str] = None, max_turns: int = 6, model: str = "azure/o4-mini", debug: bool = False, hint: Optional[str] = None, sim_gate: bool = False) -> None:
     """
     Helper main to run interactive diff/repair for an instance using files under outputs_dir.
@@ -1170,9 +1199,8 @@ def run_diff_for_instance(instance_id: str, outputs_dir: str, jsonl_path: Option
     engine = infer_engine(instance_id)
     db_path_or_cred = db_path  # Use provided db_path if available
     
-    # If no explicit db_path provided, try to derive from jsonl using configured base_folder
+    # If no explicit db_path provided, look up the instance's db in the jsonl.
     jsonl_to_use = jsonl_path or config.JSONL_DEFAULT
-    data_base_folder = config.DATA_BASE_FOLDER
     if not db_path_or_cred and jsonl_to_use and Path(jsonl_to_use).exists():
         with open(jsonl_to_use, 'r', encoding='utf-8') as f:
             for line in f:
@@ -1183,32 +1211,8 @@ def run_diff_for_instance(instance_id: str, outputs_dir: str, jsonl_path: Option
                 if iid and str(iid) == str(instance_id):
                     db_id = obj.get('db') or obj.get('database') or obj.get('db_id') or obj.get('database_id')
                     
-                    # Resolve db_path_or_cred based on engine type
-                    if engine == "sqlite" and db_id:
-                        # Check minidev path first (if instance_id starts with "minidev")
-                        if instance_id.lower().startswith("minidev"):
-                            # Minidev databases are at: data/minidev/MINIDEV/dev_databases/{db_id}/{db_id}.sqlite
-                            project_root = Path(__file__).resolve().parent.parent
-                            minidev_path = project_root / "data" / "minidev" / "MINIDEV" / "dev_databases" / db_id / f"{db_id}.sqlite"
-                            if minidev_path.exists():
-                                db_path_or_cred = str(minidev_path)
-                            else:
-                                print(f"⚠️  Warning: Minidev database not found at {minidev_path}")
-                        # Fallback to standard spider2 path
-                        elif data_base_folder:
-                            example_folder = os.path.join(data_base_folder, str(instance_id))
-                            if os.path.isdir(example_folder):
-                                for file in os.listdir(example_folder):
-                                    if file.endswith('.sqlite'):
-                                        db_path_or_cred = os.path.join(example_folder, file)
-                                        break
-                    elif engine == "snowflake":
-                        # Snowflake uses credential path (default provided by make_executor)
-                        db_path_or_cred = "src/executors/snowflake_credential.json"
-                    elif engine == "bq" or engine == "bigquery":
-                        # BigQuery uses credential path (default provided by make_executor)
-                        db_path_or_cred = "src/executors/bigquery_credential.json"
-                    
+                    db_path_or_cred = _resolve_db_path_or_cred(instance_id, db_id, engine)
+
                     # stop after first matching instance entry
                     break
 

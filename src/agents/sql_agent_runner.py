@@ -593,10 +593,6 @@ def load_instances_from_jsonl(jsonl_path: str) -> List[Instance]:
     return instances
 
 
-def resolve_db_path_for_sqlite(instance_id: str, db: str) -> Optional[str]:
-    return resolve_sqlite_db_path(instance_id, db)
-
-
 def run_refinement_on_existing_outputs(args):
     """Run refinement on existing output directories, loading execution_query.sql instead of regenerating.
     
@@ -717,13 +713,13 @@ def run_refinement_on_existing_outputs(args):
         engine = infer_engine(instance_id)
         db_path_or_cred = None
         if engine == "sqlite":
-            db_path_or_cred = resolve_db_path_for_sqlite(instance_id, inst.db)
+            db_path_or_cred = resolve_sqlite_db_path(instance_id, inst.db)
             if not db_path_or_cred:
                 print(f"❌ Could not resolve SQLite DB for {instance_id}")
                 failed_count += 1
                 continue
         
-        # Run refinement with reduced max_turns
+        # Run refinement
         try:
             # Convert --tribalknowledge-all-scopes flag to tribalknowledge_generic_only parameter
             tribalknowledge_generic_only = not getattr(args, 'tribalknowledge_all_scopes', False)
@@ -915,7 +911,7 @@ def main():
         engine = infer_engine(inst.instance_id)
         db_path_or_cred = None
         if engine == "sqlite":
-            db_path_or_cred = resolve_db_path_for_sqlite(inst.instance_id, inst.db)
+            db_path_or_cred = resolve_sqlite_db_path(inst.instance_id, inst.db)
             if not db_path_or_cred:
                 print(f"❌ Could not resolve SQLite DB for {inst.instance_id}")
                 continue

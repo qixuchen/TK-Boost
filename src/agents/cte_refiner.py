@@ -14,6 +14,8 @@ import sqlite3
 from pathlib import Path
 import litellm
 
+from src.utils.db_paths import get_database_path
+
 
 # --- Provider/Env ---
 AZURE_TO_OPENAI_MODEL = {
@@ -58,34 +60,6 @@ class TraceLogger:
         if self.output_path and self.sections:
             with open(self.output_path, 'w') as f:
                 f.write('\n'.join(self.sections))
-
-
-def get_database_path(instance_id: str, db_id: str) -> str:
-    # Check mini_dev path first (if instance_id starts with "minidev")
-    if instance_id.lower().startswith("minidev"):
-        # Mini-dev databases are at: data/minidev/MINIDEV/dev_databases/{db_id}/{db_id}.sqlite
-        # Try relative path first (from project root)
-        minidev_path = os.path.join("data", "minidev", "MINIDEV", "dev_databases", db_id, f"{db_id}.sqlite")
-        if os.path.exists(minidev_path):
-            return os.path.abspath(minidev_path)
-        # If relative doesn't work, try absolute (should be same, but checking for safety)
-        abs_path = os.path.abspath(minidev_path)
-        if os.path.exists(abs_path):
-            return abs_path
-        raise FileNotFoundError(f"Mini-dev database not found: {minidev_path} (resolved: {abs_path})")
-    
-    # Original logic for other instances - use relative path
-    base_folder = "data/spider2"
-    example_folder = os.path.join(base_folder, instance_id)
-    if os.path.isdir(example_folder):
-        for file in os.listdir(example_folder):
-            if file.endswith(".sqlite"):
-                return os.path.join(example_folder, file)
-        raise FileNotFoundError(f"No .sqlite file found in {example_folder}")
-    fallback_path = f"{db_id}.sqlite"
-    if os.path.exists(fallback_path):
-        return fallback_path
-    raise FileNotFoundError(f"Database folder not found: {example_folder} and fallback {fallback_path} not found.")
 
 
 def _extract_message_obj(resp):
