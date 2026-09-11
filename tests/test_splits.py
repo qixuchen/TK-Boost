@@ -1,12 +1,21 @@
 """Train/test split construction and loading.
 
-The paper (Table 11) gives only the split sizes, not the instance ids, so the
-split is generated locally and must be reproducible from a recorded seed.
+The paper (Table 11) gives only the split sizes, not the instance ids. The active
+split is not random: Spider2-lite publishes gold SQL for only 24 of the 135 SQLite
+instances, and Algorithm 3 needs it, so the instances that have gold SQL become
+train and the rest become test. ``make_split`` remains for the seeded random case.
 """
 
 import pytest
 
-from src.utils.splits import load_split, make_split, write_split
+from src.utils.splits import (
+    load_split,
+    load_store_instance_ids,
+    make_split,
+    partition_by_gold_sql,
+    uncontaminated_subset,
+    write_split,
+)
 
 IDS = [f"local{i:03d}" for i in range(1, 21)]
 
@@ -107,3 +116,135 @@ class TestSplitFileRoundTrip:
     def test_load_missing_file_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             load_split(tmp_path / "absent.txt")
+
+
+def _write_gold_sql(gold_dir, instance_ids):
+    gold_dir.mkdir(parents=True, exist_ok=True)
+    for instance_id in instance_ids:
+        (gold_dir / f"{instance_id}.sql").write_text("SELECT 1;\n", encoding="utf-8")
+    return gold_dir
+
+
+def _write_store(path, instance_ids):
+    """A minimal TK-Store CSV carrying the ten canonical columns."""
+    header = "mem_id,instance_id,db,scope,sql_operations,table,column,data_type,nulls,rule\n"
+    rows = "".join(
+        f"{n},{instance_id},somedb,generic,select,all,all,all,all,a rule\n"
+        for n, instance_id in enumerate(instance_ids)
+    )
+    path.write_text(header + rows, encoding="utf-8")
+    return path
+
+
+class TestPartitionByGoldSql:
+    """Train needs gold SQL for Algorithm 3's ``s*``; test only needs gold results."""
+
+    def test_train_is_exactly_the_ids_with_gold_sql(self, tmp_path):
+        gold = _write_gold_sql(tmp_path / "sql", ["local002", "local004"])
+
+        train, test = partition_by_gold_sql(["local001", "local002", "local003", "local004"], gold)
+
+        assert train == ["local002", "local004"]
+        assert test == ["local001", "local003"]
+
+    def test_partition_is_disjoint_and_total(self, tmp_path):
+        gold = _write_gold_sql(tmp_path / "sql", ["local002"])
+        ids = ["local001", "local002", "local003"]
+
+        train, test = partition_by_gold_sql(ids, gold)
+
+        assert set(train).isdisjoint(test)
+        assert set(train) | set(test) == set(ids)
+
+    def test_outputs_are_sorted_regardless_of_input_order(self, tmp_path):
+        gold = _write_gold_sql(tmp_path / "sql", ["local003", "local001"])
+
+        train, test = partition_by_gold_sql(["local004", "local001", "local003", "local002"], gold)
+
+        assert train == ["local001", "local003"]
+        assert test == ["local002", "local004"]
+
+    def test_empty_gold_directory_puts_everything_in_test(self, tmp_path):
+        gold = _write_gold_sql(tmp_path / "sql", [])
+
+        train, test = partition_by_gold_sql(["local001", "local002"], gold)
+
+        assert train == []
+        assert test == ["local001", "local002"]
+
+    def test_unrelated_gold_files_are_ignored(self, tmp_path):
+        """The directory also holds bq/sf gold SQL, which must not join the split."""
+        gold = _write_gold_sql(tmp_path / "sql", ["local002", "bq123", "sf_bq456"])
+
+        train, test = partition_by_gold_sql(["local001", "local002"], gold)
+
+        assert train == ["local002"]
+        assert test == ["local001"]
+
+    def test_missing_gold_directory_raises(self, tmp_path):
+        """A typo'd path must not silently yield an empty train set."""
+        with pytest.raises(FileNotFoundError):
+            partition_by_gold_sql(["local001"], tmp_path / "absent")
+
+    def test_duplicate_ids_rejected(self, tmp_path):
+        gold = _write_gold_sql(tmp_path / "sql", [])
+
+        with pytest.raises(ValueError):
+            partition_by_gold_sql(["local001", "local001"], gold)
+
+    def test_empty_population_rejected(self, tmp_path):
+        gold = _write_gold_sql(tmp_path / "sql", [])
+
+        with pytest.raises(ValueError):
+            partition_by_gold_sql([], gold)
+
+
+class TestLoadStoreInstanceIds:
+    """The reference store's instance ids are what test must avoid."""
+
+    def test_returns_distinct_sorted_ids(self, tmp_path):
+        store = _write_store(tmp_path / "s.csv", ["local007", "local002", "local007"])
+
+        assert load_store_instance_ids(store) == ["local002", "local007"]
+
+    def test_blank_instance_ids_are_skipped(self, tmp_path):
+        store = tmp_path / "s.csv"
+        _write_store(store, ["local002"])
+        with store.open("a", encoding="utf-8") as f:
+            f.write("9,,somedb,generic,select,all,all,all,all,a rule\n")
+
+        assert load_store_instance_ids(store) == ["local002"]
+
+    def test_missing_store_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            load_store_instance_ids(tmp_path / "absent.csv")
+
+    def test_store_without_instance_id_column_raises(self, tmp_path):
+        store = tmp_path / "s.csv"
+        store.write_text("mem_id,rule\n0,a rule\n", encoding="utf-8")
+
+        with pytest.raises(ValueError):
+            load_store_instance_ids(store)
+
+
+class TestUncontaminatedSubset:
+    """Evaluating the reference store is only honest away from its own training ids."""
+
+    def test_drops_ids_the_reference_store_trained_on(self):
+        subset = uncontaminated_subset(["local001", "local002", "local003"], ["local002"])
+
+        assert subset == ["local001", "local003"]
+
+    def test_reference_ids_absent_from_test_are_harmless(self):
+        subset = uncontaminated_subset(["local001"], ["local999"])
+
+        assert subset == ["local001"]
+
+    def test_result_is_sorted(self):
+        subset = uncontaminated_subset(["local003", "local001"], [])
+
+        assert subset == ["local001", "local003"]
+
+    def test_duplicate_test_ids_rejected(self):
+        with pytest.raises(ValueError):
+            uncontaminated_subset(["local001", "local001"], [])

@@ -251,9 +251,17 @@ python scripts/make_splits.py --seed 0 --train-size 34
 因为阶段 2.3 的 populate CLI 和阶段 4 的 runner 都要读划分文件，
 `load_split` 属于代码库而不只是脚本。
 
+> **本节的 seed=0 随机划分已被 2.0 取代。** 后来发现上游随仓库发布的
+> `tkstore/tkstore_sqlite.csv` 泄露了论文的 train 集（32 个 `instance_id`，
+> 对应 Table 13 的 `n=34`），采用它比随机划分离论文近得多。下面关于随机划分的
+> 记录保留备查，`data/splits/` 的两个文件会按 2.0 重新生成，
+> `scripts/make_splits.py` 要增加"从 store 复原 train 集"的模式。
+> 本节里 `src/utils/splits.py` 的纯函数（`make_split` / `write_split` / `load_split`）
+> 仍然有用，`load_split` 是阶段 2.3 和阶段 4 的依赖。
+
 **注意两点**，都要写进最终报告：
 
-- 论文只给了数量，**没给实例 ID 列表**，所以我们复现不了它的确切划分。
+- 论文正文只给了数量，没给实例 ID 列表。**但 train 集可从上游 store 复原**，见 2.0。
 - 不做按库分层，因为论文没提，分层会引入新的不可比性。
 
 **db 覆盖率比预期好得多。** 实际生成后测得：21/30 个库至少有一个 train 实例，
@@ -299,14 +307,66 @@ python scripts/make_splits.py --seed 0 --train-size 34
 
 # 阶段 2 — Populate（Alg 2 / Alg 3）
 
+## 2.0 路线：双轨制（因 gold SQL 不可得）
+
+这一节是阶段 2/3 的总纲，先读它再读后面的分节。
+
+公开的 spider2-lite 只发布 24/135 个 local 实例的 gold SQL（详见 deviations 的
+"gold SQL 可得性约束"），而论文 Alg 3 的 `MakeCorrection(q,D,s,s★,R,R★)` 需要 `s★`。
+论文作者用了非公开的 gold SQL：从上游 store 复原的 32 个 train 实例里只有 7 个有公开 gold SQL。
+所以我们**无法在全部 train 实例上复现忠实的 Alg 3**。
+
+对策是把"复现论文结果"和"验证我们的 populate 实现"拆成两条独立的轨道：
+
+| | 轨道 B：我们自己的实现（主）| 轨道 A：上游 store（参照）|
+| --- | --- | --- |
+| 目的 | 端到端复现整套方法并测准确率提升 | 提供论文真实知识的参照点 |
+| TK-Store 来源 | 我们 populate 产出的 `artifacts/tkstore_sqlite.csv` | **上游 `tkstore/tkstore_sqlite.csv`**（已验证是 Spider2 真实产物，只读）|
+| 覆盖实例 | 24 个 train 实例，**全部有 gold SQL，可走忠实 Alg 3** | 论文 32 个 train 实例学到的 118 条规则 |
+| 评测范围 | 全部 **111** 个 test | 仅 **86** 个未污染子集 |
+| 成功标准 | test 上 augmented 显著优于 baseline | 与轨道 B 在同一 86 子集上的对照 |
+
+轨道 B 是主轨：24 个 train 实例全有 gold SQL，所以整条 Alg 2/3 链路都能忠实跑通，
+产出的 store 是我们自己的端到端成果。轨道 A 提供一个"论文真实知识能做到多少"的参照。
+
+**额外的实现保真度证据**：那 7 个既在我们 train 又被上游 store 训练过的实例
+（`local004`、`local039`、`local075`、`local099`、`local163`、`local197`、`local301`），
+可以把我们产出的规则与上游同 `instance_id` 的行并排对比。这个对比是 populate 质量检查，
+不涉及评测，所以不受子集问题影响。不要求逐字相同（两次 LLM 调用不可能一致），
+要求 `scope` 分类一致、`sql_operations` 有实质重叠、规则指向同一类错误。
+写进 `artifacts/populate_comparison.md`。
+
+**划分按 gold SQL 可得性决定**（已实施）：有 gold SQL 的 24 个当 train，其余 111 个当 test。
+理由是 Alg 3 需要 `s★`，而 gold 结果 135/135 齐全所以评测不受影响。
+
+这条规则的收益是轨道 B 大幅升级：train 的 24 个**全部**有 gold SQL，
+所以我们自己的 populate 能在每一个 train 实例上跑完整忠实的 Alg 3，
+而不是只在 7 个上验证。我们的 store 因此成为正当的主产物。
+
+代价是与上游 store 有交叉污染：它训练过的 32 个实例里 7 个落在我们 train、
+25 个落在我们 test。所以额外生成第三个文件
+`data/splits/spider2_sqlite_test_no_reference_leak.txt`（86 个），
+**上游 store 只在这个子集上评测**，我们自己的 store 在全部 111 个上评测。
+报告里必须声明两者的评测范围不同，不能直接比绝对数值。
+
+**轨道 B 的对比方法**：对那 7 个实例，把我们产出的规则与上游 store 里**同 `instance_id`** 的行
+并排放。不要求逐字相同（两次 LLM 调用不可能一致），要求的是：`scope` 分类一致、
+`sql_operations` 有实质重叠、规则指向的是同一类错误。这份对比写进
+`artifacts/populate_comparison.md`，是实现保真度的唯一证据。
+
 ## 2.1 生成 train 集 agent 输出
 
 **用途**：produce 论文经验元组 `e = (q, τ, s*)` 里的 `τ`（agent 执行轨迹）和 agent SQL。
 populate 是从**真实 agent 的错误**里学规则，所以这一步不能跳过、也不能用 LLM 造假 draft 替代。
 
-**输入**：`data/splits/spider2_sqlite_train.txt`（34 个实例）。
+**输入**：`data/splits/spider2_sqlite_train.txt`（24 个实例，全部有 gold SQL，见 2.0）。
 
-**输出**：34 个实例目录，每个含
+注意 Alg 3 第 1 行是 `s ← incorrect SQL in τ` —— **populate 只能从 agent 做错的实例里学**。
+agent 做对的实例没有 correction 可提取，不产出规则。按 batch_5 观察到的约 25% 正确率，
+24 个 train 实例大约有 18 个能进入 populate。这也解释了上游 store 为什么是 32 个实例
+而论文 Table 13 说 `n=34`：少数实例产出 0 条规则。
+
+**输出**：每个实例一个目录，含
 
 ```
 execution_query.sql      # agent 最终 SQL
@@ -319,17 +379,35 @@ gt_result.csv            # gold 执行结果
 **命令**（现有 CLI，无需改动）：
 
 ```bash
+set -a; source .env; set +a
+
 python -m src.agents.sql_agent_runner \
-  --run-all-from-file data/splits/spider2_sqlite_train.txt \
   --jsonl-path data/spider2-lite.jsonl \
+  $(grep -v '^#' data/splits/spider2_sqlite_train.txt | sed 's/^/--instance-id /') \
   --out-base outputs/train \
+  --model azure/gpt-4.1 \
   --verbose
 ```
+
+三个容易踩的点：
+
+`--run-all-from-file` 是 `store_true` 开关，**不接路径**（`sql_agent_runner.py:834` 无条件读
+整个 `--jsonl-path`）。能限定实例的只有可重复的 `--instance-id`，所以要把划分文件展开。
+
+`set -a` 不能省。`.env` 里 `SPIDER2_DB_ROOT` 那行没有 `export` 前缀，光 `source .env`
+只会变成 shell 局部变量，传不进子进程。
+
+`--model` 必须显式给。runner 不读 `.env` 的 `TKBOOST_MODEL`（那个只被 `tkboost.init()` 读），
+它的默认值是 `azure/gpt-4.1`，经 `AZURE_TO_OPENAI_MODEL` 映射成 `gpt-4.1`。三处默认值不一致，
+写出来避免歧义。
 
 注意**不加** `--refine-cte`。这一步要的是 agent 未经修正的原始产物，
 带 refine 的输出属于阶段 3。
 
-**验收**：34 个目录都有非空 `execution_query.sql` 和 `processed_trace.txt`。
+**断点续跑是现成的**：`has_completed_output` 会跳过 `--out-base` 下已有非空
+`execution_query.sql` 的实例，中断后重跑同一条命令不会重复花钱。
+
+**验收**：每个目录都有非空 `execution_query.sql` 和 `processed_trace.txt`。
 `execution_result.csv` 允许为空（agent SQL 执行失败也是有效的学习素材，
 恰好是 correction 信号最强的样本）。
 
@@ -375,14 +453,35 @@ gold SQL 走 `gold_sql_dir` 而不是输出目录，是因为 runner **不保证
 实测 5 个输出目录里 2 个（`local002`、`local007`）既没有 `gt_query.sql` 也没有
 `{instance_id}.sql`（C8）。权威来源是 `evaluation/gold/sql/`，那里有 256 个文件。
 
-**处理流程**（三个 LLM 阶段直接复用现有函数，它们本身没问题）：
+**已确定的设计决策**：
+
+| 项 | 决定 | 理由 |
+| --- | --- | --- |
+| `db_name` | **必须显式传 jsonl 的 `db` 字段**，不能沿用现有入口的 `None` | 见 deviations A7。不传就等于所有行 `db="all"`，库专属规则退化成全局规则，且阶段 3 验收会假通过 |
+| `clean_summary` 行 | **不写进 TK-Store** | 两条检索路径都显式跳过 `scope='question'` 和 `sql_operations='NA'`，是永远召回不到的死行；上游参考库里这类行也是 0 条。实现上不用改 `_persist_via_tkstore`——它写这行有 `if clean_summary:` 守卫，传 `""` 即可跳过，同时真实的 clean_summary 照常喂给 tagger |
+| 重跑语义 | **全量运行前清空 store 重建** | `TKStore.insert` 不去重，追加会产生重复规则并放大阶段 3 的召回 |
+| agent SQL 执行失败的实例 | **从 `messages.json` / `processed_trace.txt` 提取真实报错**喂给 diff | 实测 `local007` 的 `execution_result.csv` 是 0 字节。只传空字符串的话 LLM 分不清是语法错还是空结果集，而这类样本恰好 correction 信号最强 |
+| 模型 | 与 agent 同一个模型，默认取 `.env` 的 `TKBOOST_MODEL` | 现状三处默认值不一致：runner 的 `--model` 是 `azure/gpt-4.1`，populate 相关 helper 是 `azure/o4-mini`，`.env` 另有 `TKBOOST_MODEL`。读 `.env` 可复用 `src/utils/db_paths.py` 里已有的 `_read_dotenv_value` |
+| 文本解析 helper | 直接从 `builder.py` 导入 `_extract_clean_summary` 和 `_extract_memories_from_rules` | 零改动、零风险；不动 `run_diff_for_instance` 里那份内联副本 |
+
+**处理流程**（LLM 阶段直接复用现有函数，它们本身没问题）：
+
+实际是 6 步，不是 4 步 —— 中间两步纯文本解析容易漏，但少了它们 tagger 拿不到必填入参：
 
 ```
-1. generate_memory_diff_first_turn   tkstore/harness.py:54     → diff 文本   [Alg 3]
+0. format_csv_as_table + _is_csv_like   harness.py:1137-1164  → 把结果 CSV 转 markdown 表
+     并让 SQL_ERROR: 前缀的内容原样透传，不要跳过这层
+1. generate_memory_diff_first_turn      harness.py:55         → diff 文本   [Alg 3]
      传入 processed_trace_text=<τ>，这是与 builder 路径的关键区别
-2. generate_rules_from_diff          tkstore/harness.py:967    → 规则文本
-3. generate_tagged_memories_json     tagger_index.py:31        → 结构化 JSON  [GenTKRow]
-4. _persist_via_tkstore              tkstore/builder.py:19     → 写库        [TK-Store.insert]
+2. generate_rules_from_diff             harness.py:968        → 规则文本
+     注意 tkstore/rules.py 只是个单行 re-export shim，实现只有 harness 这一份
+3. _extract_clean_summary(diff)         builder.py:160        → clean_summary
+4. _extract_memories_from_rules(rules)  builder.py:165        → database/generic memories
+     ↑ 这两步是 tagger 的必填入参 database_memories / generic_memories 的唯一来源
+5. generate_tagged_memories_json        tagger_index.py:31    → 结构化 JSON  [GenTKRow]
+     必须传 db_name=<jsonl 的 db>，见上表
+6. _persist_via_tkstore                 builder.py:19         → 写库        [TK-Store.insert]
+     传 clean_summary="" 以跳过那条不可检索的 question 行
 ```
 
 第 4 步是关键替换。**不用** `run_diff_for_instance` 内嵌的 `_append_memories_index`，
@@ -416,19 +515,25 @@ gold SQL 走 `gold_sql_dir` 而不是输出目录，是因为 runner **不保证
 artifacts/tkstore_sqlite.csv      # 本轮 Spider2-SQLite 的 TK-Store
 ```
 
-首次写入时 `artifacts/` 不存在，`populate_from_output_dir` 需要自己 `mkdir -p`。
-文件不存在时按 `TKStore.HEADER` 写表头，这条路径由 `TKStore.insert` 天然覆盖。
+**不需要**自己 `mkdir -p`：`TKStore._ensure_well_formed` 已经做了
+`p.parent.mkdir(parents=True, exist_ok=True)`，文件不存在时自动写 10 列表头，
+列数不匹配时抛 `ValueError`。
 
-即便如此，A3（写库路径固定为 BQ store）仍然要修 —— 缺省行为必须按 engine 正确分流，
-不能依赖调用方每次都记得传 `--store`。
+A3 在新入口是**天然规避**的，不需要额外工作：`_default_index_for_engine('sqlite')` 返回的
+就是 `TKSTORE_SQLITE_PATH`，本身是对的。A3 的病灶是 `tkstore/config.py:26` 的
+`MEMORY_INDEX_PATH = TKSTORE_BQ_PATH`，只有走 `_append_memories_index` / `add_memory`
+的老路径才会中招。新入口的唯一要求是**不要碰 `config.MEMORY_INDEX_PATH`**。
 
 **验收**：
 
-1. 拿一个 train 实例跑通，`TKStore(store).rows()` 能正常读出（不抛 `_ensure_well_formed`）
-2. 新增行的 `db` 列不为空
+1. 新增行的 `db` 列等于该实例 jsonl 里的 `db`，**不是 `all`**（这是 A7 的直接验收；
+   原先写的"`TKStore(store).rows()` 不抛异常"在新入口下恒真，没有区分力，已废弃）
+2. store 是 10 列，`scope` 只出现 `db` 和 `generic`，`scope='question'` 的行数为 **0**
 3. 规则进 `artifacts/tkstore_sqlite.csv`；上游的 `tkstore/tkstore_*.csv` 四个文件
    `git status` 里保持干净，一个字节都没动
-4. `MemoryRetriever(store).retrieve(sql, generic_only=False, db=<db>)` 能召回到 db 专属规则
+4. `MemoryRetriever(store).retrieve(sql, generic_only=False, db=<db>)` 能召回到 db 专属规则，
+   且换一个**不相干的 `db=` 值时召回不到**这些 db 专属行 —— 只做前半段的话，
+   `db="all"` 的退化情形会假通过
 
 ## 2.3 批量 populate CLI
 
@@ -456,6 +561,16 @@ python -m tkstore.populate \
 ---
 
 # 阶段 3 — Retrieve + Augment（Alg 4 / Alg 5）
+
+**本轮的 store 输入是上游的 `tkstore/tkstore_sqlite.csv`**，不是我们 populate 的产物，
+理由见 2.0 的双轨制。这个文件只读不写，`git status` 里必须保持干净。
+
+它是可以直接用的：列与 `TKStore.HEADER` 逐字节相同，`TKStore(path).rows()` 能读出 118 行；
+66 条 `scope='db'` 行里 63 条的 `db` 值与 jsonl 的 `db` 字段一致，所以检索时传
+`db=<jsonl 的 db>` 能正常命中库专属规则。
+
+**前提**：它只能在 `data/splits/spider2_sqlite_test_no_reference_leak.txt`（86 个）上评测，
+因为它训练过的 32 个实例里有 25 个落在我们的 test 里。我们自己的 store 走全部 111 个。
 
 ## 3.1 把检索接进 agent workflow
 
