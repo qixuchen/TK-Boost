@@ -140,10 +140,34 @@ Table 11 只给了数量（34 / 101），没给实例 ID 列表。所以我们�
 | C2 | 用动态 exec + 相对路径加载模块 | `src/utils/db_paths.py:11` 的 `spec_from_file_location("cte_refiner", "src/agents/cte_refiner.py")` | 相对路径意味着 cwd 必须是仓库根目录；而且每解析一次库路径就 `exec_module` 重跑整个 `cte_refiner.py` |
 | C3 | 依赖方向倒置 | `src/utils/db_paths.py` → `src/agents/cte_refiner.py` | 库路径解析和 CTE refiner 毫无逻辑关系，`get_database_path` 放在 refiner 里本身就不合理，应该反向 |
 | C4 | 数据库靠 134 个 symlink 硬凑一题一目录 | `data/spider2/<instance_id>/` | 见下方展开 |
-| C5 | 评测脚本对空预测结果无容错 | `evaluation/evaluate.py:497` 直接 `item['score']`，`:521` 起直接 `df_rows["score"]` | 没有实例匹配上时 `df_rows` 是无列空表，直接 `KeyError: 'score'`，而真正的原因（`--result_dir` 尾部斜杠导致实例 ID 解析失败、或 agent SQL 执行失败导致 CSV 为空）完全看不出来 |
+| C5 | 评测脚本对空预测结果无容错 | `evaluation/evaluate.py:497` 直接 `item['score']`，`:521` 起直接 `df_rows["score"]` | 没有实例匹配上时 `df_rows` 是无列空表，直接 `KeyError: 'score'`，而真正的原因（`--result_dir` 尾部斜杠导致实例 ID 解析失败、或 agent SQL 执行失败导致 CSV 为空）完全看不出来。**已于阶段 1.4 修复** |
+| C13 | `evaluate.py` 有一个死 import，导致脚本在缺该包的环境里完全无法启动 | `evaluation/evaluate.py:24`（原）`import duckdb` | `duckdb` 全文只出现在这一行，从未被使用，是从上游 Spider2 的 `evaluate.py` 继承来的。但它是模块级 import，所以没装 duckdb 的环境里 `evaluate.py --help` 都跑不起来。**已于阶段 1.4 删除**；`requirements.txt` 里的 `duckdb>=0.9.0` 也因此不再是评测的必需依赖 |
 | C6 | 过期注释 | `src/agents/sql_agent_runner.py:725` 写 `Run refinement with reduced max_turns` | 下面传的还是 25，没有 reduce |
 | C7 | `evaluation/README.md` 路径写错 | `evaluation/README.md:20-23` | 说 gold SQL 在 `exec_result/*.sql`，实际在 `evaluation/gold/sql/`（256 个文件）。另外示例里的 outputs 目录名是虚构的 |
 | C8 | populate 要求 gold SQL 在输出目录里，但 runner 不保证产出 | `tkstore/harness.py:1067::run_diff_for_instance` 要求 `gt_query.sql` 或 `{instance_id}.sql` | 实测 5 个输出目录里 **2 个没有** gold SQL（`local002`、`local007`）。权威来源是 `evaluation/gold/sql/{id}.sql`，populate 应该直接读那里 |
+| C9 | 一共有 **4 条**互相重复的数据库路径解析逻辑，其中 harness 那条是坏的 | `src/utils/db_paths.py`、`src/agents/cte_refiner.py:63`、`tkstore/harness.py:1186-1204`、`src/agents/sql_agent_runner.py:596` | 见下方展开 |
+| C10 | 仓库零测试基础设施 | 全局 | 没有任何测试文件、没有 conftest、`pytest` 不在 `requirements.txt`。任何重构都没有安全网 |
+| C11 | `data/instance_db_mapping.csv` 是死数据 | 全局 | 代码里零引用。它把 BigQuery / Snowflake 实例混在一起，且库名与真实文件名的大小写、分隔符不一致，不适合当解析依据 |
+| C12 | external knowledge 文件缺失时静默返回 `None` | `src/utils/agent_utils.py:84-91::load_external_knowledge` | 声明的文件不存在时直接 `return None`，不打印任何警告。13 个 local 实例声明了 external knowledge（`local003` 需要 `RFM.md` 等），文件一直不在 `data/spider2/<id>/` 下，于是这 13 个实例的输入长期不完整而无人发现。文件已于阶段 1.2 补齐，但**缺失时无告警这一点仍未修**，下次换机器同样会静默退化 |
+
+### C9 展开：harness 那条 fallback 从来没命中过
+
+`tkstore/harness.py:1199` 拼接的是：
+
+```python
+example_folder = os.path.join(data_base_folder, str(instance_id))
+```
+
+`config.DATA_BASE_FOLDER` 是 `'data'`，所以拼出来是 `data/local007`，
+而真实布局是 `data/spider2/local007` —— 少了一层。这条 fallback 一直是死的，
+只有调用方显式传 `db_path` 时 populate 才能拿到数据库。
+
+阶段 2 的 populate 正好走这条路，所以这是个埋着的雷，已决定在阶段 1.1 一并统一到新解析器。
+
+四条路径的失败契约也不一致，绕成一个圈：`get_database_path` 抛 `FileNotFoundError`
+→ `db_paths.resolve_sqlite_db_path` 用 `except Exception` 吞掉返回 `None`
+→ `src/executors/factory.py:29-30` 又把 `None` 转回 `FileNotFoundError`。
+异常里携带的"试过哪些路径"信息在中间那一步全部丢失（即 C1）。
 
 ### C4 展开：官方映射表让 symlink 完全没必要
 

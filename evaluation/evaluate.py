@@ -21,7 +21,6 @@ import json
 import re
 import pandas as pd
 import math
-import duckdb
 from typing import List, Union
 import os
 import os.path as osp
@@ -232,6 +231,64 @@ def parse_instance_id_from_output_dir(dir_name: str) -> str:
     return None
 
 
+EVAL_COLUMNS = ["instance_id", "score", "score_final", "assistant_turns"]
+
+
+class NoPredictionsFound(Exception):
+    """Raised when --result_dir yielded no evaluable instance."""
+
+
+def normalize_result_dir(result_dir: str) -> str:
+    """Drop trailing separators so `os.path.basename` returns the directory name.
+
+    `os.path.basename('outputs/local007_20260910_172039/')` is the empty string,
+    which used to make the instance id unparseable and silently produce zero
+    predictions.
+    """
+    if not result_dir:
+        return result_dir
+    stripped = result_dir.rstrip(os.sep)
+    if os.altsep:
+        stripped = stripped.rstrip(os.altsep)
+    return stripped or result_dir[:1]
+
+
+def build_eval_dataframe(output_results: List[dict]) -> pd.DataFrame:
+    """Per-instance results as a frame that always carries the score columns.
+
+    Passing `columns=` matters: without it an empty `output_results` produces a
+    frame with no columns at all, and every later `df["score"]` raises KeyError.
+    """
+    rows = [
+        {
+            "instance_id": item.get("instance_id"),
+            "score": item.get("score") or 0,
+            "score_final": item.get("score_final") or 0,
+            "assistant_turns": item.get("assistant_turns"),
+        }
+        for item in output_results
+    ]
+    return pd.DataFrame(rows, columns=EVAL_COLUMNS)
+
+
+def require_predictions(pred_ids: List[str], missing_exec_ids: List[str], result_dir: str) -> None:
+    """Fail with an actionable message when nothing under `result_dir` is evaluable.
+
+    Instances that ran but whose SQL failed are still evaluable and score 0; only
+    a total absence of matches is treated as an error.
+    """
+    if pred_ids or missing_exec_ids:
+        return
+    raise NoPredictionsFound(
+        f"No evaluable instances found under {result_dir!r}.\n"
+        "Likely causes:\n"
+        "  - the path is wrong or the run wrote somewhere else\n"
+        "  - instance directories are not named '<instance_id>_YYYYMMDD_HHMMSS', "
+        "so the instance id could not be parsed\n"
+        "  - the directory holds neither execution_result.csv nor per-instance subfolders"
+    )
+
+
 def _count_assistant_turns_from_raw_memories(raw_memories_path: str) -> Union[int, None]:
     """Return number of assistant messages in raw_memories.json; None if missing/unreadable."""
     try:
@@ -263,6 +320,7 @@ def evaluate_spider2sql(args):
     """Evaluate outputs against gold CSVs, writing evals.csv and correct_ids.csv, and printing per-id score and aggregate."""
     global NO_EXECUTION_RESULT_CSV_COUNT
     mode = args.mode
+    args.result_dir = normalize_result_dir(args.result_dir)
     gold_result_dir = os.path.join(args.gold_dir, "exec_result")
 
     eval_jsonl = os.path.join(args.gold_dir, "spider2lite_eval.jsonl")
@@ -375,6 +433,8 @@ def evaluate_spider2sql(args):
             raise FileNotFoundError(f"Result path not found: {args.result_dir}")
 
     # Removed verbose debug print of eval standard keys to reduce noise
+    require_predictions(pred_ids, missing_exec_ids, args.result_dir)
+
     gold_ids = list(eval_standard_dict.keys())
     eval_ids = list(set(gold_ids).intersection(pred_ids))
     eval_ids = sorted(eval_ids)
@@ -494,8 +554,8 @@ def evaluate_spider2sql(args):
         # print(f"Evaluating {mid}...")
         # print("0")
 
-    rows = [{"instance_id": item['instance_id'], "score": item['score'], "score_final": item.get('score_final', 0), "assistant_turns": item.get('assistant_turns')} for item in output_results]
-    df_rows = pd.DataFrame(rows)
+    df_rows = build_eval_dataframe(output_results)
+    rows = df_rows.to_dict("records")
     
     # Add tick/cross columns for readability
     try:
@@ -568,4 +628,7 @@ if __name__ == "__main__":
     #     shutil.rmtree("temp")
     # os.makedirs("temp")
 
-    evaluate_spider2sql(args)
+    try:
+        evaluate_spider2sql(args)
+    except (NoPredictionsFound, FileNotFoundError) as exc:
+        raise SystemExit(f"error: {exc}")

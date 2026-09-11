@@ -18,11 +18,23 @@
   **C 组**顺手修，**B 组**本轮不动但要在解读结果时考虑进去。
 - 算法与函数的对照关系见 [`algorithm_mapping.md`](./algorithm_mapping.md)，本文不重复。
 
+## 产物目录约定
+
+| 路径 | 内容 | 是否进版本库 |
+| --- | --- | --- |
+| `data/splits/` | train / test 划分文件 | **进**，复现必需 |
+| `artifacts/` | populate 生成的 TK-Store CSV | 不进，已 ignore |
+| `outputs/` | agent 运行产物、trace、评测中间结果 | 不进，已 ignore |
+| `tkstore/tkstore_*.csv` | 上游随仓库发布的示例 store | 上游已跟踪，**本轮不改动** |
+
+上游那四个 store CSV 一个字节都不要动。我们的规则写进 `artifacts/`，
+这样 `git status` 能一直保持干净，也不会把实验产物和上游示例数据混在一起。
+
 ## 阶段总览
 
 | 阶段 | 内容 | 消除的偏差 | LLM 成本 | 依赖 |
 | --- | --- | --- | --- | --- |
-| 1 | 数据与路径基础设施 | C1–C4、C6–C8、A5 | 无 | — |
+| 1 | 数据与路径基础设施 | A5、C1–C4、C6–C11 | 无 | — |
 | 2 | Populate（Alg 2 / 3） | A2、A3、A4、A6 | 中（train 集 agent 跑一遍 + populate） | 阶段 1 |
 | 3 | Retrieve + Augment（Alg 4 / 5） | A1、B1、B7 | 无（改代码） | 阶段 2 |
 | 4 | Pipeline runner + 评测 | C5 | 高（test 集跑两遍） | 阶段 3 |
@@ -33,46 +45,142 @@
 
 # 阶段 1 — 数据与路径基础设施
 
+## 1.0 测试脚手架
+
+**用途**：仓库目前零测试基础设施（C10），TDD 无从开始，所以这是第一步。
+
+**输入**：无。
+
+**输出**：
+
+```
+tests/__init__.py            # 空文件，让 tests 成为包
+tests/conftest.py            # 共享 fixture
+requirements-dev.txt         # pytest>=8.0
+```
+
+`pytest` 放 `requirements-dev.txt` 而不是 `requirements.txt`，避免污染运行时依赖。
+
+**约定的测试命令**（后续每个 TDD 循环都用它，只换文件名）：
+
+```bash
+python -m pytest tests/test_db_paths.py -v
+```
+
+**验收**：`python -m pytest tests/ -v` 能跑起来（哪怕 0 个测试）。
+
 ## 1.1 库路径解析重构
 
 **用途**：把数据库路径解析从"靠物理目录布局硬凑"改成"查官方映射表"，
-并修掉吞异常和动态 exec 两个坑。消除 C1、C2、C3。
+统一四条重复实现，并修掉吞异常和动态 exec。消除 C1、C2、C3、C9、C11。
 
-关键发现：`~/spider2-localdb/local-map.jsonl` 是 **Spider2 官方的实例→库映射**，
+关键发现：`local-map.jsonl` 是 **Spider2 官方的实例→库映射**，
 已验证 135 个实例 → 30 个库，映射值加 `.sqlite` 后缀就是共享目录里的确切文件名
 （含 `Db-IMDB`、`sqlite-sakila` 这类不规则命名），零缺口、双向一致。
 所以**不需要任何归一化匹配启发式**，之前那套小写去下划线的逻辑可以整个扔掉。
 
-**输入**：
+### 已确定的设计决策
 
-| 来源 | 内容 |
+| 决策 | 选择 |
 | --- | --- |
-| 环境变量 `SPIDER2_DB_ROOT` | 共享库目录，默认 `~/spider2-localdb` |
-| `$SPIDER2_DB_ROOT/local-map.jsonl` | 官方映射，单行 JSON 对象 `{instance_id: db_basename}` |
-| 函数参数 | `instance_id: str`、`db_id: str` |
+| 失败契约 | 抛专用异常 `DbPathNotFound`（携带尝试过的路径列表），另留一个返回 `Optional` 的薄封装给现有调用方 |
+| 映射表位置 | 拷一份进仓库并提交，优先用它；`$SPIDER2_DB_ROOT` 里的作为回落 |
+| `SPIDER2_DB_ROOT` 默认值 | **无默认值**。未设置时跳过依赖它的步骤，并在错误信息里提示去设置 |
+| harness 那份坏逻辑 | 在本节一并统一 |
+| 返回路径形式 | 一律绝对路径 |
+| 根目录锚定 | 锚定仓库根（`Path(__file__)` 推导），不依赖 cwd |
+| 文件校验强度 | 只检查存在性，不打开验证是否合法 SQLite（那是 executor 的职责） |
+| `db_id` 与映射冲突 | 映射表优先；映射表查不到该 instance 时才拿 `db_id` 当文件名试 |
 
-**输出**：`Optional[str]`，数据库文件绝对路径。保持现有返回类型不变，
-因为两个调用方（`src/agents/sql_agent_runner.py:35`、`src/executors/factory.py:5`）都按
-`None` 判失败。
+### 公开 API
 
-**改动内容**：
+```python
+# src/utils/db_paths.py
 
-1. 把 `get_database_path` 从 `src/agents/cte_refiner.py:63` **移到** `src/utils/db_paths.py`，
-   让 `cte_refiner` 反向 import。修正倒置的依赖方向（C3）。
-2. 删掉 `src/utils/db_paths.py:9-17` 的动态 `spec_from_file_location` 加载（C2）。
-3. 解析优先级：
+class DbPathNotFound(Exception):
+    """携带诊断信息，取代原先被吞掉的 FileNotFoundError。"""
+    instance_id: str
+    db_id: Optional[str]
+    attempted: List[str]        # 按顺序试过的每个绝对路径
+    hints: List[str]            # 如 "SPIDER2_DB_ROOT is not set"
 
-   ```
-   1. minidev 分支（instance_id 以 minidev 开头）—— 原样保留，见 deviations 附注
-   2. local-map.jsonl 精确查表 → $SPIDER2_DB_ROOT/<db_basename>.sqlite
-   3. 回落 data/spider2/<instance_id>/*.sqlite    # 向后兼容
-   4. 回落 ./<db_id>.sqlite                        # 保留原有 fallback
-   ```
+def get_database_path(
+    instance_id: str,
+    db_id: Optional[str] = None,
+    *,
+    db_root: Optional[str] = None,      # 便于测试注入，默认读 SPIDER2_DB_ROOT
+    repo_root: Optional[str] = None,    # 便于测试注入，默认从 __file__ 推导
+) -> str:
+    """成功返回绝对路径；失败抛 DbPathNotFound。"""
 
-4. 全部失败时**不要静默返回 None**，打印尝试过的每个路径再返回 None（C1）。
+def resolve_sqlite_db_path(
+    instance_id: str,
+    db_id: Optional[str] = None,
+) -> Optional[str]:
+    """向后兼容薄封装：捕获 DbPathNotFound，打印诊断后返回 None。"""
+```
 
-**验收**：对全部 135 个实例调用一次，全部解析成功；随便断开一个路径，
-错误信息里能看到试过哪些路径。
+`db_root` / `repo_root` 是**关键字参数且可注入**，这样测试可以用 `tmp_path` 造假目录，
+不必 monkeypatch 模块内部变量。
+
+### 解析优先级
+
+```
+1. minidev 分支（instance_id 以 minidev 开头）
+     <repo_root>/data/minidev/MINIDEV/dev_databases/<db_id>/<db_id>.sqlite
+2. 映射表查 instance_id → basename，两个来源按序：
+     a. <repo_root>/data/spider2_local_map.json      # 仓库内，已提交
+     b. <db_root>/local-map.jsonl                    # 共享目录，回落
+   命中后 → <db_root>/<basename>.sqlite
+3. 映射表查不到该 instance 且给了 db_id → <db_root>/<db_id>.sqlite
+4. 回落 <repo_root>/data/spider2/<instance_id>/*.sqlite      # 向后兼容
+5. 回落 <repo_root>/<db_id>.sqlite                           # 保留原有 fallback
+```
+
+**`SPIDER2_DB_ROOT` 未设置时不要立即硬失败** —— 步骤 2b / 3 需要它，跳过即可；
+步骤 1、4、5 不需要它，仍应照常尝试。只有全部失败时才抛异常，
+并在 `hints` 里带上 `SPIDER2_DB_ROOT is not set`。这条容易写错，单独列一个测试。
+
+### 要改的文件
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/utils/db_paths.py` | 重写。承载 `DbPathNotFound`、`get_database_path`、`resolve_sqlite_db_path`。删掉 `:9-17` 的动态 `spec_from_file_location`（C2） |
+| `src/agents/cte_refiner.py` | 删掉 `:63-88` 的 `get_database_path`，改为 `from src.utils.db_paths import get_database_path`。修正倒置的依赖方向（C3） |
+| `src/agents/sql_agent_runner.py` | 删掉 `:596-597` 那个纯转发的 `resolve_db_path_for_sqlite`，两个调用点（`:720`、`:918`）直接调 `resolve_sqlite_db_path` |
+| `tkstore/harness.py` | 把 `:1186-1204` 内联的 sqlite 解析抽成 `_resolve_db_path_or_cred(instance_id, db_id, engine)` 并改调新解析器，修掉少一层目录的 bug（C9） |
+| `data/spider2_local_map.json` | 新增，从 `local-map.jsonl` 拷入，**要提交** |
+
+抽出 `_resolve_db_path_or_cred` 是为了可测 —— 原逻辑埋在 `run_diff_for_instance`
+的 jsonl 循环里，不抽出来就只能靠跑 LLM 才能覆盖。
+
+### 测试清单（TDD 的 Red 列表）
+
+放在 `tests/test_db_paths.py`。fixture 用 `tmp_path` 造一个假 `db_root`
+（几个空 `.sqlite` 文件 + 一个假映射）和假 `repo_root`，全部通过关键字参数注入。
+
+| # | 行为 |
+| --- | --- |
+| 1 | 映射表命中 → 返回 `<db_root>/<basename>.sqlite` 的绝对路径 |
+| 2 | 不规则命名能解析（`Db-IMDB`、`sqlite-sakila`），作为对旧启发式的回归保护 |
+| 3 | 仓库内映射优先于共享目录映射（两者对同一 instance 给出不同 basename 时） |
+| 4 | 仓库内映射缺失时回落到共享目录映射 |
+| 5 | 映射查不到 instance 但给了 `db_id` → `<db_root>/<db_id>.sqlite` |
+| 6 | 映射与 `db_id` 冲突时，映射优先 |
+| 7 | 回落到 `<repo_root>/data/spider2/<instance_id>/*.sqlite` |
+| 8 | minidev 分支解析 `dev_databases/<db_id>/<db_id>.sqlite` |
+| 9 | 每个成功分支返回的都是绝对路径 |
+| 10 | cwd 无关：`monkeypatch.chdir(tmp_path)` 后仍能解析 |
+| 11 | 全部失败时抛 `DbPathNotFound`，且 `attempted` 非空、按尝试顺序排列 |
+| 12 | `SPIDER2_DB_ROOT` 未设置时不崩，仍尝试步骤 1/4/5；失败时 `hints` 含未设置提示 |
+| 13 | `resolve_sqlite_db_path` 薄封装在失败时返回 `None` 而不是抛异常 |
+| 14 | `harness._resolve_db_path_or_cred` 对 sqlite 实例返回与解析器一致的路径（C9 回归） |
+| 15 | `harness._resolve_db_path_or_cred` 对 bq / snowflake 实例仍返回凭证路径 |
+
+**验收**：上面 15 条全绿；额外跑一次**真实环境**的冒烟检查 ——
+对全部 135 个实例调用 `get_database_path`，全部解析成功，且返回路径都真实存在。
+这条冒烟检查依赖本机数据，不进 `tests/`（否则别人 clone 下来必失败），
+放 `scripts/` 下当一次性校验脚本。
 
 ## 1.2 清理 symlink，切换到共享库目录
 
@@ -84,13 +192,37 @@
 **输出**：
 
 - 删除 134 个 symlink
-- 删除 `data/spider2/local007/Baseball.sqlite` —— 已验证共享目录里有同名文件，
-  这 30MB 是纯重复
-- `data/spider2/<instance_id>/` 只保留 metadata（`DDL.csv`、各表 JSON 等）
-- `data/instance_db_mapping.csv` 保留但降级为参考，不再作为解析依据
-  （它把 BigQuery / Snowflake 实例也混在一起，且不区分文件名大小写）
+- 删除 `data/spider2/local007/Baseball.sqlite` —— MD5 与共享目录里的同名文件一致，
+  是纯重复的 30MB
+- **保留** 135 个 `data/spider2/<instance_id>/` 目录。它们不是只放数据库的：
+  `src/utils/agent_utils.py:84::load_external_knowledge` 从
+  `data/spider2/<instance_id>/<filename>` 读 external knowledge
+- 从 `~/Spider2/spider2-lite/resource/documents/` 拷入 13 个 external knowledge 文件
+  （见下）
+- 把 `SPIDER2_DB_ROOT` 写进 `.env`，并让解析器在环境变量缺失时回落读它
+- `data/instance_db_mapping.csv` 保留但降级为参考，不再作为解析依据（C11）。
+  已确认代码里零引用，所以降级是零成本的
 
-**验收**：symlink 数为 0；1.1 的 135 实例解析仍然全部成功。
+**关于 external knowledge**：原计划以为实例目录里存着 `DDL.csv` 和各表 JSON，
+实际上 `find data/spider2 -type f ! -name '*.sqlite'` 返回 **0** —— 135 个目录里
+除了那个 symlink 什么都没有。而 `data/spider2-lite.jsonl` 里有 **13 个** local 实例
+声明了 `external_knowledge` 文件（`local003` → `RFM.md`，`local009`/`local010` →
+`haversine_formula.md` 等）。`load_external_knowledge` 在文件不存在时静默返回
+`None`（C12），所以这 13 个实例的输入长期不完整而无人发现。文件必须补齐，
+因为 external knowledge 是论文设定里 agent 输入的一部分。
+
+**删掉 symlink 后 `SPIDER2_DB_ROOT` 就是必需的**，而 runner
+（`python -m src.agents.sql_agent_runner`）不像 `tkboost.init()` 那样读 `.env`，
+只读 shell 环境变量。忘设的后果是跑到一半才发现全部实例解析失败。
+所以解析器改为：环境变量优先，其次读仓库根的 `.env`。
+
+**验收**：
+
+1. symlink 数为 0，真实 `.sqlite` 数为 0
+2. 不导出环境变量、只靠 `.env`，135 个实例仍全部解析成功
+3. 解析来源全部是共享目录映射，**0 个**走 `data/spider2` 回落
+   （symlink 还在时这条无法验证，容易被掩盖）
+4. 13 个 external knowledge 文件都能被 `load_external_knowledge` 真实读出
 
 ## 1.3 固定 train / test 划分
 
@@ -109,14 +241,35 @@ data/splits/spider2_sqlite_test.txt    # 101 行
 
 外加一个 `data/splits/README.md` 记录生成方式（排序后固定种子采样，写明种子值）。
 
+生成命令（`seed=0` 已记录在 `data/splits/README.md` 里）：
+
+```bash
+python scripts/make_splits.py --seed 0 --train-size 34
+```
+
+纯函数放 `src/utils/splits.py`（`make_split` / `write_split` / `load_split`），
+因为阶段 2.3 的 populate CLI 和阶段 4 的 runner 都要读划分文件，
+`load_split` 属于代码库而不只是脚本。
+
 **注意两点**，都要写进最终报告：
 
 - 论文只给了数量，**没给实例 ID 列表**，所以我们复现不了它的确切划分。
-- 34 个 train 实例分布在 30 个库上，意味着大部分库只有 0–1 个 train 实例。
-  db 专属规则要靠"train 和 test 共享同一个库"才能命中，这个划分下命中率天生受限，
-  预期主要收益来自 generic 规则。不做按库分层，因为论文没提，分层会引入新的不可比性。
+- 不做按库分层，因为论文没提，分层会引入新的不可比性。
 
-**验收**：两个文件无交集、并集等于 135、行数分别是 34 和 101。
+**db 覆盖率比预期好得多。** 实际生成后测得：21/30 个库至少有一个 train 实例，
+18 个库同时出现在两侧，**77/101（76%）** 的 test 实例所属库有 train 数据。
+原先我担心"34 个 train 摊到 30 个库、大部分库只有 0–1 个"导致 db 专属规则几乎无法命中，
+这个判断是错的 —— 实例在库上的分布很不均匀，有好几个库各带 7–9 个实例，
+随机抽 34 个大概率落在这些大库里，而它们同时也装着大部分 test 实例。
+所以 76% 是 db 专属规则能触及的上限，剩下 24 个实例只能靠 generic 规则。
+
+**验收**：
+
+1. train 34 行、test 101 行
+2. 两者无交集
+3. 并集等于 jsonl 里全部 135 个 `local*` 实例
+4. 两侧每个实例的数据库都能解析成功
+5. 重跑 `make_splits.py` 后文件 MD5 不变（确定性）
 
 ## 1.4 修文档与评测脚本容错
 
@@ -126,11 +279,21 @@ data/splits/spider2_sqlite_test.txt    # 101 行
 
 | 项 | 改动 |
 | --- | --- |
-| C5 | `evaluation/evaluate.py:497` 的 `item['score']` 改用 `.get('score', 0)`；`:521` 起在 `df_rows` 为空表时提前报错并说明可能原因（`--result_dir` 尾部斜杠、实例 ID 解析失败、预测 CSV 为空） |
-| C6 | 删掉 `src/agents/sql_agent_runner.py:725` 那句过期的 `reduced max_turns` 注释 |
-| C7 | `evaluation/README.md:20-23` 改成 gold SQL 在 `evaluation/gold/sql/`；换掉虚构的 outputs 目录示例 |
+| C5 | `evaluation/evaluate.py` 新增三个可测的纯函数：`build_eval_dataframe`（用 `pd.DataFrame(rows, columns=EVAL_COLUMNS)` 保证空输入也带 score 列）、`normalize_result_dir`（去掉尾部斜杠）、`require_predictions`（零匹配时抛 `NoPredictionsFound` 并列出可能原因）。入口处捕获它和 `FileNotFoundError`，转成 `error: ...` + 退出码 1 |
+| C6 | 删掉 `src/agents/sql_agent_runner.py` 那句过期的 `reduced max_turns` 注释（因 1.1 删了 4 行，实际在 `:722` 而非 `:725`） |
+| C7 | `evaluation/README.md` 改成 gold SQL 在 `evaluation/gold/sql/`；修正 `spider2lite_eval.jsonl` 的 cp 源路径（上游在 `evaluation_suite/gold/` 下，不在 `evaluation_suite/` 下）和目标路径（要进 `evaluation/gold/`，不是 `evaluation/`）；换掉虚构的 outputs 目录示例并说明目录命名要求 |
+| C13（新发现） | 删掉 `evaluation/evaluate.py:24` 的 `import duckdb` |
 
-**验收**：拿一个空 `--result_dir` 跑 `evaluate.py`，得到可读的错误说明而不是 `KeyError: 'score'`。
+**C13 的严重性**：`duckdb` 在 `evaluate.py` 全文只出现在那一行 import，从未被使用，是从上游 Spider2 继承来的。但它是模块级 import，所以在没装 duckdb 的环境里 `evaluate.py --help` 都会 `ModuleNotFoundError`。这一项排在 C5 前面，因为不删掉它，C5 的验收根本没法跑。
+
+**验收**（全部已通过）：
+
+1. 空 `--result_dir` → `error: No evaluable instances found under ...` + 三条可能原因 + 退出码 1，不是 `KeyError: 'score'`。
+2. 不存在的 `--result_dir` → `error: Result path not found: ...` + 退出码 1，不是 traceback。
+3. 真实实例目录**带与不带尾部斜杠，聚合结果与 `evals.csv` 路径完全一致**——尾斜杠正是上一轮踩到 `KeyError` 的实际触发条件。
+4. README 里声明的每个路径都实测存在：`evaluation/gold/sql/`（256 个文件）、`evaluation/gold/exec_result/`（2040 个）、`evaluation/gold/spider2lite_eval.jsonl`。
+
+**顺带的结构改动**：新增空的 `evaluation/__init__.py`，让 `evaluation.evaluate` 可以被测试导入。`evaluate.py` 没有相对导入，所以 `python evaluation/evaluate.py` 的用法不受影响。
 
 ---
 
@@ -278,17 +441,17 @@ python -m tkstore.populate \
   --outputs-base outputs/train \
   --split-file data/splits/spider2_sqlite_train.txt \
   --jsonl-path data/spider2-lite.jsonl \
-  --store tkstore/tkstore_sqlite.csv \
+  --store artifacts/tkstore_sqlite.csv \
   --verbose
 ```
 
-**输出**：填充好的 `tkstore/tkstore_sqlite.csv`；一份 `outputs/train/populate_report.json`
-记录每个实例产出多少条规则、失败原因。
+**输出**：填充好的 `artifacts/tkstore_sqlite.csv`；一份 `outputs/train/populate_report.json`
+记录每个实例产出多少条规则、失败原因。两者都不进版本库。
 
 **必须内置的护栏**：如果 `--outputs-base` 下出现了不在 `--split-file` 里的实例，
 直接报错退出，而不是静默 populate 进去。这是防泄漏的最后一道闸。
 
-**验收**：`tkstore_sqlite.csv` 行数 > 0；`instance_id` 列的取值集合是 train 集的子集。
+**验收**：`artifacts/tkstore_sqlite.csv` 行数 > 0；`instance_id` 列的取值集合是 train 集的子集。
 
 ---
 
@@ -390,7 +553,7 @@ use_llm_filtering: bool = True,          # 对应论文 FilterKnowledge，默认
 | 参数 | 含义 |
 | --- | --- |
 | `--train-split` / `--test-split` | 阶段 1.3 的两个划分文件 |
-| `--store` | tkstore CSV |
+| `--store` | tkstore CSV，默认 `artifacts/tkstore_sqlite.csv` |
 | `--stage` | `populate` / `baseline` / `augmented` / `evaluate` / `all` |
 | `--model` | LLM 模型 |
 
