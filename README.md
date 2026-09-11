@@ -71,11 +71,19 @@ pip install -r requirements.txt
 # OpenAI
 export OPENAI_API_KEY="sk-..."
 
+# OpenAI-compatible endpoint (for example, OpenLux)
+export OPENAI_API_BASE="https://api.openlux.ai/v1"
+
 # Or Azure OpenAI
 export AZURE_API_KEY="your-key"
 export AZURE_API_BASE="https://your-endpoint.openai.azure.com/"
 export AZURE_API_VERSION="2024-12-01-preview"
 ```
+
+`AZURE_API_VERSION` is required only for Azure OpenAI. For an OpenAI-compatible
+endpoint, use `OPENAI_API_KEY` and `OPENAI_API_BASE` instead. If needed, set
+`TKBOOST_MODEL` to a model ID supported by that endpoint. `tkboost.init()` also
+loads these values from a `.env` file in the directory where you run the command.
 
 ### 3. Download the example database
 

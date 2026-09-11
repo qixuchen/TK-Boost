@@ -26,6 +26,30 @@ _STATE: Dict[str, Any] = {
 }
 
 
+def _load_dotenv(dotenv_path: Optional[Union[str, Path]] = None) -> None:
+    """Load simple ``KEY=value`` or ``export KEY=value`` entries without overwriting env."""
+    path = Path(dotenv_path) if dotenv_path else Path.cwd() / ".env"
+    if not path.is_file():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
 @dataclass
 class TKStoreEntry:
     """Single tkstore row."""
@@ -237,7 +261,13 @@ def init(
       - "auto" (default): choose OpenAI if OPENAI_API_KEY is set, else Azure if Azure keys are set
       - "openai"
       - "azure"
+
+    A .env file in the current working directory is loaded automatically without
+    replacing values already set in the process environment. OpenAI-compatible
+    gateways use OPENAI_API_KEY and OPENAI_API_BASE. TKBOOST_MODEL can override
+    the provider's default model.
     """
+    _load_dotenv()
     provider = (provider or "auto").lower().strip()
     if provider not in {"auto", "openai", "azure"}:
         raise ValueError("provider must be one of: auto, openai, azure")
@@ -256,7 +286,7 @@ def init(
             os.environ["OPENAI_API_KEY"] = api_key
         if base_url:
             os.environ["OPENAI_API_BASE"] = base_url
-        default_model = "gpt-5"
+        default_model = os.environ.get("TKBOOST_MODEL") or "gpt-5"
     else:
         if azure_api_key:
             os.environ["AZURE_API_KEY"] = azure_api_key
@@ -272,7 +302,7 @@ def init(
             os.environ["AZURE_OPENAI_ENDPOINT"] = base_url
         if api_version:
             os.environ["AZURE_API_VERSION"] = api_version
-        default_model = "azure/gpt-5"
+        default_model = os.environ.get("TKBOOST_MODEL") or "azure/gpt-5"
 
     _STATE["provider"] = selected
     _STATE["model"] = model or default_model
