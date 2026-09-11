@@ -26,23 +26,32 @@ def _persist_via_tkstore(
     # Local import avoids circular import at module load.
     from tkboost import TKStoreEntry  # type: ignore
 
+    def _tag(value: Any, default: str = "all") -> str:
+        """Semicolon-join multi-valued tags.
+
+        `str(["customers", "orders"])` would store a Python list repr that no
+        table or column name can ever match during retrieval.
+        """
+        if isinstance(value, list):
+            joined = ";".join(str(v).strip().lower() for v in value if str(v).strip())
+            return joined or default
+        text = str(value).strip() if value is not None else ""
+        return text or default
+
     index_rows = tagged.get("index_rows") if isinstance(tagged, dict) else None
     entries: List[Any] = []
     if isinstance(index_rows, list):
         for ir in index_rows:
-            ops = ir.get("sql_operations", "all")
-            if isinstance(ops, list):
-                ops = ";".join(str(o).lower() for o in ops if str(o).strip()) or "all"
             entries.append(
                 TKStoreEntry(
                     instance_id=example_id,
-                    db=str(ir.get("db", db_name or "all") or "all"),
-                    scope=str(ir.get("scope", "generic") or "generic"),
-                    sql_operations=str(ops),
-                    table=str(ir.get("table", "all") or "all"),
-                    column=str(ir.get("column", "all") or "all"),
-                    data_type=str(ir.get("data_type", "all") or "all"),
-                    nulls=str(ir.get("nulls", "all") or "all"),
+                    db=_tag(ir.get("db", db_name or "all")),
+                    scope=_tag(ir.get("scope", "generic"), "generic"),
+                    sql_operations=_tag(ir.get("sql_operations", "all")),
+                    table=_tag(ir.get("table", "all")),
+                    column=_tag(ir.get("column", "all")),
+                    data_type=_tag(ir.get("data_type", "all")),
+                    nulls=_tag(ir.get("nulls", "all")),
                     rule=str(ir.get("rule", "")).replace("\n", " "),
                 )
             )

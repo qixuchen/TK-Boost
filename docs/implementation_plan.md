@@ -362,9 +362,16 @@ populate 是从**真实 agent 的错误**里学规则，所以这一步不能跳
 **输入**：`data/splits/spider2_sqlite_train.txt`（24 个实例，全部有 gold SQL，见 2.0）。
 
 注意 Alg 3 第 1 行是 `s ← incorrect SQL in τ` —— **populate 只能从 agent 做错的实例里学**。
-agent 做对的实例没有 correction 可提取，不产出规则。按 batch_5 观察到的约 25% 正确率，
-24 个 train 实例大约有 18 个能进入 populate。这也解释了上游 store 为什么是 32 个实例
+agent 做对的实例没有 correction 可提取，不产出规则。这也解释了上游 store 为什么是 32 个实例
 而论文 Table 13 说 `n=34`：少数实例产出 0 条规则。
+
+**实测产出率远低于早先预估**。头 7 个 train 实例跑完后
+`evaluate.py --result_dir outputs/train` 给出 5/7 = 0.71，只有 `local003`（答非所问，
+返回 min/max 汇总而不是 RFM 分桶）和 `local019`（SQL 未能执行）是错的。
+早先基于 batch_5 的「约 25% 正确率、24 个里约 18 个能进 populate」已作废：
+按 0.71 外推，24 个里只有约 7 个能进 populate，我们的 store 会明显小于上游的 118 条。
+n=7 波动很大，但方向上要留意——按 gold SQL 可得性挑出的这 24 个可能系统性偏简单。
+最终数字等 24 个跑完再确认。
 
 **输出**：每个实例一个目录，含
 
@@ -428,13 +435,20 @@ def populate_from_output_dir(
     engine: Optional[str] = None,          # 缺省 infer_engine(instance_id)
     jsonl_path: Optional[str] = None,      # 取 question / external_knowledge / db
     gold_sql_dir: str = "evaluation/gold/sql",
+    gold_dir: str = "evaluation/gold",     # 正误闸门要的 exec_result/ 与 eval jsonl
     store: Optional[str] = None,           # 建议显式传 artifacts/ 下的路径，见下方说明
     db_name: Optional[str] = None,         # 缺省取 jsonl 的 db 字段
+    db_path_or_cred: Optional[str] = None, # 缺省由 1.1 的解析器给出
     model: Optional[str] = None,
     max_turns: int = 6,
     verbose: bool = True,
 ) -> Dict[str, Any]
 ```
+
+`gold_dir` 和 `db_path_or_cred` 是相对初版签名的两处增补：前者是正误闸门的必需输入，
+后者对应 `run_diff_for_instance` 已有的 `db_path`，同时让测试不依赖开发机上的数据库。
+
+**重跑语义**归 2.3：单实例函数只追加，清空重建由批量 CLI 在全量运行前做。
 
 **输入**（逐项来源，这是这个函数的核心价值）：
 
@@ -457,14 +471,21 @@ gold SQL 走 `gold_sql_dir` 而不是输出目录，是因为 runner **不保证
 
 | 项 | 决定 | 理由 |
 | --- | --- | --- |
+| 正误闸门位置 | **放在 `populate_from_output_dir` 内部**：先比对 `R` 与 `R★`，判定正确就直接返回 `rule_count=0` 且 `skipped="correct"`，**一次 LLM 都不调** | Alg 3 第 1 行要求 `s` 是 incorrect SQL。放在函数内意味着单实例调用也安全，不依赖调用方先跑 evaluate；2.3 的批量 CLI 因此不需要重复这段逻辑 |
+| 正误判定方式 | **复用 `evaluation/evaluate.py` 的 `agent_result_matches_gold`**（内部走 `compare_multi_pandas_table`） | 与最终评测同一口径，支持多个 gold 变体（`local019` 有 `_a`/`_b`）和 `ignore_order`。自己写一份 CSV 等价比较会与评测口径漂移 |
 | `db_name` | **必须显式传 jsonl 的 `db` 字段**，不能沿用现有入口的 `None` | 见 deviations A7。不传就等于所有行 `db="all"`，库专属规则退化成全局规则，且阶段 3 验收会假通过 |
 | `clean_summary` 行 | **不写进 TK-Store** | 两条检索路径都显式跳过 `scope='question'` 和 `sql_operations='NA'`，是永远召回不到的死行；上游参考库里这类行也是 0 条。实现上不用改 `_persist_via_tkstore`——它写这行有 `if clean_summary:` 守卫，传 `""` 即可跳过，同时真实的 clean_summary 照常喂给 tagger |
 | 重跑语义 | **全量运行前清空 store 重建** | `TKStore.insert` 不去重，追加会产生重复规则并放大阶段 3 的召回 |
-| agent SQL 执行失败的实例 | **从 `messages.json` / `processed_trace.txt` 提取真实报错**喂给 diff | 实测 `local007` 的 `execution_result.csv` 是 0 字节。只传空字符串的话 LLM 分不清是语法错还是空结果集，而这类样本恰好 correction 信号最强 |
+| agent SQL 执行失败的实例 | **重跑 agent SQL 取回真实报错**喂给 diff，`messages.json` 里最后一条 `SQL_ERROR:` 作兜底 | 只传空字符串的话 LLM 分不清是语法错还是空结果集，而这类样本恰好 correction 信号最强。原计划写的「从 `messages.json` 提取」**实测不成立**：`run_agent` 只在循环内的探针失败时才把 `SQL_ERROR:` 追加进 messages（`sql_agent_runner.py:380`），**最终 SQL 的执行失败只 print 到 stdout**（`:393`），既不进 messages 也不进 trace。`local019` 就是这种情形，messages.json 里一条 `SQL_ERROR:` 都没有。重跑是本地 SQLite、确定性、零成本，且拿到的是精确报错——实测取回 `SQL_ERROR: no such column: winner_id` |
 | 模型 | 与 agent 同一个模型，默认取 `.env` 的 `TKBOOST_MODEL` | 现状三处默认值不一致：runner 的 `--model` 是 `azure/gpt-4.1`，populate 相关 helper 是 `azure/o4-mini`，`.env` 另有 `TKBOOST_MODEL`。读 `.env` 可复用 `src/utils/db_paths.py` 里已有的 `_read_dotenv_value` |
 | 文本解析 helper | 直接从 `builder.py` 导入 `_extract_clean_summary` 和 `_extract_memories_from_rules` | 零改动、零风险；不动 `run_diff_for_instance` 里那份内联副本 |
 
 **处理流程**（LLM 阶段直接复用现有函数，它们本身没问题）：
+
+第 0 步之前先过正误闸门（见上表）。`agent_result_matches_gold(pred_csv, instance_id, gold_dir)`
+的语义已定并有测试覆盖：预测文件缺失或为 0 字节算**错**（这是 correction 信号最强的样本，
+不能抛异常）；gold 结果缺失或该实例不在 `spider2lite_eval.jsonl` 里则**抛异常**，
+因为无法判定的实例不该悄悄当成错的喂给 Alg 3。
 
 实际是 6 步，不是 4 步 —— 中间两步纯文本解析容易漏，但少了它们 tagger 拿不到必填入参：
 
@@ -500,6 +521,7 @@ gold SQL 走 `gold_sql_dir` 而不是输出目录，是因为 runner **不保证
       "store": str,              # 实际写入的 CSV 路径
       "db": str,
       "rule_count": int,
+      "skipped": Optional[str],  # "correct" 表示正误闸门判定 agent 做对了，未调 LLM
       "inserted": List[TKStoreEntry],
       "diff_text": str,          # 便于人工审阅
       "tagged": dict,
@@ -534,6 +556,8 @@ A3 在新入口是**天然规避**的，不需要额外工作：`_default_index_
 4. `MemoryRetriever(store).retrieve(sql, generic_only=False, db=<db>)` 能召回到 db 专属规则，
    且换一个**不相干的 `db=` 值时召回不到**这些 db 专属行 —— 只做前半段的话，
    `db="all"` 的退化情形会假通过
+5. 对 `evaluate.py` 判为正确的实例（当前 7 个里的 `local004`、`local017`、`local039`、
+   `local058`、`local066`）调用后返回 `rule_count=0`、`skipped="correct"`，store 行数不变
 
 ## 2.3 批量 populate CLI
 

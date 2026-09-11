@@ -271,6 +271,50 @@ def build_eval_dataframe(output_results: List[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=EVAL_COLUMNS)
 
 
+def gold_result_paths(gold_result_dir: str, instance_id: str) -> List[str]:
+    """Every gold CSV for an instance, including the `_a` / `_b` variants."""
+    pattern = re.compile(rf'^{re.escape(instance_id)}(_[a-z])?\.csv$')
+    try:
+        names = os.listdir(gold_result_dir)
+    except OSError:
+        return []
+    return [os.path.join(gold_result_dir, name) for name in sorted(names) if pattern.match(name)]
+
+
+def agent_result_matches_gold(pred_csv_path: str, instance_id: str, gold_dir: str) -> bool:
+    """Whether the agent's result is accepted by the same check the report uses.
+
+    Populate (Algorithm 3) may only learn from incorrect SQL, so it asks this
+    rather than defining a second notion of correctness. An unreadable or
+    missing prediction counts as incorrect; an instance that cannot be judged
+    at all raises, because a correction with no ground truth is worthless.
+    """
+    gold_paths = gold_result_paths(os.path.join(gold_dir, "exec_result"), instance_id)
+    if not gold_paths:
+        raise FileNotFoundError(
+            f"No gold execution result for {instance_id!r} under {gold_dir!r}/exec_result"
+        )
+
+    eval_standard = load_jsonl_to_dict(os.path.join(gold_dir, "spider2lite_eval.jsonl"))
+    if instance_id not in eval_standard:
+        raise KeyError(f"{instance_id!r} is absent from spider2lite_eval.jsonl under {gold_dir!r}")
+    standard = eval_standard[instance_id]
+
+    try:
+        pred_pd = pd.read_csv(pred_csv_path)
+    except (OSError, ValueError):
+        return False
+
+    gold_pds = [pd.read_csv(path) for path in gold_paths]
+    score = compare_multi_pandas_table(
+        pred_pd,
+        gold_pds,
+        standard.get("condition_cols", []),
+        standard.get("ignore_order", False),
+    )
+    return bool(score)
+
+
 def require_predictions(pred_ids: List[str], missing_exec_ids: List[str], result_dir: str) -> None:
     """Fail with an actionable message when nothing under `result_dir` is evaluable.
 
