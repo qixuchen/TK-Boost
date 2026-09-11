@@ -31,7 +31,13 @@ def detect_sql_blocks(content: str) -> List[str]:
 
 
 def detect_solution(content: str) -> Optional[str]:
-    m = re.search(r"<solution>([\s\S]*?)</solution>", content, flags=re.IGNORECASE)
+    # The body may not contain another <solution>, so a tag the model merely
+    # mentions in its reasoning is skipped in favour of the real opening tag.
+    m = re.search(
+        r"<solution>((?:(?!<solution>)[\s\S])*?)</solution>",
+        content,
+        flags=re.IGNORECASE,
+    )
     return m.group(1).strip() if m else None
 
 
