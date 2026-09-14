@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -34,6 +35,7 @@ from src.agents.cte_refiner import run_refiner as refiner_run
 from src.agents.prompts import BASE_PROMPT, SNOWFLAKE_PROMPT
 from src.utils.db_paths import resolve_sqlite_db_path
 from src.utils.auth import configure_llm_env, USE_OPENAI
+from tkstore.tagger_index import search_index_for_sql, _llm_filter_relevant_rules
 
 
 # ----------------- LLM Provider Mapping -----------------
@@ -53,9 +55,130 @@ def _is_openai_provider() -> bool:
     return USE_OPENAI
 
 
+def _resolve_model(model: str) -> str:
+    return AZURE_TO_OPENAI_MODEL.get(model, model) if _is_openai_provider() else model
+
+
 def llm_completion(model: str, messages: list, **params):
-    mapped_model = AZURE_TO_OPENAI_MODEL.get(model, model) if _is_openai_provider() else model
-    return litellm.completion(model=mapped_model, messages=messages, **params)
+    return litellm.completion(model=_resolve_model(model), messages=messages, **params)
+
+
+# ----------------- Tribal Knowledge Retrieval (Alg 4) -----------------
+def _retrieve_rules_for(sql_text: str,
+                        tkstore_path: str,
+                        db: Optional[str],
+                        use_llm_filtering: bool,
+                        filter_model: str) -> Tuple[List[dict], List[dict]]:
+    """Retrieve rules for one SQL fragment, as (candidates, selected).
+
+    `MemoryRetriever.retrieve` collapses the two stages into one return value; they
+    are kept apart here so the report can show what FilterKnowledge dropped.
+
+    `tkstore.tagger_index` has no provider mapping of its own and swallows LLM
+    errors by returning every candidate, so an unmapped 'azure/...' name would
+    silently disable filtering rather than fail.
+    """
+    candidates = search_index_for_sql(
+        sql_text,
+        tkstore_path,
+        generic_only=False,
+        db=db,
+    )
+    if use_llm_filtering and candidates:
+        resolved = _resolve_model(filter_model)
+        if _is_openai_provider() and resolved.startswith('azure/'):
+            raise ValueError(
+                f"filter_model {filter_model!r} has no OpenAI equivalent in "
+                f"AZURE_TO_OPENAI_MODEL; it would disable FilterKnowledge silently"
+            )
+        selected = _llm_filter_relevant_rules(sql_text, candidates, db=db, model=resolved)
+        return candidates, selected
+    return candidates, candidates
+
+
+def _knowledge_block(rules: List[dict]) -> str:
+    lines = []
+    for r in rules[:40]:
+        txt = (r.get('rule') or '').strip()
+        if txt:
+            lines.append(f"- {txt}")
+    return "\n".join(lines)
+
+
+def _goal_with_knowledge(goal: str, rules: List[dict]) -> str:
+    block = _knowledge_block(rules)
+    if not block:
+        return goal
+    return f"{goal}\n\nUse these tribal knowledge rules as guidance:\n\n{block}"
+
+
+def _revise_from_feedback(
+    *,
+    feedback: str,
+    artifact_suffix: str,
+    messages: List[dict],
+    model: str,
+    engine: str,
+    db_path_or_cred,
+    out_dir: Path,
+) -> Optional[str]:
+    """Feed a refiner verdict back to the agent and adopt its first executable rewrite.
+
+    Returns the adopted SQL, or None when no attempt produced a runnable solution.
+    """
+    messages.append({"role": "user", "content": feedback})
+    for _attempt in range(1, 6):
+        resp = llm_completion(model=model, messages=messages)
+        msg = resp['choices'][0]['message']
+        content = (msg.get('content') or msg.get('reasoning_content') or "")
+        if not content:
+            continue
+        messages.append({"role": "assistant", "content": content})
+        # Execute any <sql> probes returned during cooperation
+        sql_blocks = detect_sql_blocks(content)
+        if sql_blocks:
+            try:
+                temp_executor = make_executor(engine, db_path_or_cred)
+                headers_ref, rows_ref = temp_executor.execute(sql_blocks[0].strip())
+                messages.append({"role": "user",
+                                 "content": "SQL_RESULT_TABLE:\n" + format_table(headers_ref, rows_ref)})
+                if hasattr(temp_executor, 'close'):
+                    temp_executor.close()
+            except Exception as e_sql:
+                messages.append({"role": "user", "content": f"SQL_ERROR: {e_sql}"})
+        new_sol = detect_solution(content)
+        if not new_sol:
+            continue
+        try:
+            temp_executor = make_executor(engine, db_path_or_cred)
+            headers_new, rows_new = temp_executor.execute(new_sol)
+            if hasattr(temp_executor, 'close'):
+                temp_executor.close()
+        except Exception as e_exec:
+            messages.append({"role": "user", "content": f"SQL_ERROR: {e_exec}"})
+            continue
+        (out_dir / f"execution_query_after_{artifact_suffix}.sql").write_text(new_sol, encoding='utf-8')
+        write_csv(headers_new, rows_new, out_dir / f"execution_result_after_{artifact_suffix}.csv")
+        return new_sol
+    return None
+
+
+def _feedback_text(verdict: dict, target: str, instruction: str) -> Optional[str]:
+    """Render a refiner verdict as agent-facing feedback, or None when it found no issues."""
+    if str((verdict or {}).get('status', '')).lower() not in ('issues', 'issue', 'incorrect'):
+        return None
+    issues = verdict.get('issues') if isinstance((verdict or {}).get('issues'), list) else []
+    suggested = verdict.get('suggested_fix') or ''
+    tests = verdict.get('tests') if isinstance(verdict.get('tests'), list) else []
+    lines = [f"[Refiner feedback for {target}]", "Issues:"]
+    lines.extend([f"- {it}" for it in issues[:10]] or ["- <none>"])
+    if suggested:
+        lines.append("\nSuggested fix (reference):\n" + suggested)
+    if tests:
+        lines.append("\nTests / checks to satisfy:")
+        lines.extend([f"- {t}" for t in tests[:5]])
+    lines.append(instruction)
+    return "\n".join(lines)
 
 
 # ----------------- Final Artifact Selection -----------------
@@ -72,13 +195,20 @@ def _choose_and_mark_final_artifacts(output_dir: Path, last_cte_name: str = None
         output_dir = Path(output_dir)
         chosen_sql = None
         chosen_csv = None
+        # The final SELECT is refined after every CTE, so its revision supersedes them
+        fs_sql = output_dir / "execution_query_after_final_select.sql"
+        fs_csv = output_dir / "execution_result_after_final_select.csv"
+        if fs_sql.exists():
+            chosen_sql = fs_sql
+        if fs_csv.exists():
+            chosen_csv = fs_csv
         # Prefer after files for the last CTE if provided
         if last_cte_name:
             sql_path = output_dir / f"execution_query_after_{last_cte_name}.sql"
             csv_path = output_dir / f"execution_result_after_{last_cte_name}.csv"
-            if sql_path.exists():
+            if chosen_sql is None and sql_path.exists():
                 chosen_sql = sql_path
-            if csv_path.exists():
+            if chosen_csv is None and csv_path.exists():
                 chosen_csv = csv_path
         # Latest revised artifacts (from refiner revisions)
         if chosen_sql is None:
@@ -435,7 +565,10 @@ def perform_refinement_and_revision(inst: Instance,
                                     verbose: bool,
                                     tribalknowledge_generic_only: bool = True,
                                     external_knowledge: str = None,
-                                    schema_context: str = None) -> Tuple[str, Optional[dict]]:
+                                    schema_context: str = None,
+                                    tkstore_path: Optional[str] = None,
+                                    use_llm_filtering: bool = True,
+                                    filter_model: str = 'gpt-4.1') -> Tuple[str, Optional[dict]]:
     """Run per-CTE refiner flow with cooperative revision and final SELECT refinement.
 
     Returns updated_final_sql, final_select_verdict (optional).
@@ -443,8 +576,32 @@ def perform_refinement_and_revision(inst: Instance,
     # Parse CTEs and remainder
     ctes, remainder_sql = parse_ctes_from_sql(final_sql)
     refiner_model = 'azure/gpt-4.1'
+    retrievals: List[dict] = []
 
-    for idx_cte, c in enumerate(ctes):
+    def retrieve_for(stage: str, name: str, sql_text: str) -> List[dict]:
+        if not tkstore_path:
+            return []
+        candidates, selected = _retrieve_rules_for(
+            sql_text=sql_text,
+            tkstore_path=tkstore_path,
+            db=inst.db,
+            use_llm_filtering=use_llm_filtering,
+            filter_model=filter_model,
+        )
+        retrievals.append({
+            'stage': stage,
+            'name': name,
+            'sql_sha1': hashlib.sha1(sql_text.encode('utf-8')).hexdigest(),
+            'candidates': [str(r.get('mem_id')) for r in candidates],
+            'selected': [str(r.get('mem_id')) for r in selected],
+        })
+        return selected
+
+    # Indexed rather than iterated: adopting a revision below rebinds `ctes`, and the
+    # remaining CTEs must come from that revision.
+    idx_cte = 0
+    while idx_cte < len(ctes):
+        c = ctes[idx_cte]
         cte_name = c.get('name') or ''
         cte_body = c.get('body') or ''
         goal = extract_goal_from_cte_body(cte_body, cte_name)
@@ -464,7 +621,7 @@ def perform_refinement_and_revision(inst: Instance,
             db_id=inst.db,
             user_query=inst.question,
             cte_text=with_sql,
-            cte_goal=goal,
+            cte_goal=_goal_with_knowledge(goal, retrieve_for('cte', cte_name, with_sql)),
             previous_ctes=previous_ctes_text,
             predicted_ctes=predicted_cte_hint or None,
             model=refiner_model,
@@ -478,65 +635,28 @@ def perform_refinement_and_revision(inst: Instance,
         )
         cte_out.write_text(json.dumps(verdict, indent=2), encoding='utf-8')
 
-        vstatus = str((verdict or {}).get('status','')).lower()
-        vissues = verdict.get('issues') if isinstance((verdict or {}).get('issues'), list) else []
-        suggested = verdict.get('suggested_fix') or ''
-        tests = verdict.get('tests') if isinstance(verdict.get('tests'), list) else []
-        if vstatus in ('issues','issue','incorrect'):
-            feedback_lines = [f"[Refiner feedback for CTE {cte_name}]", "Issues:"]
-            if vissues:
-                feedback_lines.extend([f"- {str(it)}" for it in vissues[:10]])
-            else:
-                feedback_lines.append("- <none>")
-            if suggested:
-                feedback_lines.append("\nSuggested fix (reference):\n" + suggested)
-            if tests:
-                feedback_lines.append("\nTests / checks to satisfy:")
-                feedback_lines.extend([f"- {t}" for t in tests[:5]])
-            feedback_lines.append(
-                "\nInstruction: Revise ONLY the CTE named '" + cte_name + "' in your previous solution. Keep other CTEs unchanged.\n"
-                "Output a complete <solution> that includes the revised CTE."
+        feedback = _feedback_text(
+            verdict,
+            f"CTE {cte_name}",
+            f"\nInstruction: Revise ONLY the CTE named '{cte_name}' in your previous solution. Keep other CTEs unchanged.\n"
+            "Output a complete <solution> that includes the revised CTE.",
+        )
+        if feedback:
+            revised = _revise_from_feedback(
+                feedback=feedback,
+                artifact_suffix=cte_name,
+                messages=messages,
+                model=model,
+                engine=engine,
+                db_path_or_cred=db_path_or_cred,
+                out_dir=out_dir,
             )
-            fb_text = "\n".join(feedback_lines)
-            messages.append({"role": "user", "content": fb_text})
-            # small revise loop
-            for attempt in range(1, 6):
-                resp2 = llm_completion(model=model, messages=messages)
-                msg2 = resp2['choices'][0]['message']
-                content2 = (msg2.get('content') or msg2.get('reasoning_content') or "")
-                if not content2:
-                    continue
-                messages.append({"role": "assistant", "content": content2})
-                # Execute any <sql> probes returned during cooperation
-                sql_blocks2 = detect_sql_blocks(content2)
-                if sql_blocks2:
-                    sql_probe = sql_blocks2[0].strip()
-                    try:
-                        temp_executor = make_executor(engine, db_path_or_cred)
-                        headers_ref, rows_ref = temp_executor.execute(sql_probe)
-                        table_text_ref = format_table(headers_ref, rows_ref)
-                        messages.append({"role": "user", "content": "SQL_RESULT_TABLE:\n" + table_text_ref})
-                        if hasattr(temp_executor, 'close'):
-                            temp_executor.close()
-                    except Exception as e_sql:
-                        messages.append({"role": "user", "content": f"SQL_ERROR: {e_sql}"})
-                # Try to adopt a new <solution>
-                new_sol = detect_solution(content2)
-                if new_sol:
-                    try:
-                        temp_executor = make_executor(engine, db_path_or_cred)
-                        headers_new, rows_new = temp_executor.execute(new_sol)
-                        if hasattr(temp_executor, 'close'):
-                            temp_executor.close()
-                        (out_dir / f"execution_query_after_{cte_name}.sql").write_text(new_sol, encoding='utf-8')
-                        write_csv(headers_new, rows_new, out_dir / f"execution_result_after_{cte_name}.csv")
-                        final_sql = new_sol
-                        # Refresh CTE bodies from adopted solution
-                        ctes, remainder_sql = parse_ctes_from_sql(final_sql)
-                        break
-                    except Exception as e_exec:
-                        messages.append({"role": "user", "content": f"SQL_ERROR: {e_exec}"})
-                        continue
+            if revised:
+                final_sql = revised
+                # Refresh CTE bodies from adopted solution
+                ctes, remainder_sql = parse_ctes_from_sql(final_sql)
+
+        idx_cte += 1
 
     # Final SELECT refinement if remainder exists
     final_verdict = None
@@ -556,7 +676,10 @@ def perform_refinement_and_revision(inst: Instance,
             db_id=inst.db,
             user_query=inst.question,
             cte_text=complete_query,
-            cte_goal=f"Final SELECT using {len(ctes)} CTE(s)",
+            cte_goal=_goal_with_knowledge(
+                f"Final SELECT using {len(ctes)} CTE(s)",
+                retrieve_for('final_select', '_final_select', complete_query),
+            ),
             previous_ctes=previous_ctes_text,
             predicted_ctes=predicted_cte_hint or None,
             model=refiner_model,
@@ -569,6 +692,36 @@ def perform_refinement_and_revision(inst: Instance,
             schema_context=schema_context,
         )
         final_out.write_text(json.dumps(final_verdict, indent=2), encoding='utf-8')
+
+        feedback = _feedback_text(
+            final_verdict,
+            "the final SELECT",
+            "\nInstruction: Revise the final SELECT of your previous solution. Keep the CTEs unchanged.\n"
+            "Output a complete <solution>.",
+        )
+        if feedback:
+            revised = _revise_from_feedback(
+                feedback=feedback,
+                artifact_suffix='final_select',
+                messages=messages,
+                model=model,
+                engine=engine,
+                db_path_or_cred=db_path_or_cred,
+                out_dir=out_dir,
+            )
+            if revised:
+                final_sql = revised
+
+    if tkstore_path:
+        (out_dir / 'retrieved_rules.json').write_text(
+            json.dumps({
+                'n_ctes': len(ctes),
+                'filter_model': filter_model,
+                'use_llm_filtering': bool(use_llm_filtering),
+                'retrievals': retrievals,
+            }, indent=2),
+            encoding='utf-8',
+        )
 
     return final_sql, final_verdict
 
@@ -757,6 +910,7 @@ def run_refinement_on_existing_outputs(args):
                 tribalknowledge_generic_only=tribalknowledge_generic_only,
                 external_knowledge=external_knowledge,
                 schema_context=schema_context,
+                **_knowledge_options(args),
             )
             
             # Don't save _refined files - refiner changes are already in _after_ files
@@ -806,7 +960,7 @@ def run_refinement_on_existing_outputs(args):
                                  encoding='utf-8')
 
 
-def main():
+def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="SQL Agent Runner")
     p.add_argument("--instance-id", action="append", default=[], help="Instance ID to run; can repeat")
     p.add_argument("--run-all-from-file", action="store_true", help="Run all instances from JSONL path")
@@ -819,11 +973,41 @@ def main():
     p.add_argument("--refine-output", type=str, default=None, help="Path to existing output directory to run refinement on (skips initial agent generation)")
     p.add_argument("--refine-output-dir", type=str, default=None, help="Destination directory for refinement results (defaults to source + '_withrefiner')")
     p.add_argument("--tribalknowledge-all-scopes", action="store_true", help="Include both generic and database-specific tribalknowledge rules (default: generic only)")
+    p.add_argument("--tkstore", type=str, default=None, help="TK-Store CSV to retrieve rules from; requires --refine-cte or --refine-output")
+    p.add_argument("--no-llm-filtering", action="store_true", help="Skip the FilterKnowledge LLM step of retrieval (ablation only)")
+    p.add_argument("--filter-model", type=str, default="gpt-4.1", help="Model used for the FilterKnowledge step")
     p.add_argument("--out-base", default="outputs_cleaned", help="Base output directory")
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
     # TEMP EXPERIMENT: Add train context file
     p.add_argument("--train-context-file", type=str, default=None, help="[TEMP EXPERIMENT] Path to file with train SQL examples to prepend to system prompt")
+    return p
+
+
+def _knowledge_options(args) -> Dict[str, object]:
+    """Knowledge kwargs for `perform_refinement_and_revision`, or {} when disabled."""
+    if not args.tkstore:
+        return {}
+    if not (args.refine_cte or args.refine_output):
+        raise ValueError(
+            "--tkstore has no effect without --refine-cte or --refine-output, "
+            "because retrieval only runs during refinement"
+        )
+    if not Path(args.tkstore).exists():
+        raise ValueError(f"--tkstore path does not exist: {args.tkstore}")
+    return {
+        'tkstore_path': args.tkstore,
+        'use_llm_filtering': not args.no_llm_filtering,
+        'filter_model': args.filter_model,
+    }
+
+
+def main():
+    p = _build_parser()
     args = p.parse_args()
+    try:
+        _knowledge_options(args)
+    except ValueError as e:
+        p.error(str(e))
 
     # Refinement-only mode: load existing outputs and run refiner
     if args.refine_output:
@@ -1011,6 +1195,7 @@ def main():
                     verbose=bool(args.verbose),
                     external_knowledge=external_knowledge,
                     schema_context=schema_context,
+                    **_knowledge_options(args),
                 )
             except Exception as e:
                 if args.verbose:
