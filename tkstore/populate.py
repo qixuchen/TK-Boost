@@ -7,14 +7,23 @@ the execution trace away. This one keeps both halves and leaves the originals
 untouched.
 """
 
+import argparse
 import json
+import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from evaluation.evaluate import agent_result_matches_gold
 from src.executors.factory import make_executor
 from src.utils.agent_utils import infer_engine, load_external_knowledge
+from src.utils.db_paths import (
+    _default_repo_root,
+    _read_dotenv_value,
+    resolve_sqlite_db_path,
+)
+from src.utils.splits import load_split
 from tkboost import TKStore
 
 from .builder import (
@@ -199,3 +208,178 @@ def populate_from_output_dir(
     result["inserted"] = rows[before:]
     result["rule_count"] = len(rows) - before
     return result
+
+
+class SplitLeakError(ValueError):
+    """Raised when --outputs-base contains an instance that is not in the split."""
+
+    def __init__(self, extra: List[str], split_file: str):
+        self.extra = extra
+        super().__init__(
+            f"outputs-base contains instance ids not in {split_file}: {extra}. "
+            "Refusing to populate to avoid train/test leakage."
+        )
+
+
+def _instance_dirs(outputs_base: Path) -> Dict[str, List[Path]]:
+    grouped: Dict[str, List[Path]] = {}
+    if not outputs_base.is_dir():
+        raise FileNotFoundError(f"outputs-base does not exist: {outputs_base}")
+    for path in sorted(outputs_base.iterdir()):
+        if not path.is_dir():
+            continue
+        grouped.setdefault(instance_id_from_output_dir(str(path)), []).append(path)
+    return grouped
+
+
+def _completed_dir(dirs: List[Path]) -> Optional[Path]:
+    completed = [
+        path
+        for path in dirs
+        if (path / "execution_query.sql").exists()
+        and (path / "execution_query.sql").stat().st_size > 0
+    ]
+    if not completed:
+        return None
+    return max(completed, key=lambda path: path.stat().st_mtime)
+
+
+def _default_model() -> Optional[str]:
+    return os.environ.get("TKBOOST_MODEL") or _read_dotenv_value(
+        _default_repo_root() / ".env", "TKBOOST_MODEL"
+    )
+
+
+def populate_split(
+    outputs_base: str,
+    split_file: str,
+    jsonl_path: str,
+    store: str,
+    gold_dir: str = "evaluation/gold",
+    gold_sql_dir: str = "evaluation/gold/sql",
+    model: Optional[str] = None,
+    rebuild: bool = True,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    """Populate a store from every completed output whose id is in the split.
+
+    Directories whose instance id is not in the split abort the run. The store
+    is wiped first so a rerun cannot accumulate duplicate rules.
+    """
+    allowed = load_split(Path(split_file))
+    grouped = _instance_dirs(Path(outputs_base))
+    extra = sorted(set(grouped) - set(allowed))
+    if extra:
+        raise SplitLeakError(extra, split_file)
+
+    store_path = Path(store)
+    if rebuild and store_path.exists():
+        store_path.unlink()
+
+    instances: List[Dict[str, Any]] = []
+    for instance_id in allowed:
+        completed = _completed_dir(grouped.get(instance_id, []))
+        if completed is None:
+            instances.append(
+                {
+                    "instance_id": instance_id,
+                    "rule_count": 0,
+                    "skipped": "missing_output",
+                    "error": None,
+                    "output_dir": None,
+                }
+            )
+            continue
+        try:
+            result = populate_from_output_dir(
+                output_dir=str(completed),
+                instance_id=instance_id,
+                jsonl_path=jsonl_path,
+                gold_sql_dir=gold_sql_dir,
+                gold_dir=gold_dir,
+                store=str(store_path),
+                db_path_or_cred=resolve_sqlite_db_path(instance_id),
+                model=model,
+                verbose=verbose,
+            )
+            instances.append(
+                {
+                    "instance_id": instance_id,
+                    "rule_count": result.get("rule_count", 0),
+                    "skipped": result.get("skipped"),
+                    "error": None,
+                    "output_dir": str(completed),
+                    "db": result.get("db"),
+                }
+            )
+        except Exception as exc:
+            instances.append(
+                {
+                    "instance_id": instance_id,
+                    "rule_count": 0,
+                    "skipped": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "output_dir": str(completed),
+                }
+            )
+
+    report = {
+        "store": str(store_path),
+        "split_file": split_file,
+        "outputs_base": str(Path(outputs_base)),
+        "instances": instances,
+    }
+    report_path = Path(outputs_base) / "populate_report.json"
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    return report
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Populate a TK-Store from agent outputs on a train split."
+    )
+    parser.add_argument("--outputs-base", required=True)
+    parser.add_argument("--split-file", required=True)
+    parser.add_argument("--jsonl-path", default="data/spider2-lite.jsonl")
+    parser.add_argument("--store", default="artifacts/tkstore_sqlite.csv")
+    parser.add_argument("--gold-dir", default="evaluation/gold")
+    parser.add_argument("--gold-sql-dir", default="evaluation/gold/sql")
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--no-rebuild",
+        action="store_true",
+        help="Append to an existing store instead of wiping it first.",
+    )
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        report = populate_split(
+            outputs_base=args.outputs_base,
+            split_file=args.split_file,
+            jsonl_path=args.jsonl_path,
+            store=args.store,
+            gold_dir=args.gold_dir,
+            gold_sql_dir=args.gold_sql_dir,
+            model=args.model or _default_model(),
+            rebuild=not args.no_rebuild,
+            verbose=args.verbose,
+        )
+    except SplitLeakError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    populated = sum(1 for row in report["instances"] if row["rule_count"] > 0)
+    skipped = sum(1 for row in report["instances"] if row["skipped"])
+    failed = sum(1 for row in report["instances"] if row["error"])
+    print(
+        f"populate: {populated} with rules, {skipped} skipped, {failed} failed; "
+        f"store={report['store']}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

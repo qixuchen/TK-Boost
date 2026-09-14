@@ -578,9 +578,15 @@ python -m tkstore.populate \
 记录每个实例产出多少条规则、失败原因。两者都不进版本库。
 
 **必须内置的护栏**：如果 `--outputs-base` 下出现了不在 `--split-file` 里的实例，
-直接报错退出，而不是静默 populate 进去。这是防泄漏的最后一道闸。
+直接报错退出（退出码 1），**先于**清空 store，而不是静默 populate 进去。这是防泄漏的最后一道闸。
+空目录也按目录名计入，所以一次中断留下的 test 实例目录同样会挡住。
+
+train 集里还没有非空 `execution_query.sql` 的 id 记为 `skipped: "missing_output"`，
+不调 LLM、不算失败。默认每次全量运行前删除 `--store` 再重建；`--no-rebuild` 留给调试。
+模型缺省读 `.env` 的 `TKBOOST_MODEL`。
 
 **验收**：`artifacts/tkstore_sqlite.csv` 行数 > 0；`instance_id` 列的取值集合是 train 集的子集。
+当前 7 个产物里只有 `local003` 和 `local019` 会写入规则，所以验收要等这批（或后续补跑）真的调 LLM 之后才能在磁盘上看到行数 > 0；函数与 CLI 的行为已由 `tests/test_populate_split.py` 覆盖。
 
 ---
 
