@@ -307,6 +307,9 @@ def run_refiner(instance_id: str, db_id: str, user_query: str, cte_text: str, ct
 
         user_payload += "\n\n[CTE]\n" + cte_text.strip()
         user_payload += "\n\n[CTE_GOAL]\n" + cte_goal.strip()
+        # The goal carries any retrieved tribal knowledge, so a verdict can only be
+        # attributed to specific rules if it is recorded here.
+        trace.add_section("CTE GOAL", cte_goal.strip())
         cte_name_hint = _extract_first_cte_name(cte_text)
         if cte_name_hint:
             user_payload += f"\n\n[CTE_NAME]\n{cte_name_hint}"
