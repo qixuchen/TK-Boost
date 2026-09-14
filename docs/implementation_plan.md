@@ -602,6 +602,68 @@ train 集里还没有非空 `execution_query.sql` 的 id 记为 `skipped: "missi
 **前提**：它只能在 `data/splits/spider2_sqlite_test_no_reference_leak.txt`（86 个）上评测，
 因为它训练过的 32 个实例里有 25 个落在我们的 test 里。我们自己的 store 走全部 111 个。
 
+**规则覆盖实测**（决定了能期待多少增益）：66 条 `scope='db'` 行覆盖 22 个库，
+但 86 个免泄漏 test 实例里只有 52 个的库在其中，另外 34 个
+（`BowlingLeague`、`EntertainmentAgency`、`complex_oracle`、`electronic_sales`、`f1`、
+`imdb_movies`、`log`、`oracle_sql`、`school_scheduling` 共 9 个库）只能吃 generic 规则。
+
+`generic_only=False`（B7）是真的要紧。先前拿 local003 单个 CTE 实测时，20 条候选**全是
+generic**，`generic_only` 的两个取值结果相同，据此一度判断 B7 影响不大 —— **这个判断是错的**。
+扩到 4 个实例 24 个片段后，db 专属规则在 8 个片段里进入了候选
+（`local004::customer_summary` 2 条、`local017::top2_sets` 1 条、`local066` 多个片段 1–2 条），
+`generic_only=True` 会把它们全丢掉。local003 那次只是恰好该 CTE 的 3 条 db 规则被
+`data_type` / `nulls` 维度先滤掉了。
+
+## 3.0 前置修复：CTE 循环的陈旧快照
+
+**用途**：这不是工程洁癖，是 Alg 5 的保真问题，必须在 3.1 之前修。
+
+`perform_refinement_and_revision` 的 CTE 循环里，主 agent 采纳新解后有一行
+
+```python
+ctes, remainder_sql = parse_ctes_from_sql(final_sql)   # sql_agent_runner.py:535
+```
+
+注释写的是 "Refresh CTE bodies from adopted solution"，但 `for idx_cte, c in enumerate(ctes)`
+的迭代器在循环开始时就绑定到了原 list 对象上，这里只是**重新绑定名字**，迭代器毫无感知。
+于是第 2 个 CTE 之后拿到的都是修订前的旧 CTE 体，传给 refiner 的
+`previous_ctes_text = ctes[:idx_cte]` 也是旧的。更别扭的是循环**之后**的 final SELECT
+那段读的是重绑定后的新值 —— 同一个函数里循环用旧的、final SELECT 用新的，半生效。
+
+论文里 `number_of_CTEs(s_t)` 和 `c_i` 都取自**当前**的 `s_t`，每轮从最新 SQL 重取。
+所以这是对 Alg 5 的偏离，不只是工程 bug。接上检索后它还会让 `retrieved_rules.json`
+里记的「规则是为这段 SQL 检索的」对不上真正在跑的 SQL，直接毁掉阶段 4.2 的 `rules_used` 归因。
+
+**改法**：把 `for idx_cte, c in enumerate(ctes)` 换成显式下标的 `while` 循环，
+每轮从最新的 `ctes` 取 `ctes[idx]`。注意新解的 CTE 个数可能变化，循环条件要用
+`idx < len(ctes)` 实时求值。
+
+**验收**：Red 用一个 stub 掉 `refiner_run` 与 `llm_completion` 的测试 —— 第 1 个 CTE 被
+"修好"后返回一个 CTE 体全变了的新解，断言第 2 轮 refiner 收到的 `cte_text` 是**新**的体。
+修之前该断言必须失败。
+
+**已完成**（偏差记为 C16）。`tests/test_refinement_cte_refresh.py` 5 个测试，改前 2 红 3 绿。
+产品改动 6 行：`for idx_cte, c in enumerate(ctes)` → `while idx_cte < len(ctes)` + `c = ctes[idx_cte]`
++ 循环末尾 `idx_cte += 1`。
+
+实际缺陷比原先描述的窄：`previous_ctes`（`ctes[:idx_cte]`）和循环之后的 final SELECT 段
+读的都是重绑定后的**新**值，陈旧的只有循环变量 `c` 本身和迭代轮数。那两条断言写成了
+characterization 测试留作重构护栏。
+
+**顺带发现并修掉了 C17**，它直接决定阶段 3 的有效样本量。`parse_ctes_from_sql` 有两处
+会让 CTE 列表静默丢失或截断：定位 `WITH` 用的是裸词 `\bwith\b`，会命中前导注释里的英文
+"with"（`local066` 因此解析出 **0 个 CTE**，尽管 SQL 里有 10 个 `AS (`）；remainder 起点用
+右括号之后 20 字符内有无 `SELECT` 判断，下一个 CTE 名字短的时候会把它自己的 `SELECT`
+算进去从而截断。解析成 0 个 CTE 时逐 CTE 循环整个跳过，Alg 5 的 per-CTE 检索一次都不发生。
+
+改法：`WITH` 改用跳过注释的 `_find_sql_keyword`；remainder 边界改成"跳过空白与注释后
+是否为逗号"——逗号说明还有 CTE，否则就是 remainder。`tests/test_parse_ctes.py` 14 个测试，
+分两个循环各自见过 Red（3 红 / 2 红）。修后手上 12 个真实 SQL 的 `parsed == AS( 计数`
+全部相等，`local066` 从 0 个恢复成 10 个。
+
+即便如此，3.1 的 `retrieved_rules.json` 仍要记下 `n_ctes` —— 这个解析器是 best-effort 的，
+真解析成 0 个 CTE 时那个实例其实是退化成单次整句精修，不记下来会把它的 0 增益误算进结论。
+
 ## 3.1 把检索接进 agent workflow
 
 **用途**：消除 A1。这是整个计划的核心一步。
@@ -622,6 +684,7 @@ train 集里还没有非空 `execution_query.sql` 的 id 记为 `skipped: "missi
 ```python
 tkstore_path: Optional[str] = None,      # tkstore CSV；None 则完全退化为当前 baseline 行为
 use_llm_filtering: bool = True,          # 对应论文 FilterKnowledge，默认开，见下
+filter_model: str = "gpt-4.1",           # FilterKnowledge 用的模型，必须显式传，见下
 ```
 
 **改动**：
@@ -636,6 +699,9 @@ use_llm_filtering: bool = True,          # 对应论文 FilterKnowledge，默认
        generic_only=False,        # 必须 False，否则 db 专属规则全丢（B7）
        db=inst.db,
        use_llm_filtering=True,    # 论文 Alg 4 最后一步是固定步骤（B1）
+       llm_model=filter_model,    # 必须显式传，默认值会静默退化，见下
+       # 绝对不要传 instance_id：search_index_for_sql:532 用同名局部变量覆盖了形参（C14），
+       # 传了等于没过滤，还会让人误以为做了实例级过滤
    )
    ```
 
@@ -645,17 +711,49 @@ use_llm_filtering: bool = True,          # 对应论文 FilterKnowledge，默认
    cte_goal = f"{goal}\n\nUse these tribal knowledge rules as guidance:\n\n{rules_block}"
    ```
 
-4. 检索为空时保持 `goal` 原样，不要塞空的知识段落进 prompt
+4. **同样要在 final SELECT 那一段注入**（`:554-570`）。原计划漏了这个点：
+   现在传的是不含任何知识的固定串 `f"Final SELECT using {len(ctes)} CTE(s)"`，
+   而 `tkboost.sql()` 这一侧对 remainder 也是调 `_rules_block_for` 的
+   （`tkboost/__init__.py:659`）。**更要紧的是 draft SQL 不含 `WITH` 时 `ctes` 为空、
+   CTE 循环根本不执行，整条 SQL 全落在这个分支** —— 只改循环的话，所有无 CTE 的实例
+   会一条规则都注入不到。检索的 `sql_text` 用 `rebuild_sql_from_ctes(ctes, remainder_sql)`
+   的完整 SQL，与 `tkboost/__init__.py:659` 一致。
+5. 检索为空时保持 `goal` 原样，不要塞空的知识段落进 prompt
 
-**两个默认值必须显式设成这样**，否则跑的不是论文方法：
-`generic_only=False`（B7，三处默认值不一致）、`use_llm_filtering=True`
-（B1，默认 `False` 会跳过 `FilterKnowledge`）。
+**三个参数必须显式设成这样**，否则跑的不是论文方法：
+
+- `generic_only=False`（B7，三处默认值不一致）
+- `use_llm_filtering=True`（B1，默认 `False` 会跳过 `FilterKnowledge`）
+- `llm_model` 显式传一个 **OpenAI 口径**的模型名（决策：`gpt-4.1`，与 agent / populate 一致）
+
+第三条是个**静默失效陷阱**，单独说清。`tkstore/tagger_index.py` 是三个模块里唯一
+没有 `AZURE_TO_OPENAI_MODEL` 映射的（`sql_agent_runner.py:40` 和 `cte_refiner.py:21` 都有），
+它直接 `litellm.completion(model=model)`；而 `MemoryRetriever.retrieve` 的默认
+`llm_model="azure/gpt-4.1"`（`tagger_index.py:1043`）。我们的 `.env` 只有 `OPENAI_API_KEY`
+和 `TKBOOST_MODEL="gpt-4.1"`，没有 `AZURE_*`。这个调用会抛异常，然后被
+`_llm_filter_relevant_rules` 自己的兜底吞掉、**原样返回全部候选规则**
+（`tagger_index.py:745-750` 和 `:1016-1022`），只在 stdout 打一行 `[ERROR in LLM filtering]`。
+结果是"开了 FilterKnowledge"和"没开"看起来都正常，实际上 Alg 4 的最后一步整步没跑，
+prompt 里塞的是 20 条未筛选规则。
 
 **输出**：
 
 - 每个 CTE 的 refiner prompt 里带上检索到的规则
-- 落盘一份 `<out_dir>/retrieved_rules.json`，记录每个 CTE 检索到哪些 `mem_id`。
-  这个用于事后归因，判断增益到底来自哪条规则，别省。
+- 落盘一份 `<out_dir>/retrieved_rules.json`，用于事后归因，别省。schema 要**区分
+  code filter 候选与 LLM 选中**，否则分不清规则是在 Alg 4 哪一步丢的：
+
+  ```json
+  {"n_ctes": 2, "filter_model": "gpt-4.1", "use_llm_filtering": true,
+   "retrievals": [{"stage": "cte", "name": "customer_months", "sql_sha1": "…",
+                   "candidates": ["24", "26"], "selected": ["26"]}]}
+  ```
+
+  `n_ctes` 用于统计有多少实例因 C17 退化成 0 个 CTE，见 3.0 末尾。
+  `sql_sha1` 是被检索的那段 SQL 的指纹，用于确认规则是针对**当前**而非陈旧的 CTE 检索的。
+
+  原计划里还有个 `filter_ok` 字段，**去掉了**：`_llm_filter_relevant_rules` 在自己内部
+  吞掉异常并返回全量候选，我们在外面拿不到真假，写一个可能撒谎的字段比不写更糟。
+  改成靠下面的显式守卫在**调用前**拦住已知的静默退化。
 - 最终 SQL 仍由现有 `_choose_and_mark_final_artifacts`（`:62`）提升为
   `execution_result_final.csv`，评测侧不用改
 
@@ -663,8 +761,41 @@ use_llm_filtering: bool = True,          # 对应论文 FilterKnowledge，默认
 
 1. 不传 `--tkstore` 时，输出与阶段 3 之前逐字节一致（保证 baseline 可比）
 2. 传 `--tkstore` 时，`retrieved_rules.json` 非空，且 refiner trace 里能看到规则文本
-3. 至少有一个实例的 `execution_query_after_<cte>.sql` 与 `execution_query.sql` 不同，
+3. 传一个在 `AZURE_TO_OPENAI_MODEL` 里没有对应项的 `azure/...` 模型名时**直接报错**，
+   而不是跑完之后才发现 FilterKnowledge 没生效
+4. 无 CTE 的输入也能拿到规则：用一条不含 `WITH` 的 SQL 走单元测试，断言
+   final SELECT 分支的 `cte_goal` 里含规则文本
+5. 至少有一个实例的 `execution_query_after_<cte>.sql` 与 `execution_query.sql` 不同，
    证明回环真的生效了
+
+**原来的验收 3 是错的，已改成上面这条。** 原文写的是"至少有一条记录满足
+`len(selected) < len(candidates)`，用来抓静默退化"。实测推翻了它：拿 `local003` 的 CTE
+对真实上游 store 跑一次真调用，20 条候选**全部被选中**（`selected == candidates`），
+且没有任何错误输出，说明过滤确实成功执行了，只是 `_process_rule_chunk` 的 prompt 明确写着
+"It's better to include a rule that might be relevant than to exclude one"，天然偏向全选。
+所以"没收窄"不能推出"没生效"，这条断言会给出假警报。
+
+**FilterKnowledge 实测（4 个实例 / 24 个片段 / 34 次调用）**：`local004`、`local017`、
+`local039`、`local066`，用它们真实的 agent SQL 逐 CTE 加 final SELECT 跑完两级漏斗。
+
+| 指标 | 结果 |
+| --- | --- |
+| 候选合计 → 选中合计 | 290 → 243（收窄 16%） |
+| 发生收窄的片段 | 17 / 24 |
+| 每片段候选数范围 | 1 – 36 |
+| FilterKnowledge 调用数 | 34（约 8.5 次/实例） |
+
+**结论：保留 `use_llm_filtering=True`。** 它确实在做筛选，不是 pass-through。
+7 个"一条没淘汰"的片段几乎都是候选本来就极少的（1 / 4 / 5 / 7 条），无可筛。
+收窄最明显的是候选多的片段：`qualifying_cities` 5→1、`set_frequency` 17→10、
+`customer_summary` 23→15、`local066` 的 final SELECT 27→19。
+
+**这推翻了先前基于 `local003` 单点得出的"基本不起筛选作用"。** 那一次是 20→20，
+属于异常样本而非常态。教训是不要用一个片段的观察去推断整个检索层的行为。
+
+顺带两条：final SELECT 片段的候选数总是全实例最多的（整条 SQL 匹配到的操作维度最多），
+所以它也是最需要过滤的地方；`local066` 能逐 CTE 检索 10 次是 3.0 修掉 C17 的直接收益，
+修之前它是 0 次。
 
 ## 3.2 CLI 参数贯通
 
@@ -676,12 +807,201 @@ use_llm_filtering: bool = True,          # 对应论文 FilterKnowledge，默认
 | --- | --- |
 | `--tkstore <csv>` | tkstore CSV 路径，不传则不注入知识 |
 | `--no-llm-filtering` | 关掉 `FilterKnowledge`，仅用于消融实验 |
+| `--filter-model <name>` | FilterKnowledge 的模型，默认 `gpt-4.1` |
 
-在 `main()` 里透传给 `perform_refinement_and_revision`。
-现有的 `--tribalknowledge-all-scopes` 保持原样不动 —— 它最终传给 `run_refiner` 的那个
-同名参数是死参数（B12），改它没有意义，也不在本轮范围。
+**两个调用点都要透传**，不只 `main()`：`:1002`（正常跑）和
+`:747::run_refinement_on_existing_outputs`（`--refine-output` 续跑）。漏掉后者会让
+复跑时知识静默丢失，而这条路径恰好是最容易被用来省钱重跑的。
 
-**验收**：`--help` 能看到新参数；传一个不存在的路径时报清晰错误而不是静默跳过。
+**`--tkstore` 必须校验前置条件，不能静默无效**。检索只发生在
+`perform_refinement_and_revision` 里，而它只在 `if args.refine_cte and final_sql`
+（`:1000`）时被调用。所以：
+
+- 传了 `--tkstore` 但没传 `--refine-cte` → 直接报错退出，别静默跑成 baseline
+- `--tkstore` 指向不存在的路径 → 报错退出，别静默跳过
+
+现有的 `--tribalknowledge-all-scopes` 保持原样不动（决策）—— 它最终传给 `run_refiner`
+的那个同名参数是死参数（B12），改它没有意义；更不要把它接到新的 `generic_only` 上，
+那会让人误以为过去带这个 flag 跑的实验是有效的。
+
+**验收**：`--help` 能看到新参数；`--tkstore` 缺 `--refine-cte` 或路径不存在时报清晰错误。
+
+**已完成。** `tests/test_cli_knowledge_args.py` 11 个测试，写完先跑全红（`_build_parser`
+尚不存在），实现后全绿。为了让 CLI 可测，把 parser 从 `main()` 里抽成 `_build_parser()`，
+校验与 kwargs 组装抽成纯函数 `_knowledge_options(args)`，两个调用点都用 `**_knowledge_options(args)`
+透传。
+
+`--refine-output` 也被接受为合法的 refinement stage（它无条件精修，不需要 `--refine-cte`）。
+两条拒绝路径实测退出码均为 2，消息分别是
+`--tkstore has no effect without --refine-cte or --refine-output, because retrieval only runs during refinement`
+和 `--tkstore path does not exist: <path>`。
+
+**覆盖缺口（明确记下）**：`--refine-output` 续跑路径的透传有测试（stub 掉
+`perform_refinement_and_revision` 后断言收到了 `tkstore_path`）；**正常跑那条路径的透传没有自动化测试**，
+因为它要先跑完整个外层 ReAct 循环，成本不合适。那处只靠 `_knowledge_options` 的单元测试
+加人工核对调用点。3.3 冒烟时 `retrieved_rules.json` 是否出现，就是这条路径的实际验证。
+
+## 3.3 链路冒烟（放开全量之前）
+
+**用途**：花小钱验证两个注入点、FilterKnowledge 真的生效、以及 agent 回环真的改了 SQL。
+
+**实例**（决策：5 个，刻意覆盖 db 规则的三档密度，都来自 86 个免泄漏子集）：
+
+| 实例 | 库 | db 规则数 | 覆盖意图 |
+| --- | --- | --- | --- |
+| `local074` | `bank_sales_trading` | 12 | db 规则最密，最可能命中库专属知识 |
+| `local025` | `IPL` | 6 | 中等密度 |
+| `local070` | `city_legislation` | 1 | 稀疏，验证只有 1 条时不崩 |
+| `local310` | `f1` | 0 | 无 db 规则，只走 generic |
+| `local269` | `oracle_sql` | 0 | 同上，另一个库 |
+
+**有 CTE / 无 CTE 这个维度没法事前选**——取决于 agent 当场吐什么。所以：跑完先检查这 5 个
+里有没有产出不含 `WITH` 的 SQL；如果没有，无 CTE 那条路径就靠 3.1 验收第 4 条的单元测试
+兜住，不额外花钱去凑一个真实实例。
+
+**验收**：3.1 的 5 条验收在这 5 个实例上全过。
+
+## 3.3 结果
+
+5 个实例全部跑完（`outputs/smoke_augmented/`，约 45 分钟）。
+
+| 实例 | 库 | n_ctes | 检索片段 | 候选→选中 | 选中的 db 规则 | `after_*.sql` | 最终 SQL 有变化 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `local025` | IPL | 5 | 6 | 90 → 68 | 6 | 5 | 是 |
+| `local070` | city_legislation | 5 | 6 | 74 → 57 | 0 | 3 | 是 |
+| `local074` | bank_sales_trading | **0** | 1 | 36 → 31 | 6 | 0 | **否** |
+| `local269` | oracle_sql | **0** | 1 | 21 → 16 | 0 | 0 | **否** |
+| `local310` | f1 | 5 | 6 | 101 → 70 | 0 | 2 | 是 |
+| 合计 | | | 20 | 322 → 242 | | 10 | 3/5 |
+
+**通过的验收**：`retrieved_rules.json` 全部生成（这同时是 3.2 里那条没有自动化测试的
+正常跑路径的实际验证）；20 个片段里 15 个发生收窄，与先前 4 实例漏斗研究一致；
+每个片段的 `sql_sha1` 互不相同，说明规则是针对各自那段 SQL 检索的；
+3 个实例产出了 10 个 `execution_query_after_*.sql` 且与原始 SQL 不同，agent 回环有效。
+
+**3.0 修复在生产里的直接证据**：`local025` 的原始 SQL 有 6 个 CTE，精修 `over_runs` 时
+agent 的新解删掉了 `over_with_bowler`，列表变成 5。修复前迭代器绑定原始 6 元素列表，
+会去精修一个已不存在的 CTE；修复后循环重新读取，`retrieved_rules.json` 里正好是 5 次
+CTE 检索且没有 `over_with_bowler`。
+
+### 三个必须记下的问题
+
+**一、验收 #2 按原文无法满足，已作废。** 原文要求"refiner trace 里能看到规则文本"。
+但 `cte_refiner` 的 `trace.add_section` 只记 USER QUERY / LLM THINKING / SQL QUERY /
+SQL RESULT / VERDICT，**从不记录自己的 prompt**，而 `[CTE_GOAL]` 才是知识的唯一落点。
+实测把 `local074` 选中的 31 条规则原文逐条去 trace 里找，命中 0 条 —— 这不代表注入失败，
+只代表 trace 记不下来。注入本身由 3.1 的单元测试覆盖。记为 B15。
+
+**二、C18：解析器还有两种语法会返回 0 个 CTE，冒烟里命中 2/5。**
+`local269` 是 `WITH RECURSIVE packaging_expansion AS (`，解析器把 `RECURSIVE` 当 CTE 名
+读掉；`local074` 是 `WITH\nmonths(month) AS (`，CTE 带列名列表。两者都在"读完名字后硬性
+期待 `AS`"这一步 break。与 3.0 修的 C17 同类但成因不同。
+
+**三、B14：final SELECT 的 verdict 算出来就丢掉，从不回灌 agent。**
+逐 CTE 那段有完整的 feedback → agent 重出 `<solution>` → 落盘回环；final SELECT 这段
+只调 `refiner_run` 写 `refiner_final_select.json`，没有 `messages.append`，没有修订循环。
+
+**二 + 三叠加的后果是本轮最重要的发现**：任何解析出 0 个 CTE 的实例，增强对最终 SQL 的
+影响必然为零 —— 知识检索到了（`local074` 36→31、`local269` 21→16）、注入 refiner 了、
+verdict 也产出了，但没有任何通路能改动输出。这两个实例的 `execution_query_final.sql`
+与 `execution_query.sql` 逐字节相同。也就是说，如果直接放开全量，
+**这类实例会以"增益 0"的身份计入结果，而原因是工程缺陷而非知识无效**。
+
+冒烟集里占 40%。放开 86 个实例前必须先量化真实占比，否则 baseline vs augmented 的
+差值会被系统性稀释。
+
+### 三个问题的处置（均已修，TDD）
+
+| 编号 | 修法 | 回归覆盖 |
+| --- | --- | --- |
+| C18 | `WITH` 后跳过可选 `RECURSIVE`；CTE 名后遇 `(` 用 `_skip_balanced_parens` 跳过列名列表再期待 `AS` | `tests/test_parse_ctes.py::TestCteHeaderSyntax`（6 例） |
+| B15 | `[CTE_GOAL]` 拼好处补 `trace.add_section("CTE GOAL", ...)` | `tests/test_refiner_trace_goal.py`（3 例） |
+| B14 | 抽出 `_feedback_text` / `_revise_from_feedback`，逐 CTE 与 final SELECT 共用回灌逻辑；final-select 产物在 `_choose_and_mark_final_artifacts` 里提到最高优先级 | `tests/test_final_select_feedback.py`（8 例） |
+
+B14 里那条优先级调整是必须的：`_choose_and_mark_final_artifacts` 原本让调用方传的
+`last_cte_name` 压过 mtime，final-select 的修订会被静默丢弃，等于白做。
+
+C18 修完后 `local074` 由 0 个 CTE 变 6 个（`months, customers, month_grid, txn_sums,
+joined, final`），`local269` 由 0 个变 3 个（`packaging_expansion, leaf_expansion,
+leaf_totals`）。
+
+全量测试 169 passed。
+
+### 修复后的端到端复验（`local074`，`outputs/smoke_verify/`）
+
+挑之前"增强必然无效"的 `local074` 重跑一遍：
+
+- **C18**：`n_ctes` 由 0 变 4（`txn_monthly, cust_calendar, txn_activity, final`），检索片段由
+  1 个变 5 个，5 个片段全部发生收窄（24→20、7→6、24→17、13→5、35→29）。
+- **B15**：`refiner_txn_monthly_trace.txt` 里有 `=== CTE GOAL ===` 段落，且该片段选中的
+  20 条规则**原文全部可在 trace 中定位**，归因链路完整可审计。
+- **B14**：这一轮 final SELECT 的 verdict 是 `ok`，回灌路径没被触发（生产侧未验证，
+  逻辑由 8 个单元测试覆盖）。但产物优先级已生效：`execution_query_final.sql` 取自
+  `execution_query_after_txn_activity.sql`，**与原始 SQL 不同**（修复前逐字节相同）。
+
+也就是说这个实例从"结构上不可能产生增益"变成了真的被修订。
+
+### 修复后 5 实例整体重跑（`outputs/smoke_augmented_v2/`，约 50 分钟）
+
+| 实例 | n_ctes 前→后 | 片段 前→后 | 候选→选中（后） | `after_*` 前→后 | 最终 SQL 有变 前→后 | finalSel verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| `local025` | 5 → 3 | 6 → 4 | 73 → 60 | 5 → 2 | True → True | ok |
+| `local070` | 5 → **0** | 6 → 1 | 9 → 4 | 3 → 1 | True → True | **issues（已回灌）** |
+| `local074` | **0 → 5** | 1 → 6 | 91 → 67 | 0 → 1 | **False → True** | ok |
+| `local269` | **0 → 3** | 1 → 4 | 44 → 32 | 0 → 1 | **False → True** | **issues（已回灌）** |
+| `local310` | 5 → 5 | 6 → 6 | 104 → 75 | 2 → 3 | True → True | ok |
+| 合计 | | 20 → 21 | 321 → 238 | | **3/5 → 5/5** | |
+
+**核心结果：最终 SQL 发生变化的实例由 3/5 变成 5/5。** 之前那两个"结构上不可能产生增益"
+的实例现在都被真正修订了。整体过滤收窄率 26%（321 → 238），17/21 个片段发生收窄。
+
+**B14 的生产侧这次被验证了。** `local070` 与 `local269` 的 final SELECT verdict 是
+`issues`，回灌确实触发并落了 `execution_query_after_final_select.sql`。其中 `local070`
+这轮 agent 产出的是纯 `UNION ALL`、**完全不含 `WITH`** 的查询（已核对全文，0 个 CTE 是
+正确解析而非新 bug），修复前它必然空转 —— 这正是 B14 要救的场景。
+
+**B15 可审计性 5/5 通过**：每个实例首个片段选中的规则原文在对应 trace 里 100% 可定位
+（5/5、4/4、1/1、1/1、13/13），`=== CTE GOAL ===` 段落全部存在。
+
+### 正确性评测（补做，`evaluation/evaluate.py --mode exec_result`）
+
+3.3 原本只验了链路与结构，没有比对执行结果。补跑评测后：
+
+| 实例 | 修复前 base → final | 修复后 base → final |
+| --- | --- | --- |
+| `local025` | ✗ → ✗ | ✗ → ✗ |
+| `local070` | ✗ → ✗ | ✗ → ✗ |
+| `local074` | **✓ → ✓** | **✓ → ✓** |
+| `local269` | ✗ → ✗ | ✗ → **✓** |
+| `local310` | ✗ → ✗ | ✗ → **✓** |
+| 合计 | 1/5 → 1/5 | 1/5 → **3/5** |
+
+`base` 是精修前的 `execution_result.csv`，`final` 是精修后的 `execution_result_final.csv`。
+两轮都**没有出现 ✓ → ✗ 的回退**。
+
+**修复前精修的净收益是 0**：3 个实例的 SQL 被改动，但一个都没改对。修复后变成 +2。
+
+**但 +2 不能都记在修复上，逐实例归因如下**：
+
+- `local269` 与修复有合理因果链：修复前 0 个 CTE、增益结构上不可能；修复后拿到 3 个 CTE
+  的逐段精修，且 final SELECT verdict 为 `issues` 并成功回灌，然后变对。
+- `local310` **与三个修复都无关**：两轮都是 5 个 CTE（C18 不影响它），final SELECT verdict
+  为 `ok`（B14 未触发）。它修复前 ✗→✗、修复后 ✗→✓，只能归因于 run-to-run 波动。
+- `local074` 虽然是 C18 修复效果最显著的实例（0→5 个 CTE），但它**两轮 base 就已经是对的**，
+  分数没变。前文强调它"从不可能产生增益变成真的被修订"在链路上成立，在分数上无体现。
+
+**更重要的是这组数字不能当作知识增益。** 外层 ReAct agent 全程看不到 tribal knowledge
+（知识只进 `refiner_run` 的 `cte_goal`），所以 `base` 确实是无知识产出、`final` 是带知识
+精修后产出。但 refiner 同时在探库，`base → final` 的差值里**混着探库增益与知识增益**，
+正是先前讨论过的两臂设计的归因缺陷。要单独归因给知识，仍需第三臂（带 refiner 不带知识）。
+
+n=5，且下面这条波动观察成立，因此 1/5 → 3/5 不具统计意义，只能作为"链路没跑坏、且方向
+不为负"的信号。
+
+**一个要带进阶段 4 的观察：run-to-run 波动很大。** 同一实例两次运行的 CTE 结构可以完全
+不同（`local025` 5→3、`local070` 5→0），候选规则数随之从 74 掉到 9。这说明
+baseline vs augmented 的**单次对比噪声很高**，差值小于波动幅度时不可解读。阶段 4 需要
+先确定重复次数或改用配对设计。
 
 ---
 
@@ -706,10 +1026,14 @@ use_llm_filtering: bool = True,          # 对应论文 FilterKnowledge，默认
 
 ```
 populate    : 2.1 train 集 agent 输出 → 2.3 批量 populate → store
-baseline    : test 集跑 agent，不传 --tkstore          → outputs/test_baseline/
-augmented   : test 集跑 agent，传 --tkstore + --refine-cte → outputs/test_augmented/
+baseline    : test 集跑 agent，不传 --tkstore 也不传 --refine-cte → outputs/test_baseline/
+augmented   : test 集跑 agent，传 --tkstore + --refine-cte      → outputs/test_augmented/
 evaluate    : 对两个目录分别跑 evaluate.py，汇总对比
 ```
+
+**决策：只跑这两臂**，不做"有 refiner 无知识"的第三臂。理由是论文自己的 baseline 就是
+完全不带 Alg 5 的原始 agent，两臂在口径上对齐 Fig. 6。代价是差值无法分离，
+必须在结果里写清，见下方"本轮不做"的最后一段。
 
 **输出**：`outputs/pipeline_<timestamp>/` 下含两侧的实例目录、两份评测结果、
 一份汇总 JSON。
@@ -747,18 +1071,25 @@ evaluate    : 对两个目录分别跑 evaluate.py，汇总对比
 
 | 阶段 | agent 运行次数 | 说明 |
 | --- | --- | --- |
-| 2.1 | 34 | train 集，外层 ReAct 最多 25 轮 |
+| 2.1 | 24（已跑 7） | 我们的 train 集 = 有 gold SQL 的 24 个，外层 ReAct 最多 25 轮 |
 | 2.2/2.3 | 0 | 每实例约 3–4 次 LLM 调用（diff 循环最多 6 轮） |
-| 4 baseline | 101 | test 集 |
-| 4 augmented | 101 | test 集，额外含 refiner 的 25 轮探库循环 |
+| 3.3 冒烟 | 5 | 只跑 augmented 一侧 |
+| 4 baseline | 86 | 上游 store 轨道的免泄漏子集 |
+| 4 augmented | 86 | 同上，额外含 refiner 的 25 轮探库循环 |
 
-合计约 236 次 agent 运行。augmented 一侧因为带 refiner 探库，单实例成本明显高于 baseline。
-建议先在 3–5 个实例上把整条链路跑通，再放开跑全量。
+**检索本身的 LLM 开销实测**：每个 CTE 约 20 条 code filter 候选，按 `CHUNK_SIZE=15` 切
+就是 2 次 `FilterKnowledge` 调用。按每实例 3 个 CTE 加 1 个 final SELECT 算，
+**光检索每实例约 8 次调用**，86 个实例约 690 次 —— 这还没算 refiner 每个 CTE 的 25 轮探库。
+augmented 一侧单实例成本明显高于 baseline。
+
+先按 3.3 的 5 个实例把链路跑通，再放开全量。
 
 ## 本轮不做
 
 - [`deviations.md`](./deviations.md) **B 组**全部 —— 检索只用 3 维特征、正则抽特征、
   refiner 是 25 轮探库循环而非单次 `Feedback`、每 CTE 修订 5 次上限等
+  （唯一例外是 3.0 那条陈旧快照，它是 Alg 5 的保真问题，本轮修）
+- "有 refiner 无知识"的第三臂对照（决策：只跑两臂）
 - BIRD / minidev 适配
 - ReFORCE agent（论文 6.1.3 用它证明通用性，不是主结果）
 - 论文 6.4 的各项消融
