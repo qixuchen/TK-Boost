@@ -201,6 +201,54 @@ def infer_engine(instance_id: str) -> str:
     return "sqlite"
 
 
+_COMMENT_RE = re.compile(r"--[^\n]*|/\*[\s\S]*?\*/")
+
+
+def _skip_ws_and_comments(text: str, pos: int) -> int:
+    """Advance past whitespace and SQL comments starting at `pos`."""
+    n = len(text)
+    while pos < n:
+        if text[pos].isspace():
+            pos += 1
+        elif text.startswith('--', pos):
+            end = text.find('\n', pos)
+            pos = n if end == -1 else end + 1
+        elif text.startswith('/*', pos):
+            end = text.find('*/', pos)
+            pos = n if end == -1 else end + 2
+        else:
+            break
+    return pos
+
+
+def _skip_balanced_parens(text: str, pos: int) -> int:
+    """Advance past the parenthesised group opening at `pos`."""
+    depth = 0
+    n = len(text)
+    while pos < n:
+        if text[pos] == '(':
+            depth += 1
+        elif text[pos] == ')':
+            depth -= 1
+            if depth == 0:
+                return pos + 1
+        pos += 1
+    return pos
+
+
+def _find_sql_keyword(text: str, keyword: str) -> Optional[re.Match]:
+    """First occurrence of `keyword` that is not inside a comment.
+
+    Agents routinely describe their plan in a leading comment, and English prose
+    such as "joins orders with customers" otherwise reads as the WITH clause.
+    """
+    spans = [(m.start(), m.end()) for m in _COMMENT_RE.finditer(text)]
+    for match in re.finditer(rf"\b{keyword}\b", text, flags=re.IGNORECASE):
+        if not any(start <= match.start() < end for start, end in spans):
+            return match
+    return None
+
+
 def parse_ctes_from_sql(sql_text: str) -> Tuple[List[Dict[str, str]], str]:
     """Best-effort parse of CTEs and remainder SELECT.
 
@@ -212,12 +260,15 @@ def parse_ctes_from_sql(sql_text: str) -> Tuple[List[Dict[str, str]], str]:
     ctes: List[Dict[str, str]] = []
     remainder = text
     # Seek 'with'
-    m = re.search(r"\bwith\b", text, flags=re.IGNORECASE)
+    m = _find_sql_keyword(text, "with")
     if not m:
         return ctes, text
     i = m.start()
     # From 'with' to the end, parse name AS ( ... ) blocks separated by commas until we reach a SELECT
     j = i + 4
+    j = _skip_ws_and_comments(text, j)
+    if re.match(r"(?i)recursive\b", text[j:j + 10]):
+        j += len("recursive")
     while j < n:
         # skip whitespace, commas, and comments
         while j < n:
@@ -238,9 +289,11 @@ def parse_ctes_from_sql(sql_text: str) -> Tuple[List[Dict[str, str]], str]:
         name = text[name_start:j].strip()
         if not name:
             break
-        # skip whitespace
-        while j < n and text[j].isspace():
-            j += 1
+        j = _skip_ws_and_comments(text, j)
+        # optional column list, as in `months(month) AS (`
+        if j < n and text[j] == '(':
+            j = _skip_balanced_parens(text, j)
+            j = _skip_ws_and_comments(text, j)
         # expect 'as'
         if not re.match(r"(?i)as", text[j:j+2] or ""):
             break
@@ -266,9 +319,9 @@ def parse_ctes_from_sql(sql_text: str) -> Tuple[List[Dict[str, str]], str]:
             j += 1
         else:
             break
-        # peek next token; if SELECT likely remainder
-        lookahead = text[j:j+20].lower()
-        if re.search(r"\bselect\b", lookahead):
+        # A comma introduces another CTE; anything else begins the remainder.
+        next_pos = _skip_ws_and_comments(text, j)
+        if next_pos >= n or text[next_pos] != ',':
             remainder = text[j:].strip()
             break
         # else loop for next CTE name
