@@ -743,13 +743,21 @@ prompt 里塞的是 20 条未筛选规则。
   code filter 候选与 LLM 选中**，否则分不清规则是在 Alg 4 哪一步丢的：
 
   ```json
-  {"n_ctes": 2, "filter_model": "gpt-4.1", "use_llm_filtering": true,
+  {"tkstore": {"path": "tkstore/tkstore_sqlite.csv", "sha1": "3f75f169…", "n_rules": 118},
+   "n_ctes": 2, "filter_model": "gpt-4.1", "use_llm_filtering": true,
    "retrievals": [{"stage": "cte", "name": "customer_months", "sql_sha1": "…",
                    "candidates": ["24", "26"], "selected": ["26"]}]}
   ```
 
   `n_ctes` 用于统计有多少实例因 C17 退化成 0 个 CTE，见 3.0 末尾。
   `sql_sha1` 是被检索的那段 SQL 的指纹，用于确认规则是针对**当前**而非陈旧的 CTE 检索的。
+
+  `tkstore` 这一组是**进 4.1 之前补的**（`_store_provenance`）。3.3 冒烟时报告里只有
+  `filter_model` 和 `use_llm_filtering`，**不记用了哪份 store**，只能靠 `mem_id` 最大值
+  反推（冒烟出现 98，故知是 118 条的上游 store 而非我们那份 8 条的）。4.1 的两臂只差 store
+  这一个变量，某一臂传错就无从事后区分，所以记路径 + 文件 sha1 + 行数：两臂即使 store 同名
+  也能靠 sha1 分开。文件读不出时三字段为 null 而不是丢掉整份报告，因为 `_knowledge_options`
+  已在 CLI 边界拦过不存在的路径。
 
   原计划里还有个 `filter_ok` 字段，**去掉了**：`_llm_filter_relevant_rules` 在自己内部
   吞掉异常并返回全量候选，我们在外面拿不到真假，写一个可能撒谎的字段比不写更糟。
@@ -1007,38 +1015,251 @@ baseline vs augmented 的**单次对比噪声很高**，差值小于波动幅度
 
 # 阶段 4 — Pipeline runner 与评测
 
-## 4.1 端到端编排脚本
+## 4.0 给 runner 补 `--split`
 
-**用途**：一条命令跑完 baseline 与 augmented 两侧，产出可对比的结果。
+**用途**：让 `sql_agent_runner` 能按划分文件跑，并支持分批。
 
-**位置**：新增 `scripts/run_pipeline.py`（或 Makefile 目标）。
+**为什么现在才做**：阶段 1.3 已经写了"阶段 4 的 runner 要读划分文件"
+（见 1.3 末尾的注），但那时只建了 `src/utils/splits.py::load_split` 这个纯函数，
+**从没接到 CLI 上**。实际清点 `_build_parser`（`sql_agent_runner.py:963`）只有两个入口：
 
-**输入**：
+| 现有参数 | 问题 |
+| --- | --- |
+| `--instance-id`（可重复） | 能用，但 86 个实例要展开成 86 个参数 |
+| `--run-all-from-file` | 读 jsonl 全部 **547** 个实例，含 bq / sf，用不了 |
+
+所以 4.1 的第一条命令目前无法直接写出来，必须先补这个参数。
+
+**位置**：`src/agents/sql_agent_runner.py::_build_parser` 与 `main()` 的实例筛选段
+（`:1017-1028`）。
+
+**参数**：
 
 | 参数 | 含义 |
 | --- | --- |
-| `--train-split` / `--test-split` | 阶段 1.3 的两个划分文件 |
-| `--store` | tkstore CSV，默认 `artifacts/tkstore_sqlite.csv` |
-| `--stage` | `populate` / `baseline` / `augmented` / `evaluate` / `all` |
-| `--model` | LLM 模型 |
+| `--split PATH` | 划分文件路径，用现成的 `load_split`（会跳过 `#` 注释行） |
+| `--split-offset N` | 从第 N 个开始，默认 0 |
+| `--split-limit N` | 最多取 N 个，默认全部 |
 
-**流程**：
+后两个是给 4.1 分批用的：单臂 86 个实例约 14 小时，切成小批便于分段推进。
+按划分文件加偏移量比手工拼 ID 列表可靠。（写这条时 `--refine-output` 的续跑还是整目录
+全有或全无，分批是唯一的止损手段；C19 修掉之后两条路径都是实例级续跑，
+分批的作用降级成控制单条命令的墙钟时间，见 4.1 的"断点续跑与分批"。）
 
+**行为**：
+
+- 与 `--instance-id`、`--run-all-from-file` 三者互斥，同时传要报错而不是静默择一
+- 划分文件里的 ID 若不在 jsonl 中，沿用现有的 `missing` 报错路径（`:1028`）
+- 文件不存在时给可读错误，不要 traceback
+
+**验收**（TDD）：
+
+1. `--split` 只跑文件里的实例，且 `#` 注释行被跳过
+2. `--split-offset` / `--split-limit` 切出的子集正确，边界（offset 超出长度）不崩
+3. 与 `--instance-id` 或 `--run-all-from-file` 同时传时报错
+4. 文件不存在时是可读错误信息
+
+**已完成**。实现落在 `_requested_instance_ids`（`sql_agent_runner.py:990`），
+`main()` 只负责把它的异常转成 `p.error`。测试见 `tests/test_cli_split_selection.py`（17 条）。
+
+实现时定的两条边界，比验收条目更严：
+
+- **offset 超出长度直接报错**，不是返回空集。分批跑时静默跑 0 个实例，会让人以为那一批已经跑完。
+- **`--split-offset` / `--split-limit` 不配 `--split` 时报错**，与 3.2 里 `--tkstore` 的守卫同风格。
+  `--split-limit` 超出剩余量不报错，因为最后一批本来就短。
+
+顺带把 `main()` 的筛选段改成按划分文件的顺序输出实例（原来是 `set` 成员判断，
+输出顺序随 jsonl 而定），这样分批的边界和日志顺序对得上。
+
+实机验证：真实的 86 id 划分文件切成 30/30/26 三批，拼接后与全量逐位相等且无重叠；
+四条错误路径（文件不存在、与 `--instance-id` 互斥、批参数缺 `--split`、offset 越界）
+都是单行可读信息。
+
+## 4.1 端到端编排脚本
+
+**用途**：产出可对比的三个准确率数字，且知识增益能单独归因。
+
+**位置**：新增 `scripts/run_pipeline.py`（或 Makefile 目标）。
+
+### 架构决策：一次 agent 运行，两次精修
+
+原计划是两侧各跑一次完整 agent，baseline 定义为"无 refiner 无知识"的裸 agent。
+**已改为共享同一次 agent 产出**，理由如下。
+
+`execution_query.sql` 在 `sql_agent_runner.py:1136` 写盘，而精修在 `:1184` 才开始，
+知识只在 `perform_refinement_and_revision` 内部注入。所以**任何一次运行的
+`execution_query.sql` 都是"无知识无 refiner"的裸 agent 产出**，裸 agent 这个数字是免费的，
+不需要单独跑一臂。
+
+而 `--refine-output`（`:1013` 独立分发，不需要 `--refine-cte`）会
+`shutil.copytree` 整个目录再原地精修（`:788`），所以可以对同一份 agent 产出精修两次。
+两臂的 `execution_query.sql` 逐字节相同，**知识增益的对比是严格配对的**。
+
+这一点很关键：主要对比已从"裸 agent vs 增强"改成
+**"有 refiner 无知识" vs "有 refiner 有知识"**，因为只有后者两臂之间只差知识这一个变量。
+而这个对比恰恰是对 agent 波动最敏感的——两臂都建立在起始 SQL 之上。3.3 实测同一实例
+两次运行的 CTE 结构能从 5 个变 0 个、5 个变 3 个，所以若各跑一次 agent，差值里会混进
+"这次 agent 恰好写得不一样"。共享产出把这个噪声源彻底消除。
+
+### 三条命令
+
+```bash
+# 共享的 agent 产出（86 个免泄漏实例）——依赖 4.0 的 --split
+python -m src.agents.sql_agent_runner \
+  --split data/splits/spider2_sqlite_test_no_reference_leak.txt \
+  --out-base outputs/test_agent
+
+# 臂 A：有 refiner 无知识
+python -m src.agents.sql_agent_runner --refine-output outputs/test_agent \
+  --refine-output-dir outputs/test_refonly
+
+# 臂 B：有 refiner 有知识
+python -m src.agents.sql_agent_runner --refine-output outputs/test_agent \
+  --refine-output-dir outputs/test_tk --tkstore tkstore/tkstore_sqlite.csv
 ```
-populate    : 2.1 train 集 agent 输出 → 2.3 批量 populate → store
-baseline    : test 集跑 agent，不传 --tkstore 也不传 --refine-cte → outputs/test_baseline/
-augmented   : test 集跑 agent，传 --tkstore + --refine-cte      → outputs/test_augmented/
-evaluate    : 对两个目录分别跑 evaluate.py，汇总对比
+
+### 断点续跑与分批
+
+两条路径现在都是**实例级续跑**，中断后重跑同一条命令即可接上。哨兵统一是
+`REFINEMENT_MARKER`（每个实例目录下的 `refinement_complete.marker`）。
+
+| 路径 | 判据 | 位置 |
+| --- | --- | --- |
+| agent 产出 | `execution_query.sql` 非空 | `_has_completed_output` |
+| agent + `--refine-cte` | 上面**再加**实例级哨兵 | 同上，`require_refinement=True` |
+| `--refine-output` | 实例级哨兵 | `run_refinement_on_existing_outputs` 循环开头 |
+
+**修之前的两个坑**（都已修，见 `deviations.md` C19 / C20）：
+
+- `--refine-output` 是整目录全有或全无：目标目录缺目录级 marker 时，非交互模式直接
+  `shutil.rmtree` 重来。86 个实例跑到第 80 个挂掉，前 79 个全丢。
+- 带 `--refine-cte` 的正常路径是**假续跑**：`execution_query.sql` 在精修**之前**写盘，
+  所以精修阶段中断的实例会被当成已完成永久跳过，产出一个未精修的实例且不报警。
+
+**`--split` 对精化路径依然无效**：`main()` 在 early return 处就进了
+`run_refinement_on_existing_outputs`，那里按目录里的实例目录遍历，不看 `--split`。
+这一条没改——有了实例级续跑之后不需要改了。
+
+**分批方案（已定）**：在 agent 阶段用 `--split-offset` / `--split-limit` 产出多个小目录，
+再逐目录精修两臂。分批的作用从"控制中断损失"降级成"控制单条命令的墙钟时间"，
+因为损失现在最多是一个实例（约 10 分钟）。
+
+```bash
+# agent 阶段切三批（30/30/26），已验证拼接后与全量逐位相等且无重叠
+for off in 0 30 60; do
+  python -m src.agents.sql_agent_runner \
+    --split data/splits/spider2_sqlite_test_no_reference_leak.txt \
+    --split-offset $off --split-limit 30 \
+    --out-base outputs/test_agent_b$off
+done
+# 之后对 outputs/test_agent_b{0,30,60} 各跑臂 A / 臂 B，评估时把三批的 evals.csv 合并
 ```
 
-**决策：只跑这两臂**，不做"有 refiner 无知识"的第三臂。理由是论文自己的 baseline 就是
-完全不带 Alg 5 的原始 agent，两臂在口径上对齐 Fig. 6。代价是差值无法分离，
-必须在结果里写清，见下方"本轮不做"的最后一段。
+另有一个评估侧的破坏性行为要知道：同一 instance_id 出现多个时间戳目录时（中断重跑会留下
+半成品），`evaluation/evaluate.py:424-448` 会优选"最新且有 `execution_result.csv`"的那个，
+并 `shutil.rmtree` **删掉其余的**。因为两臂是逐实例复制出来的副本，删一臂不影响另一臂，
+但共享产出目录上跑评估会真的删目录。
 
-**输出**：`outputs/pipeline_<timestamp>/` 下含两侧的实例目录、两份评测结果、
-一份汇总 JSON。
+**顺带去掉的交互提示**：目标目录已存在时原先会问 `Overwrite? (y/n)`，答 `y` 就
+`rmtree`。现在一律续跑，要重来请自己 `rm -rf`。误按一个 `y` 就毁掉整臂的风险不值得保留。
+另外目录级 marker 现在**只在零失败时才写**——原先带着失败实例也照写，会把重试永久挡住。
 
-**验收**：`--stage all` 在 3 个实例的小集合上跑通，且中断后可从任一 stage 续跑。
+三个数字的来源：
+
+| 数字 | 取自 | 含义 |
+| --- | --- | --- |
+| 裸 agent | 共享产出的 `score`（两臂目录里相同） | 无 Alg 5 |
+| 臂 A | `outputs/test_refonly` 的 `score_final` | 有 refiner 无知识 |
+| 臂 B | `outputs/test_tk` 的 `score_final` | 有 refiner 有知识 |
+
+**知识增益 = 臂 B − 臂 A**（严格配对）。**论文 Fig. 6 口径 = 裸 agent vs 臂 B**。
+
+### 决策记录
+
+| 决策 | 结论 |
+| --- | --- |
+| 架构 | 共享一次 agent 产出，`--refine-output` 精修两次 |
+| 臂数 | 三个数字（裸 agent / 臂 A / 臂 B），主要对比是 B − A |
+| store | 先用仓库自带的上游 `tkstore/tkstore_sqlite.csv`，我们自己 populate 的 store 之后再跑 |
+| 样本与重复 | 86 × 1 次 |
+| `--refine-output` 是否改成读真实 `messages.json` | **不改**，保持现状 |
+| 全量 evaluate | 未经确认不得自行运行 |
+
+### 解读时必须写清的三件事
+
+**一、两臂的改写 agent 都缺少原始探库历史。** `--refine-output` 不读 `messages.json`
+（该文件在每个输出目录里都有，`:1138` 写的），而是重建一份三条消息的最小上下文
+（`:887-898`）。注意这不是编造：前两条调的是**和正常路径完全相同的
+`get_system_prompt` / `build_user_message`**（对比 `:440-443`），只把
+`train_context_file` 与 `expected_output_format` 硬编码成 `None`——只要我们不传这两个 flag，
+前两条消息与正常路径逐字节相同。
+
+真正缺的只有中间那段：15 轮 `<think>` / `<sql>` / 查询结果被一条"这是你的解"顶替。
+正常路径下 `messages` 是主 agent 那次活的对话（实测 `local310` 有 30 条消息约 2 万字符），
+改写时它还记得 `race_id` 不是年份、必须 join `races` 才能按年聚合。
+
+影响比听起来轻：`_revise_from_feedback` 会执行 agent 在改写中吐出的 `<sql>` 探针并把结果
+喂回去，所以它**可以现场重新探库**。代价是那 5 次修订预算由探针和出解共用（见 B11），
+它得花掉本来用于出解的次数去重新发现已知的事。
+
+所以**两臂的绝对值可能都比正常路径略低**。B − A 的差值不受影响（两臂同等受损），但
+"裸 agent vs 臂 B"这个论文口径会对臂 B 偏保守——实际部署走正常路径会更好。
+
+**二、3.3 的冒烟数据不可与阶段 4 直接比较。** 那 5 个实例是走**正常路径**跑的
+（`outputs/smoke_augmented_v2/`），改写 agent 有完整历史，与臂 B 不是同一条代码路径。
+
+**三、~~续跑是按目录全有或全无的~~**（已失效，两个坑都已修，见上面的"断点续跑与分批"
+以及 `deviations.md` C19 / C20）。
+
+**前置**：第一条命令依赖 **4.0** 的 `--split`；分批跑还要 `--split-offset` / `--split-limit`。
+
+**验收**：三条命令在 3 个实例的小集合上跑通；两臂目录里的 `execution_query.sql` 逐字节相同。
+
+### 已完成
+
+按仓库惯例拆成两块：编排逻辑在 `src/utils/pipeline.py`（可测），
+CLI 外壳在 `scripts/run_pipeline.py`（与 `make_splits.py` 同构）。
+测试见 `tests/test_pipeline.py`（24 条）。
+
+```bash
+# 看命令不执行
+python scripts/run_pipeline.py --dry-run \
+  --split data/splits/spider2_sqlite_test_no_reference_leak.txt \
+  --out-prefix outputs/test --tkstore tkstore/tkstore_sqlite.csv
+
+# 分三批真跑
+python scripts/run_pipeline.py --batch-size 30 \
+  --split data/splits/spider2_sqlite_test_no_reference_leak.txt \
+  --out-prefix outputs/test --tkstore tkstore/tkstore_sqlite.csv
+```
+
+目录名由 `--out-prefix` 派生：`_agent` / `_refonly` / `_tk`，分批时插 `_b<offset>`。
+实测 86 个 id 按 30 一批切成 `offset/limit` = `0/30`、`30/30`、`60/26`。
+
+三条实现上的取舍：
+
+- **分批参数只给 agent 那一步**。`--refine-output` 按目录遍历、不看 `--split`，
+  给臂传 `--split` 会暗示一个不存在的过滤。
+- **`--tkstore` / `--filter-model` / `--no-llm-filtering` 只给臂 B**，臂 A 一个都不带——
+  这正是两臂唯一的差别。agent 那一步连 `--refine-cte` 都不带，它的
+  `execution_query.sql` 就是裸 agent 数字。
+- **某一步非零退出就停下整批**。带着半成品的 agent 目录继续精修会静默缩小样本量，
+  那看起来像结果而不像错误。
+
+**`verify_shared_agent_output` 是这一节的核心断言**：每批跑完逐实例比对
+agent 目录与两个臂目录的 `execution_query.sql` 字节。不相等就意味着
+`delta_knowledge` 不是配对比较，脚本报错退出而不是继续算数。
+精修的改写落在 `execution_query_after_*.sql`，不动原始文件，所以这个不变量应当恒成立。
+
+**验收执行情况**：`--dry-run` 与分批的命令形态已核对（见上）。三条 argv 被 runner 接受、
+续跑生效、配对校验会跑，是用**零 LLM 调用**的方式验的——预置好产物让三步都走"已完成"
+分支，整条管道 exit 0。反向也验了：把某个实例的起始 SQL 篡改一个字节，
+脚本报 `does not share the agent's starting SQL` 并 exit 1。
+四条参数守卫（store 不存在、`--batch-size` 与 `--split-limit` 互斥、`--batch-size 0`、
+划分文件不存在）都是单行可读信息。
+
+**尚未执行**：真跑 3 个实例的小集合（要真实 agent 与 refiner 调用，约 1 小时）。
+精修本身的正确性已由 3.3 冒烟覆盖，这条待确认后再跑。
 
 ## 4.2 结果对比
 
@@ -1051,19 +1272,103 @@ evaluate    : 对两个目录分别跑 evaluate.py，汇总对比
 | 列 | 含义 |
 | --- | --- |
 | `instance_id` | 实例 |
-| `score_baseline` | 未注入知识 |
-| `score_augmented` | 注入知识 |
-| `delta` | `+1` 修好 / `0` 无变化 / `-1` 改坏 |
-| `rules_used` | 该实例命中的 `mem_id` 列表 |
+| `score_bare` | 裸 agent，取共享产出的 `score` |
+| `score_arm_a` | 有 refiner 无知识，取 `outputs/test_refonly` 的 `score_final` |
+| `score_arm_b` | 有 refiner 有知识，取 `outputs/test_tk` 的 `score_final` |
+| `delta_knowledge` | 臂 B − 臂 A，`+1` 知识修好 / `0` 无变化 / `-1` 知识改坏 |
+| `delta_paper` | 臂 B − 裸 agent，对齐论文 Fig. 6 |
+| `rules_used` | 该实例的 `mem_id` 列表，定义见下 |
+| `n_db_rules` | 该实例的库在 store 里有多少条 db 作用域规则，用于下面的分组 |
+
+### `rules_used` 的定义
 
 `rules_used` 是关键 —— 论文强调 TK 是**可审阅**的。有了它才能回答
 "哪条规则真的起了作用"、"改坏的那些是哪条规则导致的"。
 
-**注意**：`evaluate.py` 本身已经区分 `score`（`execution_result.csv`，baseline）和
-`score_final`（`execution_result_final.csv`，增强后），槽位是现成的。
-但因为我们 baseline 和 augmented 跑在**两个独立目录**，用的是两侧的 `score` 列做对比，
-不要混用同一目录内的 `score` / `score_final`（那个对比的是"refine 前 vs refine 后"，
-不是"有知识 vs 无知识"，两者不是一回事）。
+但**没有真值可用**：refiner 的 verdict 从不引用规则 ID，所以无法确知某条规则是否被采纳。
+**决策：定义为"判 `issues` 且改写被采纳的那些片段所选中的规则"**，
+即从 `retrieved_rules.json` 的 `selected` 取，条件是该片段的
+`refiner_<name>.json` 状态为 `issues` 且存在对应的 `execution_query_after_<name>.sql`。
+
+这是**可能影响过输出的上界**，不是"确实起了作用"。3.3 实测这个上界远小于检索总量：
+21 个片段里只有 8 个判 `issues`，**全局去重**后 52 条选中的规则里只有 29 条（56%）
+落在这个上界内，其余在 refiner 判 `ok` 时就被静默吸收了。
+
+口径要写清，两个数都对但差一倍：**全局去重**（5 个实例合起来出现过的 distinct `mem_id`）
+是 52 → 29（56%）；**逐实例去重再求和**是 118 → 72（61%）。上面那句用的是前者。
+`src/utils/compare.py::rules_used` 按实例返回，所以聚合时用哪个口径要显式说明。
+
+备选方案是让 refiner 在 verdict 里显式引用规则 ID（改 prompt 与 schema），归因最硬，
+但那是新工作且依赖 LLM 如实报告，本轮不做。
+
+**取数注意**：`evaluate.py` 已区分 `score`（`execution_result.csv`）和
+`score_final`（`execution_result_final.csv`），槽位是现成的。共享产出架构下取数很自然——
+两臂目录里的 `score` 都是同一份裸 agent 产出（应逐字节相同，可作为一致性校验），
+各自的 `score_final` 才是本臂结果。
+
+### 必须按"有无 db 规则可用"分组报告
+
+**总体一个数字会掩盖结论。** 检索的硬闸门只有库名：`generic` 规则对所有实例可用，
+`db` 作用域规则只在库名相等时才通过（`tagger_index.py:552-572`）。按这个闸门清点上游
+store 对 86 个实例的可达性：
+
+| 度量 | 值 |
+| --- | --- |
+| generic 规则（对全部 86 个实例可用） | 52 条 |
+| db 作用域规则 | 66 条，分布在 22 个库 |
+| 86 个实例中库有 db 规则可用的 | **52 个（60%）** |
+| 每实例可用 db 规则数的分布 | 0 条：34 个实例；1–6 条：42 个；**12 条：10 个**（全在 `bank_sales_trading`）|
+
+分布极不均：34 个实例一条 db 规则都吃不到，而 10 个实例独占 12 条。
+所以总体增益会被少数库主导。**决策：4.2 的结果表按 db 规则可用性分两组报**
+（0 条 vs ≥1 条），否则总体增益接近 0 时无法区分"知识没用"和"大部分实例本来就没知识可用"。
+
+参考：换成我们自己 populate 的 store 时，闸门是 train 与 test 的库重叠。
+train 24 个实例覆盖 16 个库，test 111 个覆盖 28 个、共享 14 个，
+**65/111（59%）** 的 test 实例其库在 train 里出现过；对 86 子集是 49/86（57%）。
+量级与上游 store 的 60% 相当，所以上面的分组口径两条轨道通用。
+
+表这一层的重叠远薄于库这一层，但**不影响检索能否命中**，因为 `table`/`column` 不是筛选
+条件（B2）。共享库里 train 的 gold SQL 触及面很窄，例如 `f1` 有 29 张表而 train 只碰了 4 张、
+`bank_sales_trading` 19 张碰 5 张（`IPL` 是例外，8 张碰 5 张）。实测已补进 B2。
+
+### 已完成
+
+同 4.1 的拆法：取数与聚合在 `src/utils/compare.py`，CLI 在 `scripts/compare_arms.py`。
+测试见 `tests/test_compare.py`（24 条）。
+
+```bash
+# 先分别评两臂（不要评共享的 agent 目录，见下）
+python evaluation/evaluate.py --mode exec_result --result_dir outputs/test_refonly --gold_dir evaluation/gold
+python evaluation/evaluate.py --mode exec_result --result_dir outputs/test_tk --gold_dir evaluation/gold
+
+python scripts/compare_arms.py --arm-a outputs/test_refonly --arm-b outputs/test_tk \
+  --tkstore tkstore/tkstore_sqlite.csv --out outputs/comparison.csv
+```
+
+**只需要两份 `evals.csv`，不评共享的 agent 目录。** `score_bare` 从两臂的 `score` 列取
+（那一列算的是 `execution_result.csv`，即复制过来的裸 agent 结果）。这样做有两个好处：
+共享目录保持原样不被 `evaluate.py` 的删重目录行为碰到，且两臂各给一份裸分，
+互相就是一次一致性交叉校验。
+
+**裸分不一致的行会被排除出所有汇总组**，并单独计数（`Row.paired`、`GroupSummary.unpaired`）。
+两臂本应精修同一条起始 SQL，不一致说明配对已经破了，那一行的 `delta_knowledge`
+量的不是知识。只发警告却照样计入汇总，会让表头数字在一行警告背后失真。
+正常情况下 4.1 的 `verify_shared_agent_output` 会先硬失败，这里是第二道防线。
+
+`+1` / `-1` 分开计数而不是只报净差：净差为 0 可能是"什么都没发生"，
+也可能是"修好一个、改坏一个"，两者的结论完全不同。
+
+**目录名与批次**：用了 `--batch-size` 时目录带 `_b<offset>` 后缀，evaluate 与 compare
+要按批分别跑，或先把批目录合并。
+
+**验证**：`rules_used` 拿 3.3 的真实产物核过，精确复现上面记的全局去重 52 → 29（56%）
+与片段 21 → 8。CLI 用冒烟产物搭出的两臂跑通，覆盖 `+1` / `-1` / 无变化 / 裸分不一致
+四种情况，以及四条错误路径（两臂缺 `evals.csv`、store 不存在、两臂交集为空退出码 1）。
+
+**一个反直觉但正确的现象**：`local269` 的 `n_db_rules=0` 却有 13 条 `rules_used`。
+那些全是 generic 规则——它们对所有实例可用，不受库名闸门限制。
+所以分组的含义是"有没有**库专属**知识可用"，不是"有没有知识可用"。
 
 ---
 
@@ -1071,11 +1376,15 @@ evaluate    : 对两个目录分别跑 evaluate.py，汇总对比
 
 | 阶段 | agent 运行次数 | 说明 |
 | --- | --- | --- |
-| 2.1 | 24（已跑 7） | 我们的 train 集 = 有 gold SQL 的 24 个，外层 ReAct 最多 25 轮 |
+| 2.1 | 24（已跑 8） | 我们的 train 集 = 有 gold SQL 的 24 个，外层 ReAct 最多 25 轮。还差 16 个 |
 | 2.2/2.3 | 0 | 每实例约 3–4 次 LLM 调用（diff 循环最多 6 轮） |
-| 3.3 冒烟 | 5 | 只跑 augmented 一侧 |
-| 4 baseline | 86 | 上游 store 轨道的免泄漏子集 |
-| 4 augmented | 86 | 同上，额外含 refiner 的 25 轮探库循环 |
+| 3.3 冒烟 | 5 | 走正常路径，只跑带知识一侧 |
+| 4 共享 agent 产出 | 86 | 免泄漏子集，只跑外层 ReAct，约 3–4 分钟/实例，合计约 5 小时 |
+| 4 臂 A | 0 | 复用上面的产出，只跑精修 |
+| 4 臂 B | 0 | 同上，额外含检索与 FilterKnowledge |
+
+精修一侧按 3.3 实测约 10 分钟/实例（含 refiner 每 CTE 的 25 轮探库），
+单臂 86 个约 14 小时，两臂约 28 小时。共享 agent 产出省掉了第二次 86 个实例的 agent 运行。
 
 **检索本身的 LLM 开销实测**：每个 CTE 约 20 条 code filter 候选，按 `CHUNK_SIZE=15` 切
 就是 2 次 `FilterKnowledge` 调用。按每实例 3 个 CTE 加 1 个 final SELECT 算，
@@ -1089,12 +1398,20 @@ augmented 一侧单实例成本明显高于 baseline。
 - [`deviations.md`](./deviations.md) **B 组**全部 —— 检索只用 3 维特征、正则抽特征、
   refiner 是 25 轮探库循环而非单次 `Feedback`、每 CTE 修订 5 次上限等
   （唯一例外是 3.0 那条陈旧快照，它是 Alg 5 的保真问题，本轮修）
-- "有 refiner 无知识"的第三臂对照（决策：只跑两臂）
+- 让 refiner 在 verdict 里显式引用规则 ID（`rules_used` 用上界代替，见 4.2）
+- 把 `--refine-output` 改成加载真实 `messages.json`（决策：保持现状，见 4.1 解读第一条）
+- 我们自己 populate 的 store 那条轨道（先跑上游 store，之后再补）
 - BIRD / minidev 适配
 - ReFORCE agent（论文 6.1.3 用它证明通用性，不是主结果）
 - 论文 6.4 的各项消融
 
-其中 **B10**（refiner 做的比论文多）和 **B11**（修订次数上限）会影响 augmented 一侧的绝对数值，
-解读结果时必须一并说明：baseline 与 augmented 的差值里混入了 refiner 探库带来的增益，
-不能全部归因于 tribal knowledge。要干净地分离，需要一个"有 refiner 无知识"的第三组对照，
-那属于后续消融。
+其中 **B10**（refiner 做的比论文多）和 **B11**（修订次数上限）会影响带 refiner 两臂的绝对数值。
+但归因问题已由 4.1 的臂设计解决：**臂 A 与臂 B 都带 refiner，差值里不再混入探库增益**，
+`delta_knowledge` 可以直接归因给 tribal knowledge。需要注意的是 `delta_paper`
+（裸 agent vs 臂 B）仍然混着两者，那个数字只用于与论文 Fig. 6 对齐，不用于归因。
+
+B10 另有一层后果值得记住：知识只进 refiner 的 `cte_goal`，出来的是它的 verdict，
+所以**知识是透过 refiner 的判决间接到达 agent 的**。refiner 判 `ok` 时那批规则彻底消失
+（3.3 实测 21 个片段里 13 个如此）。这不算偏离论文——Alg 5 的循环条件 `f ≠ ∅` 本身就允许
+feedback 为空——但它意味着"检索到 N 条规则"与"agent 收到 N 条规则"是两件差很远的事，
+这也正是 `rules_used` 只能给出上界的原因。
