@@ -25,6 +25,68 @@ def _instance_dir(parent, name, sql="SELECT 1"):
     return d
 
 
+def _partial_instance_dir(parent, name):
+    """What an instance interrupted mid-agent-loop leaves behind: the directory is
+    created up front, but `execution_query.sql` is only written once the loop returns."""
+    d = parent / name
+    d.mkdir(parents=True)
+    (d / "messages.json").write_text("[]", encoding="utf-8")
+    return d
+
+
+class TestHasAgentOutput:
+    """The one predicate for 'this instance finished its agent loop'."""
+
+    def test_non_empty_sql_counts(self, tmp_path):
+        assert runner._has_agent_output(_instance_dir(tmp_path, "local001_20260101_000000")) is True
+
+    def test_a_missing_file_does_not_count(self, tmp_path):
+        assert runner._has_agent_output(_partial_instance_dir(tmp_path, "local001_20260101_000000")) is False
+
+    def test_an_empty_file_does_not_count(self, tmp_path):
+        """The write is `final_sql or ""`, so a failed run can leave the file empty."""
+        d = _instance_dir(tmp_path, "local001_20260101_000000", sql="")
+
+        assert runner._has_agent_output(d) is False
+
+
+class TestDiscardIncompleteInstanceDirs:
+    """Interrupting the agent step leaves a directory with no `execution_query.sql`.
+    Rerunning creates a second, timestamped directory for the same instance, and the
+    leftover then travels into both arms where it is counted as a refinement failure
+    forever. Clearing it is the runner's job, not the operator's."""
+
+    def test_a_partial_directory_is_discarded(self, tmp_path):
+        _partial_instance_dir(tmp_path, "local001_20260101_000000")
+
+        discarded = runner._discard_incomplete_instance_dirs(tmp_path)
+
+        assert discarded == ["local001_20260101_000000"]
+        assert not (tmp_path / "local001_20260101_000000").exists()
+
+    def test_a_finished_directory_is_kept_whole(self, tmp_path):
+        d = _instance_dir(tmp_path, "local001_20260101_000000")
+        (d / "messages.json").write_text("[]", encoding="utf-8")
+
+        assert runner._discard_incomplete_instance_dirs(tmp_path) == []
+        assert (d / "execution_query.sql").exists()
+        assert (d / "messages.json").exists()
+
+    def test_an_empty_query_file_is_discarded(self, tmp_path):
+        _instance_dir(tmp_path, "local001_20260101_000000", sql="")
+
+        assert runner._discard_incomplete_instance_dirs(tmp_path) == ["local001_20260101_000000"]
+
+    def test_hidden_directories_are_left_alone(self, tmp_path):
+        (tmp_path / ".ipynb_checkpoints").mkdir()
+
+        assert runner._discard_incomplete_instance_dirs(tmp_path) == []
+        assert (tmp_path / ".ipynb_checkpoints").exists()
+
+    def test_an_absent_base_is_not_an_error(self, tmp_path):
+        assert runner._discard_incomplete_instance_dirs(tmp_path / "nope") == []
+
+
 class TestSyncInstanceDirs:
     """Copying the tree in one shot is what makes the pass all-or-nothing."""
 
@@ -107,6 +169,20 @@ class TestSyncInstanceDirs:
         synced = runner._sync_instance_dirs(src, tmp_path / "dest")
 
         assert [d.name for d in synced] == ["local001_20260101_000000"]
+
+    def test_an_instance_with_no_agent_output_is_not_synced(self, tmp_path):
+        """The agent step can leave one behind by failing on a single instance, and that
+        happens without stopping the pipeline. Refining it is impossible, so counting it
+        as a failure would make `Failed: n/86` non-zero for good and withhold the
+        directory receipt no matter how often the arm is rerun."""
+        src = tmp_path / "src"
+        _instance_dir(src, "local001_20260101_000000")
+        _partial_instance_dir(src, "local002_20260101_000000")
+
+        synced = runner._sync_instance_dirs(src, tmp_path / "dest")
+
+        assert [d.name for d in synced] == ["local001_20260101_000000"]
+        assert not (tmp_path / "dest/local002_20260101_000000").exists()
 
 
 class TestInstanceMarker:

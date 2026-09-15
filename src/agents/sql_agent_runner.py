@@ -1003,12 +1003,53 @@ def _mark_instance_refined(inst_dir: Path) -> None:
     )
 
 
+def _has_agent_output(inst_dir: Path) -> bool:
+    """Whether this instance's agent loop ran to completion.
+
+    `execution_query.sql` is only written once the loop returns, and as `final_sql or ""`
+    -- so a directory with the file missing or empty is one the agent never finished.
+    """
+    sql_file = Path(inst_dir) / "execution_query.sql"
+    try:
+        return bool(sql_file.read_text(encoding='utf-8').strip())
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _instance_dirs_in(base: Path) -> List[Path]:
+    base = Path(base)
+    if not base.is_dir():
+        return []
+    return sorted(d for d in base.iterdir() if d.is_dir() and not d.name.startswith('.'))
+
+
+def _discard_incomplete_instance_dirs(out_base: Path) -> List[str]:
+    """Drop leftovers of instances this runner started but never finished.
+
+    An interrupted instance leaves a directory with no `execution_query.sql`. The rerun
+    writes a fresh timestamped directory instead of reusing it, so the leftover would
+    travel into both arms, where refinement can only count it as a failure -- keeping
+    `Failed: n/86` non-zero however often the arm is rerun, and withholding the
+    directory receipt with it. Discarding is safe by construction: this is the exact
+    complement of the `_has_completed_output` criterion for the agent path.
+    """
+    discarded = []
+    for d in _instance_dirs_in(out_base):
+        if not _has_agent_output(d):
+            shutil.rmtree(d)
+            discarded.append(d.name)
+    return discarded
+
+
 def _sync_instance_dirs(source_dir: Path, dest_dir: Path) -> List[Path]:
     """Mirror the instance directories of `source_dir` into `dest_dir`.
 
     Copying the tree in one shot is what made a refinement pass all-or-nothing: an
     instance already present in `dest_dir` may hold hours of finished work, so it is
     left untouched and only missing instances are copied.
+
+    Instances the agent never finished are skipped: there is no SQL to refine, and
+    carrying them in would only inflate this pass's failure count.
 
     A marker that comes in with a fresh copy is dropped. It records that some *other*
     pass refined that instance, and trusting it would skip the work of this one --
@@ -1017,19 +1058,16 @@ def _sync_instance_dirs(source_dir: Path, dest_dir: Path) -> List[Path]:
     source_dir, dest_dir = Path(source_dir), Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    def instance_dirs(base: Path) -> List[Path]:
-        return sorted(d for d in base.iterdir() if d.is_dir() and not d.name.startswith('.'))
-
-    for src in instance_dirs(source_dir):
+    for src in _instance_dirs_in(source_dir):
         dst = dest_dir / src.name
-        if dst.exists():
+        if dst.exists() or not _has_agent_output(src):
             continue
         shutil.copytree(src, dst)
         inherited = dst / REFINEMENT_MARKER
         if inherited.exists():
             inherited.unlink()
 
-    return instance_dirs(dest_dir)
+    return _instance_dirs_in(dest_dir)
 
 
 def _has_completed_output(instance_id: str, out_base: Path, require_refinement: bool = False) -> bool:
@@ -1039,14 +1077,10 @@ def _has_completed_output(instance_id: str, out_base: Path, require_refinement: 
     part of the run it cannot stand in for "finished": an instance interrupted during
     refinement would be skipped forever and quietly ship unrefined.
     """
-    out_base = Path(out_base)
-    if not out_base.exists():
-        return False
-    for dir_path in sorted(out_base.iterdir()):
-        if not (dir_path.is_dir() and dir_path.name.startswith(f"{instance_id}_")):
+    for dir_path in _instance_dirs_in(out_base):
+        if not dir_path.name.startswith(f"{instance_id}_"):
             continue
-        sql_file = dir_path / "execution_query.sql"
-        if not (sql_file.exists() and sql_file.stat().st_size > 0):
+        if not _has_agent_output(dir_path):
             continue
         if require_refinement and not _instance_is_refined(dir_path):
             continue
@@ -1166,6 +1200,10 @@ def main():
     # Ensure output base
     out_base = Path(args.out_base)
     ensure_dir(out_base)
+
+    abandoned = _discard_incomplete_instance_dirs(out_base)
+    if abandoned:
+        print(f"\n🧹 Discarded {len(abandoned)} unfinished directory(ies) from an earlier run: {abandoned}")
 
     # Filter instances: skip those with existing outputs
     completed = []

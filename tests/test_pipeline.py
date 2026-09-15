@@ -188,6 +188,17 @@ class TestVerifySharedAgentOutput:
 
         assert pipeline.verify_shared_agent_output(agent, arm) == []
 
+    def test_an_instance_the_agent_never_finished_is_ignored(self, tmp_path):
+        """A failed agent instance leaves an empty `execution_query.sql` and is not
+        synced into the arms. There is no starting SQL to pair on, so reporting it would
+        hard-fail the pipeline over an instance nobody could have refined."""
+        agent, arm = tmp_path / "agent", tmp_path / "arm"
+        _write_instance(agent, "local001_20260101_000000", "SELECT 1")
+        _write_instance(agent, "local002_20260101_000000", "")
+        _write_instance(arm, "local001_20260101_000000", "SELECT 1")
+
+        assert pipeline.verify_shared_agent_output(agent, arm) == []
+
     def test_a_missing_arm_directory_is_an_error(self, tmp_path):
         agent = tmp_path / "agent"
         _write_instance(agent, "local001_20260101_000000", "SELECT 1")

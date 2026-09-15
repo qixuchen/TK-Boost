@@ -140,6 +140,10 @@ def verify_shared_agent_output(agent_dir: Path, arm_dir: Path) -> List[str]:
     Refinement writes its revisions to `execution_query_after_*.sql` and leaves the
     original alone, so any difference here means the arms did not start from the same
     query and the comparison is not paired.
+
+    Instances the agent never finished carry no starting SQL and are not synced into the
+    arms, so they are ignored rather than reported -- failing the pipeline over an
+    instance nobody could have refined would hide the arms that did run.
     """
     agent_dir, arm_dir = Path(agent_dir), Path(arm_dir)
     for d in (agent_dir, arm_dir):
@@ -148,10 +152,17 @@ def verify_shared_agent_output(agent_dir: Path, arm_dir: Path) -> List[str]:
 
     def starting_sql(base: Path, name: str) -> Optional[bytes]:
         path = base / name / STARTING_SQL
-        return path.read_bytes() if path.is_file() else None
+        if not path.is_file():
+            return None
+        raw = path.read_bytes()
+        return raw if raw.strip() else None
 
     names = {d.name for d in _instance_dirs(agent_dir)} | {d.name for d in _instance_dirs(arm_dir)}
-    return sorted(n for n in names if starting_sql(agent_dir, n) != starting_sql(arm_dir, n))
+    return sorted(
+        n for n in names
+        if starting_sql(agent_dir, n) is not None
+        and starting_sql(agent_dir, n) != starting_sql(arm_dir, n)
+    )
 
 
 def _subprocess_run(argv: Sequence[str]) -> int:
