@@ -79,10 +79,16 @@ class TestPlanSteps:
     def test_the_agent_runs_before_either_arm(self, steps):
         assert [s.name for s in steps] == ["agent", "arm_refonly", "arm_tk"]
 
+    def test_every_step_runs_unbuffered(self, steps):
+        """The child does the progress printing. Block-buffered through a `tee` pipe it
+        withholds output for kilobytes at a time, which reads as a hung run."""
+        for step in steps:
+            assert "-u" in step.argv, step.name
+
     def test_the_agent_step_is_a_bare_run(self, steps, split_file, tmp_path):
         argv = _argv_of(steps, "agent")
 
-        assert argv[:3] == [pipeline.PYTHON, "-m", "src.agents.sql_agent_runner"]
+        assert argv[:4] == [pipeline.PYTHON, "-u", "-m", "src.agents.sql_agent_runner"]
         assert "--split" in argv and str(split_file) in argv
         assert "--out-base" in argv and str(tmp_path / "test_agent") in argv
         assert "--tkstore" not in argv

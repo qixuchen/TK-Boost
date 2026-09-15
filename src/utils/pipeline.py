@@ -99,7 +99,9 @@ def plan_steps(
     The agent step deliberately carries no refinement flag: its `execution_query.sql`
     is the bare-agent number, which both arms then start from.
     """
-    base = [PYTHON, "-m", RUNNER_MODULE]
+    # `-u` because the child prints the progress: piped to a log it would otherwise
+    # block-buffer and look hung for kilobytes at a time.
+    base = [PYTHON, "-u", "-m", RUNNER_MODULE]
     common = ["--model", model] if model else []
 
     agent = base + ["--split", str(split_path), "--out-base", str(batch.agent_dir)] + common
