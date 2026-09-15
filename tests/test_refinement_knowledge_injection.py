@@ -5,6 +5,7 @@ string. These tests pin down what reaches that string and what gets recorded for
 after-the-fact attribution.
 """
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -170,6 +171,45 @@ class TestRetrievedRulesReport:
         _run(tmp_path)
 
         assert not (tmp_path / "retrieved_rules.json").exists()
+
+    def test_report_identifies_which_store_was_read(self, tmp_path, refiner_calls, stub_retrieval):
+        """Phase 4 compares arms that differ only by store; the path alone can be a typo,
+        so the report also fingerprints the file it actually read."""
+        store = tmp_path / "some_store.csv"
+        store.write_text("mem_id,instance_id\n0,local003\n1,local019\n", encoding="utf-8")
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+
+        _run(out_dir, tkstore_path=str(store))
+
+        report = json.loads((out_dir / "retrieved_rules.json").read_text(encoding="utf-8"))
+        assert report["tkstore"]["path"] == str(store)
+        assert report["tkstore"]["n_rules"] == 2
+        assert report["tkstore"]["sha1"] == hashlib.sha1(store.read_bytes()).hexdigest()
+
+    def test_two_stores_are_distinguishable_by_fingerprint(self, tmp_path, refiner_calls, stub_retrieval):
+        """Same filename in two arms must not look identical."""
+        fingerprints = []
+        for i, body in enumerate(["mem_id\n0\n", "mem_id\n0\n1\n"]):
+            arm = tmp_path / f"arm{i}"
+            arm.mkdir()
+            store = arm / "tkstore_sqlite.csv"
+            store.write_text(body, encoding="utf-8")
+            _run(arm, tkstore_path=str(store))
+            report = json.loads((arm / "retrieved_rules.json").read_text(encoding="utf-8"))
+            fingerprints.append((report["tkstore"]["sha1"], report["tkstore"]["n_rules"]))
+
+        assert fingerprints[0] != fingerprints[1]
+
+    def test_unreadable_store_still_records_the_path(self, tmp_path, refiner_calls, stub_retrieval):
+        """The CLI validates existence, so this only guards direct callers; losing the
+        whole report over a fingerprint would be worse than a null one."""
+        _run(tmp_path, tkstore_path="does_not_exist.csv")
+
+        report = json.loads((tmp_path / "retrieved_rules.json").read_text(encoding="utf-8"))
+        assert report["tkstore"]["path"] == "does_not_exist.csv"
+        assert report["tkstore"]["sha1"] is None
+        assert report["tkstore"]["n_rules"] is None
 
 
 class TestRetrievalCall:

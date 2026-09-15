@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 import hashlib
+import io
 import json
 import os
 import re
@@ -34,6 +36,7 @@ from src.utils.agent_utils import (
 from src.agents.cte_refiner import run_refiner as refiner_run
 from src.agents.prompts import BASE_PROMPT, SNOWFLAKE_PROMPT
 from src.utils.db_paths import resolve_sqlite_db_path
+from src.utils.splits import load_split
 from src.utils.auth import configure_llm_env, USE_OPENAI
 from tkstore.tagger_index import search_index_for_sql, _llm_filter_relevant_rules
 
@@ -715,6 +718,7 @@ def perform_refinement_and_revision(inst: Instance,
     if tkstore_path:
         (out_dir / 'retrieved_rules.json').write_text(
             json.dumps({
+                'tkstore': _store_provenance(tkstore_path),
                 'n_ctes': len(ctes),
                 'filter_model': filter_model,
                 'use_llm_filtering': bool(use_llm_filtering),
@@ -765,32 +769,20 @@ def run_refinement_on_existing_outputs(args):
     else:
         dest_dir = Path(str(source_dir).rstrip('/') + '_withrefined')
     
+    # The directory-level marker is a receipt, never a skip decision: it records the
+    # instances of one pass, and the source can grow afterwards. Short-circuiting on it
+    # made a 3-instance rehearsal silently turn the arm into a no-op when the same
+    # prefix was scaled up. The per-instance markers below are the resume state.
+
+    # Resume rather than wipe: an existing directory can hold most of a 14-hour pass.
+    # Deleting it is left to the caller (`rm -rf`) so it cannot happen by accident.
     if dest_dir.exists():
-        print(f"⚠️  Output directory already exists: {dest_dir}")
-        # Check if we're in an interactive terminal
-        if sys.stdin.isatty():
-            response = input("Overwrite? (y/n): ").strip().lower()
-            if response != 'y':
-                print("❌ Aborted by user")
-                sys.exit(1)
-        else:
-            # Non-interactive mode: check if refinement is already complete
-            final_marker = dest_dir / "refinement_complete.marker"
-            if final_marker.exists():
-                print(f"✅ Refinement already complete for {dest_dir}, skipping")
-                return
-            else:
-                print(f"🔄 Non-interactive mode: Overwriting incomplete refinement directory")
-        shutil.rmtree(dest_dir)
-    
-    # Copy the entire directory
-    print(f"📋 Copying {source_dir} -> {dest_dir}")
-    shutil.copytree(source_dir, dest_dir)
-    print(f"✅ Copy complete")
-    
-    # Find all instance directories (format: instanceid_timestamp)
-    instance_dirs = [d for d in dest_dir.iterdir() if d.is_dir() and not d.name.startswith('.')]
-    
+        print(f"🔄 Resuming into existing directory: {dest_dir}")
+
+    print(f"📋 Syncing {source_dir} -> {dest_dir}")
+    instance_dirs = _sync_instance_dirs(source_dir, dest_dir)
+    print(f"✅ Sync complete")
+
     if not instance_dirs:
         print(f"❌ No instance directories found in {dest_dir}")
         sys.exit(1)
@@ -808,8 +800,14 @@ def run_refinement_on_existing_outputs(args):
     
     processed_count = 0
     failed_count = 0
+    skipped_count = 0
     
     for inst_dir in sorted(instance_dirs):
+        if _instance_is_refined(inst_dir):
+            print(f"⏭️  Already refined, skipping: {inst_dir.name}")
+            skipped_count += 1
+            continue
+
         # Extract instance_id from directory name (format: instanceid_timestamp)
         # Handle both sf###_timestamp and sf_bq###_timestamp formats
         dir_name = inst_dir.name
@@ -933,6 +931,7 @@ def run_refinement_on_existing_outputs(args):
             except Exception:
                 pass
             _choose_and_mark_final_artifacts(inst_dir, last_cte_name=last_cte)
+            _mark_instance_refined(inst_dir)
             
             processed_count += 1
             
@@ -948,22 +947,30 @@ def run_refinement_on_existing_outputs(args):
     print("📊 REFINEMENT SUMMARY")
     print(f"{'='*80}")
     print(f"✅ Successfully refined: {processed_count}/{len(instance_dirs)}")
+    print(f"⏭️  Already refined: {skipped_count}/{len(instance_dirs)}")
     print(f"❌ Failed: {failed_count}/{len(instance_dirs)}")
     print(f"📂 Results saved to: {dest_dir}/")
     print()
     
-    # Mark refinement as complete
-    refinement_marker = dest_dir / "refinement_complete.marker"
-    refinement_marker.write_text(f"Refinement completed at {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                                 f"Processed: {processed_count}/{len(instance_dirs)}\n"
-                                 f"Failed: {failed_count}/{len(instance_dirs)}\n",
-                                 encoding='utf-8')
+    # A receipt that this pass covered every instance it saw, for reading a finished run
+    # after the fact. Resume does not consult it; see the note where dest_dir is resolved.
+    if failed_count:
+        print(f"⚠️  {failed_count} instance(s) still unrefined; rerun the same command to retry")
+        return
+    (dest_dir / REFINEMENT_MARKER).write_text(
+        f"Refinement completed at {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"Refined this pass: {processed_count}/{len(instance_dirs)}\n"
+        f"Skipped as already refined: {skipped_count}/{len(instance_dirs)}\n",
+        encoding='utf-8')
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="SQL Agent Runner")
     p.add_argument("--instance-id", action="append", default=[], help="Instance ID to run; can repeat")
     p.add_argument("--run-all-from-file", action="store_true", help="Run all instances from JSONL path")
+    p.add_argument("--split", type=str, default=None, help="Split file listing the instance IDs to run")
+    p.add_argument("--split-offset", type=int, default=0, help="Skip this many IDs of --split, for batching")
+    p.add_argument("--split-limit", type=int, default=None, help="Run at most this many IDs of --split, for batching")
     p.add_argument("--jsonl-path", default="data/spider2-lite.jsonl", help="JSONL path with instances")
     # Engine and credential inference from instance_id; no explicit args required
     p.add_argument("--model", default="azure/gpt-4.1", help="LLM model")
@@ -981,6 +988,128 @@ def _build_parser() -> argparse.ArgumentParser:
     # TEMP EXPERIMENT: Add train context file
     p.add_argument("--train-context-file", type=str, default=None, help="[TEMP EXPERIMENT] Path to file with train SQL examples to prepend to system prompt")
     return p
+
+
+REFINEMENT_MARKER = "refinement_complete.marker"
+
+
+def _instance_is_refined(inst_dir: Path) -> bool:
+    return (Path(inst_dir) / REFINEMENT_MARKER).is_file()
+
+
+def _mark_instance_refined(inst_dir: Path) -> None:
+    (Path(inst_dir) / REFINEMENT_MARKER).write_text(
+        f"Refinement completed at {time.strftime('%Y-%m-%d %H:%M:%S')}\n", encoding='utf-8'
+    )
+
+
+def _sync_instance_dirs(source_dir: Path, dest_dir: Path) -> List[Path]:
+    """Mirror the instance directories of `source_dir` into `dest_dir`.
+
+    Copying the tree in one shot is what made a refinement pass all-or-nothing: an
+    instance already present in `dest_dir` may hold hours of finished work, so it is
+    left untouched and only missing instances are copied.
+
+    A marker that comes in with a fresh copy is dropped. It records that some *other*
+    pass refined that instance, and trusting it would skip the work of this one --
+    yielding an arm that is a plain copy of its input, silently.
+    """
+    source_dir, dest_dir = Path(source_dir), Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    def instance_dirs(base: Path) -> List[Path]:
+        return sorted(d for d in base.iterdir() if d.is_dir() and not d.name.startswith('.'))
+
+    for src in instance_dirs(source_dir):
+        dst = dest_dir / src.name
+        if dst.exists():
+            continue
+        shutil.copytree(src, dst)
+        inherited = dst / REFINEMENT_MARKER
+        if inherited.exists():
+            inherited.unlink()
+
+    return instance_dirs(dest_dir)
+
+
+def _has_completed_output(instance_id: str, out_base: Path, require_refinement: bool = False) -> bool:
+    """Whether `instance_id` can be skipped on a rerun.
+
+    `execution_query.sql` is written before refinement starts, so when refinement is
+    part of the run it cannot stand in for "finished": an instance interrupted during
+    refinement would be skipped forever and quietly ship unrefined.
+    """
+    out_base = Path(out_base)
+    if not out_base.exists():
+        return False
+    for dir_path in sorted(out_base.iterdir()):
+        if not (dir_path.is_dir() and dir_path.name.startswith(f"{instance_id}_")):
+            continue
+        sql_file = dir_path / "execution_query.sql"
+        if not (sql_file.exists() and sql_file.stat().st_size > 0):
+            continue
+        if require_refinement and not _instance_is_refined(dir_path):
+            continue
+        return True
+    return False
+
+
+def _store_provenance(tkstore_path: str) -> Dict[str, object]:
+    """Identify the store a run actually read, for `retrieved_rules.json`.
+
+    The arms of an experiment can differ only by which store was passed, and two
+    arms may name the store identically, so the path alone is not enough. A file
+    that cannot be read yields null fields rather than losing the whole report;
+    `_knowledge_options` already rejects a missing path at the CLI boundary.
+    """
+    provenance: Dict[str, object] = {'path': str(tkstore_path), 'sha1': None, 'n_rules': None}
+    try:
+        raw = Path(tkstore_path).read_bytes()
+    except OSError:
+        return provenance
+
+    provenance['sha1'] = hashlib.sha1(raw).hexdigest()
+    text = raw.decode('utf-8', errors='replace')
+    provenance['n_rules'] = max(len(list(csv.DictReader(io.StringIO(text)))), 0)
+    return provenance
+
+
+def _requested_instance_ids(args) -> Optional[List[str]]:
+    """Instance ids to run, in file order, or None for every instance in the JSONL.
+
+    Raises so `main` can report a parser error; picking one of several conflicting
+    selectors would quietly run the wrong instance set.
+    """
+    used = [name for name, given in (
+        ("--instance-id", bool(args.instance_id)),
+        ("--run-all-from-file", bool(args.run_all_from_file)),
+        ("--split", bool(args.split)),
+    ) if given]
+    if len(used) > 1:
+        raise ValueError(f"{', '.join(used)} are mutually exclusive; pass exactly one")
+    if not used:
+        raise ValueError("provide one of --instance-id, --split, or --run-all-from-file")
+
+    batching = args.split_offset or args.split_limit is not None
+    if batching and not args.split:
+        raise ValueError("--split-offset and --split-limit only apply to --split")
+
+    if args.run_all_from_file:
+        return None
+    if not args.split:
+        return list(args.instance_id)
+
+    ids = load_split(args.split)
+    if args.split_offset < 0:
+        raise ValueError(f"--split-offset cannot be negative: {args.split_offset}")
+    if args.split_limit is not None and args.split_limit < 1:
+        raise ValueError(f"--split-limit must be positive: {args.split_limit}")
+    if args.split_offset >= len(ids):
+        raise ValueError(
+            f"--split-offset {args.split_offset} is beyond the {len(ids)} ids in {args.split}"
+        )
+    end = None if args.split_limit is None else args.split_offset + args.split_limit
+    return ids[args.split_offset:end]
 
 
 def _knowledge_options(args) -> Dict[str, object]:
@@ -1014,18 +1143,19 @@ def main():
         run_refinement_on_existing_outputs(args)
         return
 
+    try:
+        requested_ids = _requested_instance_ids(args)
+    except (ValueError, FileNotFoundError) as e:
+        p.error(str(e))
+
+    all_instances = load_instances_from_jsonl(args.jsonl_path)
     instances: List[Instance] = []
-    if args.run_all_from_file:
-        instances = load_instances_from_jsonl(args.jsonl_path)
+    if requested_ids is None:
+        instances = all_instances
     else:
-        # Filter instances list to provided IDs from JSONL
-        if not args.instance_id:
-            print("❌ Provide --instance-id or use --run-all-from-file")
-            sys.exit(1)
-        all_instances = load_instances_from_jsonl(args.jsonl_path)
-        id_set = set(args.instance_id)
-        instances = [inst for inst in all_instances if inst.instance_id in id_set]
-        missing = list(id_set - set(i.instance_id for i in instances))
+        by_id = {inst.instance_id: inst for inst in all_instances}
+        instances = [by_id[i] for i in requested_ids if i in by_id]
+        missing = [i for i in requested_ids if i not in by_id]
         if missing:
             print(f"⚠️  Missing instances in JSONL: {missing}")
 
@@ -1037,23 +1167,11 @@ def main():
     out_base = Path(args.out_base)
     ensure_dir(out_base)
 
-    # Check for already completed instances
-    def has_completed_output(instance_id: str, out_base: Path) -> bool:
-        """Check if instance already has completed output (execution_query.sql exists)."""
-        if not out_base.exists():
-            return False
-        for dir_path in out_base.iterdir():
-            if dir_path.is_dir() and dir_path.name.startswith(f"{instance_id}_"):
-                sql_file = dir_path / "execution_query.sql"
-                if sql_file.exists() and sql_file.stat().st_size > 0:
-                    return True
-        return False
-
     # Filter instances: skip those with existing outputs
     completed = []
     to_run = []
     for inst in instances:
-        if has_completed_output(inst.instance_id, out_base):
+        if _has_completed_output(inst.instance_id, out_base, require_refinement=bool(args.refine_cte)):
             completed.append(inst.instance_id)
         else:
             to_run.append(inst)
@@ -1215,6 +1333,7 @@ def main():
             except Exception:
                 pass
             _choose_and_mark_final_artifacts(out_dir, last_cte_name=last_cte)
+            _mark_instance_refined(out_dir)
 
         if args.verbose:
             print(f"✅ Done {inst.instance_id} → {out_dir}")
