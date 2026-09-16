@@ -11,6 +11,7 @@ import re
 import json
 import argparse
 import sqlite3
+import threading
 from pathlib import Path
 import litellm
 
@@ -257,6 +258,47 @@ Only when confident, emit a single <verdict_json> containing:
 """
 
 
+QUERY_TIMEOUT_SECONDS = 120.0
+
+
+def _execute_with_timeout(conn, cursor, sql: str, fetch_all: bool = True,
+                          seconds: float = QUERY_TIMEOUT_SECONDS):
+    """Run `sql` on `cursor`, interrupting it if it outruns `seconds`.
+
+    The refiner writes its own exploratory SQL, so it can emit a query the agent never
+    would -- one probe against `f1.sqlite` ran for four hours at a full core and stalled
+    the whole pass. `SQLiteExecutor` has bounded the agent's side at the same limit all
+    along; keeping the two equal means a timeout in the logs has one meaning.
+
+    The timer has to cover the fetch as well: `execute` only steps as far as the first
+    row, so bounding it alone would move a runaway projection's spin into `fetchall`.
+    """
+    timed_out = threading.Event()
+
+    def interrupt():
+        timed_out.set()
+        conn.interrupt()
+
+    timer = threading.Timer(seconds, interrupt)
+    timer.start()
+    try:
+        cursor.execute(sql)
+        rows = cursor.fetchall() if fetch_all else cursor.fetchmany(1)
+        headers = [d[0] for d in cursor.description] if cursor.description else None
+    except sqlite3.OperationalError as e:
+        # An interrupt surfaces as a generic OperationalError, so the flag is what
+        # separates "we gave up on it" from "the model wrote invalid SQL".
+        if timed_out.is_set():
+            raise TimeoutError(f"SQL query execution exceeded {seconds:.0f} seconds") from e
+        raise
+    finally:
+        timer.cancel()
+
+    if timed_out.is_set():
+        raise TimeoutError(f"SQL query execution exceeded {seconds:.0f} seconds")
+    return headers, rows
+
+
 def run_refiner(instance_id: str, db_id: str, user_query: str, cte_text: str, cte_goal: str, predicted_ctes: str = None, previous_ctes: str = None, model: str = "azure/gpt-4.1", max_turns: int = 30, verbose: bool = True, trace_output_path: str = None, use_all_rules: bool = False, tribalknowledge_generic_only: bool = True, external_knowledge: str = None, schema_context: str = None, db_path: str = None, min_required_sql: int = None):
     if not db_path:
         db_path = get_database_path(instance_id, db_id)
@@ -376,9 +418,7 @@ def run_refiner(instance_id: str, db_id: str, user_query: str, cte_text: str, ct
                         if verbose:
                             print("\n[Auto SQL]: Listing tables/views")
                         auto_sql = "SELECT name, type FROM sqlite_master WHERE type IN ('table','view') ORDER BY name"
-                        cursor.execute(auto_sql)
-                        rows = cursor.fetchall()
-                        headers = [d[0] for d in cursor.description] if cursor.description else None
+                        headers, rows = _execute_with_timeout(conn, cursor, auto_sql)
                         table_text = _format_table(headers, rows)
                         if verbose:
                             print("\n[SQL RESULT]:\n" + table_text)
@@ -424,9 +464,7 @@ def run_refiner(instance_id: str, db_id: str, user_query: str, cte_text: str, ct
                 if verbose:
                     print("\n[Executing SQL (first of multiple)]:\n" + first_sql)
                 try:
-                    cursor.execute(first_sql)
-                    rows = cursor.fetchall()
-                    headers = [d[0] for d in cursor.description] if cursor.description else None
+                    headers, rows = _execute_with_timeout(conn, cursor, first_sql)
                     table_text = _format_table(headers, rows)
                     if verbose:
                         print("\n[SQL RESULT]:\n" + table_text)
@@ -453,9 +491,7 @@ def run_refiner(instance_id: str, db_id: str, user_query: str, cte_text: str, ct
                 if verbose:
                     print("\n[Executing SQL]:\n" + sql_text)
                 try:
-                    cursor.execute(sql_text)
-                    rows = cursor.fetchall()
-                    headers = [d[0] for d in cursor.description] if cursor.description else None
+                    headers, rows = _execute_with_timeout(conn, cursor, sql_text)
                     table_text = _format_table(headers, rows)
                     
                     # Log SQL execution to trace
@@ -528,9 +564,7 @@ def run_refiner(instance_id: str, db_id: str, user_query: str, cte_text: str, ct
                         # Try to compile suggested_fix_sql as a single statement
                         if suggested_sql:
                             try:
-                                cursor.execute(suggested_sql)
-                                # consume minimal
-                                _ = cursor.fetchone()
+                                _execute_with_timeout(conn, cursor, suggested_sql, fetch_all=False)
                             except Exception as e:
                                 need_rev = True
                                 msg_needs.append("make suggested_fix_sql a single executable SELECT/CTE statement: " + str(e))
@@ -538,8 +572,7 @@ def run_refiner(instance_id: str, db_id: str, user_query: str, cte_text: str, ct
                         # Try executing tests (best-effort)
                         for test_sql in tests_list[:2]:
                             try:
-                                cursor.execute(test_sql)
-                                _ = cursor.fetchone()
+                                _execute_with_timeout(conn, cursor, test_sql, fetch_all=False)
                             except Exception as e:
                                 need_rev = True
                                 msg_needs.append("fix test SQL to be executable: " + str(e))
