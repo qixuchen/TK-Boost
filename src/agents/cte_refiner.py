@@ -260,6 +260,10 @@ Only when confident, emit a single <verdict_json> containing:
 
 QUERY_TIMEOUT_SECONDS = 120.0
 
+# Probes the refiner must run before its own verdict is accepted, one per turn. Callers
+# that shrink the turn budget have to lower this too, or a verdict becomes unreachable.
+DEFAULT_MIN_PROBES = 8
+
 
 def _execute_with_timeout(conn, cursor, sql: str, fetch_all: bool = True,
                           seconds: float = QUERY_TIMEOUT_SECONDS):
@@ -389,7 +393,7 @@ def run_refiner(instance_id: str, db_id: str, user_query: str, cte_text: str, ct
         harness_executed = False
         no_sql_streak = 0
         if min_required_sql is None:
-            min_required_sql = 8
+            min_required_sql = DEFAULT_MIN_PROBES
         executed_sql_texts = []  # track probes actually run for hard gating
         for turn in range(1, max_turns + 1):
             if verbose:

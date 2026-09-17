@@ -79,6 +79,26 @@ class TestPlanSteps:
     def test_the_agent_runs_before_either_arm(self, steps):
         assert [s.name for s in steps] == ["agent", "arm_refonly", "arm_tk"]
 
+    def test_the_refiner_budget_is_not_passed_unless_asked(self, steps):
+        """Omitting it keeps the runner's default, so the reference run stays reproducible."""
+        for step in steps:
+            assert "--refiner-turns" not in step.argv, step.name
+            assert "--refiner-min-probes" not in step.argv, step.name
+
+    def test_the_refiner_budget_reaches_both_arms_but_not_the_agent(self, split_file, tmp_path):
+        """The agent step has no refiner, so the flags would be meaningless noise there."""
+        batch = pipeline.plan_batches(split_file, tmp_path / "test")[0]
+        steps = pipeline.plan_steps(batch, split_file, tkstore="tkstore/tkstore_sqlite.csv",
+                                    refiner_turns=5, refiner_min_probes=3)
+
+        agent = _argv_of(steps, "agent")
+        assert "--refiner-turns" not in agent
+
+        for name in ("arm_refonly", "arm_tk"):
+            argv = _argv_of(steps, name)
+            assert argv[argv.index("--refiner-turns") + 1] == "5", name
+            assert argv[argv.index("--refiner-min-probes") + 1] == "3", name
+
     def test_every_step_runs_unbuffered(self, steps):
         """The child does the progress printing. Block-buffered through a `tee` pipe it
         withholds output for kilobytes at a time, which reads as a hung run."""

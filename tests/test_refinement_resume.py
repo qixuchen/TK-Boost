@@ -228,7 +228,7 @@ def _run_refinement(src, dest, extra=()):
     args = runner._build_parser().parse_args(
         ["--refine-output", str(src), "--refine-output-dir", str(dest), *extra]
     )
-    runner.run_refinement_on_existing_outputs(args)
+    return runner.run_refinement_on_existing_outputs(args)
 
 
 class TestResume:
@@ -366,6 +366,25 @@ class TestResume:
 
         assert refine_env == ["local004"]
 
+    def test_failed_instances_are_reported_to_the_caller(self, tmp_path, src, monkeypatch, refine_env):
+        """`run_steps` stops the pipeline at the first failing step, but that guard is
+        inert while this returns normally: a half-refined arm then flows into the next
+        one and comes out looking like a result. It cost a 32-instance credentials
+        outage going unnoticed until the second arm had already started."""
+        def boom(**kwargs):
+            if kwargs["inst"].instance_id == "local002":
+                raise RuntimeError("refiner blew up")
+            return "SELECT 1", None
+
+        monkeypatch.setattr(runner, "perform_refinement_and_revision", boom)
+
+        failed = _run_refinement(src, tmp_path / "arm")
+
+        assert failed == 1
+
+    def test_a_clean_pass_reports_no_failures(self, tmp_path, src, refine_env):
+        assert _run_refinement(src, tmp_path / "arm") == 0
+
     def test_a_stale_directory_marker_does_not_block_an_untouched_destination(self, tmp_path, src, refine_env):
         """A marker with no instance directories beside it cannot mean the work is done."""
         dest = tmp_path / "arm"
@@ -375,6 +394,67 @@ class TestResume:
         _run_refinement(src, dest)
 
         assert sorted(refine_env) == ["local001", "local002", "local003"]
+
+
+class TestExitCode:
+    """`run_steps` only stops the pipeline when a step exits non-zero."""
+
+    def test_refinement_failures_make_the_runner_exit_non_zero(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["sql_agent_runner", "--refine-output", str(tmp_path / "agent"),
+                                         "--refine-output-dir", str(tmp_path / "arm")])
+        monkeypatch.setattr(runner, "run_refinement_on_existing_outputs", lambda _a: 3)
+
+        with pytest.raises(SystemExit) as exit_info:
+            runner.main()
+
+        assert exit_info.value.code != 0
+
+    def test_the_agent_path_exits_non_zero_when_an_instance_produced_nothing(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """An instance whose SQL came out empty is dropped from both arms by
+        `_sync_instance_dirs`, so the pipeline would silently compare 85 instances
+        instead of 86 and report it as a result."""
+        split = tmp_path / "split.txt"
+        split.write_text("local001\nlocal002\n", encoding="utf-8")
+        monkeypatch.setattr("sys.argv", ["sql_agent_runner", "--split", str(split),
+                                         "--out-base", str(tmp_path / "agent")])
+        monkeypatch.setattr(
+            runner, "load_instances_from_jsonl",
+            lambda _p: [runner.Instance(instance_id=f"local00{i}", db="testdb", question="q")
+                        for i in (1, 2)],
+        )
+        # local001 finishes, local002 comes back with nothing.
+        monkeypatch.setattr(runner, "resolve_sqlite_db_path", lambda iid, _db: str(tmp_path / "db.sqlite"))
+        monkeypatch.setattr(runner, "get_system_prompt", lambda *_a, **_k: "sys")
+        monkeypatch.setattr(runner, "build_user_message", lambda *_a, **_k: "user")
+        monkeypatch.setattr(runner, "load_external_knowledge", lambda *_a, **_k: None)
+        monkeypatch.setattr(runner, "load_ground_truth", lambda _i: (None, None, None))
+        monkeypatch.setattr(runner, "generate_processed_trace", lambda _m: "")
+        monkeypatch.setattr(runner, "write_csv", lambda *_a, **_k: None)
+
+        class DoneExecutor:
+            def close(self):
+                pass
+
+        def fake_run_agent(**kwargs):
+            sql = "SELECT 1" if kwargs["inst"].instance_id == "local001" else ""
+            return sql, None, None, [], DoneExecutor()
+
+        monkeypatch.setattr(runner, "run_agent", fake_run_agent)
+
+        with pytest.raises(SystemExit) as exit_info:
+            runner.main()
+
+        assert exit_info.value.code != 0
+        assert "local002" in capsys.readouterr().out
+
+    def test_a_clean_refinement_pass_exits_zero(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["sql_agent_runner", "--refine-output", str(tmp_path / "agent"),
+                                         "--refine-output-dir", str(tmp_path / "arm")])
+        monkeypatch.setattr(runner, "run_refinement_on_existing_outputs", lambda _a: 0)
+
+        runner.main()  # must not raise SystemExit
 
 
 class TestHasCompletedOutput:

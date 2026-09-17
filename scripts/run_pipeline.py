@@ -57,6 +57,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--filter-model", type=str, default=None, help="Model for the FilterKnowledge step")
     p.add_argument("--no-llm-filtering", action="store_true",
                    help="Skip the FilterKnowledge step of retrieval (ablation only)")
+    p.add_argument("--refiner-turns", type=int, default=None,
+                   help="Probing turns per fragment (omit for the runner default of 25; "
+                        "upstream tkboost.sql effectively uses 5)")
+    p.add_argument("--refiner-min-probes", type=int, default=None,
+                   help="Probes required before the refiner's verdict is accepted "
+                        "(omit for 8; upstream tkboost.sql passes 3). Must be lower than "
+                        "--refiner-turns or no verdict is reachable")
     p.add_argument("--dry-run", action="store_true", help="Print the commands without running them")
     return p
 
@@ -69,6 +76,18 @@ def main() -> int:
         parser.error("--batch-size and --split-limit are mutually exclusive")
     if not Path(args.tkstore).is_file():
         parser.error(f"--tkstore path does not exist: {args.tkstore}")
+
+    # Validated here rather than left to the child: an unreachable probe minimum would
+    # otherwise only surface after the agent step had already run for hours. The runner
+    # owns the rule so the defaults cannot drift apart.
+    try:
+        from src.agents.sql_agent_runner import DEFAULT_REFINER_TURNS, _refiner_options
+        _refiner_options(argparse.Namespace(
+            refiner_turns=args.refiner_turns if args.refiner_turns is not None else DEFAULT_REFINER_TURNS,
+            refiner_min_probes=args.refiner_min_probes,
+        ))
+    except ValueError as e:
+        parser.error(str(e))
 
     try:
         batches = plan_batches(args.split, Path(args.out_prefix), batch_size=args.batch_size)
@@ -89,6 +108,8 @@ def main() -> int:
             model=args.model,
             filter_model=args.filter_model,
             use_llm_filtering=not args.no_llm_filtering,
+            refiner_turns=args.refiner_turns,
+            refiner_min_probes=args.refiner_min_probes,
         )
         code = run_steps(steps, dry_run=args.dry_run)
         if code != 0:

@@ -33,7 +33,12 @@ from src.utils.agent_utils import (
     make_json_serializable,
     load_external_knowledge,
 )
-from src.agents.cte_refiner import run_refiner as refiner_run
+from src.agents.cte_refiner import run_refiner as refiner_run, DEFAULT_MIN_PROBES
+
+# Probing turns each fragment gets. 25 is what this entry point has always used and what
+# the 86-instance reference run was measured with; upstream `tkboost.sql()` effectively
+# uses 5. Both are reproducible via --refiner-turns, so the default must not drift.
+DEFAULT_REFINER_TURNS = 25
 from src.agents.prompts import BASE_PROMPT, SNOWFLAKE_PROMPT
 from src.utils.db_paths import resolve_sqlite_db_path
 from src.utils.splits import load_split
@@ -571,7 +576,10 @@ def perform_refinement_and_revision(inst: Instance,
                                     schema_context: str = None,
                                     tkstore_path: Optional[str] = None,
                                     use_llm_filtering: bool = True,
-                                    filter_model: str = 'gpt-4.1') -> Tuple[str, Optional[dict]]:
+                                    filter_model: str = 'gpt-4.1',
+                                    refiner_turns: int = DEFAULT_REFINER_TURNS,
+                                    refiner_min_probes: Optional[int] = None,
+                                    ) -> Tuple[str, Optional[dict]]:
     """Run per-CTE refiner flow with cooperative revision and final SELECT refinement.
 
     Returns updated_final_sql, final_select_verdict (optional).
@@ -628,7 +636,8 @@ def perform_refinement_and_revision(inst: Instance,
             previous_ctes=previous_ctes_text,
             predicted_ctes=predicted_cte_hint or None,
             model=refiner_model,
-            max_turns=25,
+            max_turns=refiner_turns,
+            min_required_sql=refiner_min_probes,
             verbose=verbose,
             trace_output_path=str(cte_trace),
             use_all_rules=False,
@@ -686,7 +695,8 @@ def perform_refinement_and_revision(inst: Instance,
             previous_ctes=previous_ctes_text,
             predicted_ctes=predicted_cte_hint or None,
             model=refiner_model,
-            max_turns=25,
+            max_turns=refiner_turns,
+            min_required_sql=refiner_min_probes,
             verbose=verbose,
             trace_output_path=str(final_trace),
             use_all_rules=False,
@@ -750,10 +760,15 @@ def load_instances_from_jsonl(jsonl_path: str) -> List[Instance]:
     return instances
 
 
-def run_refinement_on_existing_outputs(args):
+def run_refinement_on_existing_outputs(args) -> int:
     """Run refinement on existing output directories, loading execution_query.sql instead of regenerating.
-    
+
     Refines existing outputs and saves to a new directory (specified by --refine-output-dir).
+
+    Returns the number of instances still unrefined, which the caller turns into the exit
+    code. `run_steps` stops the pipeline on the first failing step, and that guard is
+    inert unless failures show up there: a half-refined arm otherwise flows straight into
+    the next one and the comparison comes out looking like a result.
     """
     import shutil
     
@@ -909,6 +924,7 @@ def run_refinement_on_existing_outputs(args):
                 external_knowledge=external_knowledge,
                 schema_context=schema_context,
                 **_knowledge_options(args),
+                **_refiner_options(args),
             )
             
             # Don't save _refined files - refiner changes are already in _after_ files
@@ -956,18 +972,24 @@ def run_refinement_on_existing_outputs(args):
     # after the fact. Resume does not consult it; see the note where dest_dir is resolved.
     if failed_count:
         print(f"⚠️  {failed_count} instance(s) still unrefined; rerun the same command to retry")
-        return
+        return failed_count
     (dest_dir / REFINEMENT_MARKER).write_text(
         f"Refinement completed at {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"Refined this pass: {processed_count}/{len(instance_dirs)}\n"
         f"Skipped as already refined: {skipped_count}/{len(instance_dirs)}\n",
         encoding='utf-8')
+    return 0
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="SQL Agent Runner")
     p.add_argument("--instance-id", action="append", default=[], help="Instance ID to run; can repeat")
     p.add_argument("--run-all-from-file", action="store_true", help="Run all instances from JSONL path")
+    p.add_argument("--refiner-turns", type=int, default=DEFAULT_REFINER_TURNS,
+                   help="Probing turns per fragment for the refiner (upstream tkboost.sql uses 5)")
+    p.add_argument("--refiner-min-probes", type=int, default=None,
+                   help=f"Probes required before the refiner's verdict is accepted "
+                        f"(default: run_refiner's own {DEFAULT_MIN_PROBES}; upstream tkboost.sql passes 3)")
     p.add_argument("--split", type=str, default=None, help="Split file listing the instance IDs to run")
     p.add_argument("--split-offset", type=int, default=0, help="Skip this many IDs of --split, for batching")
     p.add_argument("--split-limit", type=int, default=None, help="Run at most this many IDs of --split, for batching")
@@ -1146,6 +1168,35 @@ def _requested_instance_ids(args) -> Optional[List[str]]:
     return ids[args.split_offset:end]
 
 
+def _refiner_options(args) -> Dict[str, object]:
+    """Refiner budget kwargs for `perform_refinement_and_revision`.
+
+    The two settings are coupled: `run_refiner` withholds its verdict until
+    `min_required_sql` probes have run, one per turn, so a minimum the turn budget
+    cannot reach makes a verdict unreachable. It would then fall through to the
+    `no_verdict` fallback, whose status is `issues` and therefore triggers a rewrite of
+    a fragment nobody diagnosed -- a silent, systematic corruption. Rejecting the
+    combination up front turns that into a CLI error.
+    """
+    if args.refiner_turns < 1:
+        raise ValueError(f"--refiner-turns must be positive: {args.refiner_turns}")
+
+    effective_min = DEFAULT_MIN_PROBES if args.refiner_min_probes is None else args.refiner_min_probes
+    if effective_min < 0:
+        raise ValueError(f"--refiner-min-probes cannot be negative: {args.refiner_min_probes}")
+    if effective_min >= args.refiner_turns:
+        raise ValueError(
+            f"--refiner-min-probes {effective_min} is unreachable within --refiner-turns "
+            f"{args.refiner_turns}: probes run one per turn and at least one turn is needed "
+            f"for the verdict itself. Lower --refiner-min-probes "
+            f"(upstream tkboost.sql pairs 5 turns with 3 probes)."
+        )
+    return {
+        'refiner_turns': args.refiner_turns,
+        'refiner_min_probes': args.refiner_min_probes,
+    }
+
+
 def _knowledge_options(args) -> Dict[str, object]:
     """Knowledge kwargs for `perform_refinement_and_revision`, or {} when disabled."""
     if not args.tkstore:
@@ -1169,12 +1220,14 @@ def main():
     args = p.parse_args()
     try:
         _knowledge_options(args)
+        _refiner_options(args)
     except ValueError as e:
         p.error(str(e))
 
     # Refinement-only mode: load existing outputs and run refiner
     if args.refine_output:
-        run_refinement_on_existing_outputs(args)
+        if run_refinement_on_existing_outputs(args):
+            sys.exit(1)
         return
 
     try:
@@ -1352,6 +1405,7 @@ def main():
                     external_knowledge=external_knowledge,
                     schema_context=schema_context,
                     **_knowledge_options(args),
+                    **_refiner_options(args),
                 )
             except Exception as e:
                 if args.verbose:
@@ -1375,6 +1429,16 @@ def main():
 
         if args.verbose:
             print(f"✅ Done {inst.instance_id} → {out_dir}")
+
+    # An instance without agent output is dropped from both arms by `_sync_instance_dirs`,
+    # so staying quiet here would let the pipeline compare a smaller sample and present
+    # it as a result. `run_steps` only stops on a non-zero exit.
+    unfinished = [inst.instance_id for inst in to_run
+                  if not _has_completed_output(inst.instance_id, out_base)]
+    if unfinished:
+        print(f"\n❌ {len(unfinished)} instance(s) produced no SQL: {unfinished}")
+        print("   Rerun the same command to retry them; finished instances are skipped.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

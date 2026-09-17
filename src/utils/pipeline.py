@@ -93,11 +93,15 @@ def plan_steps(
     model: Optional[str] = None,
     filter_model: Optional[str] = None,
     use_llm_filtering: bool = True,
+    refiner_turns: Optional[int] = None,
+    refiner_min_probes: Optional[int] = None,
 ) -> List[Step]:
     """The three invocations for one batch, in the order they must run.
 
     The agent step deliberately carries no refinement flag: its `execution_query.sql`
-    is the bare-agent number, which both arms then start from.
+    is the bare-agent number, which both arms then start from. For the same reason the
+    refiner budget is only passed to the arms, and only when asked -- omitting it leaves
+    the runner's own default, which is what the reference run was measured with.
     """
     # `-u` because the child prints the progress: piped to a log it would otherwise
     # block-buffer and look hung for kilobytes at a time.
@@ -110,16 +114,22 @@ def plan_steps(
     if batch.limit is not None:
         agent += ["--split-limit", str(batch.limit)]
 
+    budget: List[str] = []
+    if refiner_turns is not None:
+        budget += ["--refiner-turns", str(refiner_turns)]
+    if refiner_min_probes is not None:
+        budget += ["--refiner-min-probes", str(refiner_min_probes)]
+
     refonly = base + [
         "--refine-output", str(batch.agent_dir),
         "--refine-output-dir", str(batch.refonly_dir),
-    ] + common
+    ] + common + budget
 
     tk = base + [
         "--refine-output", str(batch.agent_dir),
         "--refine-output-dir", str(batch.tk_dir),
         "--tkstore", str(tkstore),
-    ] + common
+    ] + common + budget
     if filter_model:
         tk += ["--filter-model", filter_model]
     if not use_llm_filtering:
