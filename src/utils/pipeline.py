@@ -95,6 +95,7 @@ def plan_steps(
     use_llm_filtering: bool = True,
     refiner_turns: Optional[int] = None,
     refiner_min_probes: Optional[int] = None,
+    rule_scope: Optional[str] = None,
 ) -> List[Step]:
     """The three invocations for one batch, in the order they must run.
 
@@ -130,6 +131,10 @@ def plan_steps(
         "--refine-output-dir", str(batch.tk_dir),
         "--tkstore", str(tkstore),
     ] + common + budget
+    # Only the knowledge arm: `arm_refonly` has no store, and the runner rejects a scope
+    # without one rather than let it read as an ablation that retrieved nothing.
+    if rule_scope:
+        tk += ["--rule-scope", rule_scope]
     if filter_model:
         tk += ["--filter-model", filter_model]
     if not use_llm_filtering:

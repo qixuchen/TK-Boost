@@ -72,11 +72,29 @@ def llm_completion(model: str, messages: list, **params):
 
 
 # ----------------- Tribal Knowledge Retrieval (Alg 4) -----------------
+RULE_SCOPES = ('all', 'db', 'generic')
+
+
+def _keep_scope(candidates: List[dict], rule_scope: str) -> List[dict]:
+    """Restrict candidates to one scope.
+
+    Done here rather than in `tkstore/tagger_index.py` to leave the vendored upstream
+    retrieval untouched, and before FilterKnowledge so no LLM call is spent ranking
+    rules that are already excluded.
+    """
+    if rule_scope == 'all':
+        return candidates
+    wanted_generic = (rule_scope == 'generic')
+    return [c for c in candidates
+            if ((c.get('scope') or '').strip().lower() == 'generic') == wanted_generic]
+
+
 def _retrieve_rules_for(sql_text: str,
                         tkstore_path: str,
                         db: Optional[str],
                         use_llm_filtering: bool,
-                        filter_model: str) -> Tuple[List[dict], List[dict]]:
+                        filter_model: str,
+                        rule_scope: str = 'all') -> Tuple[List[dict], List[dict]]:
     """Retrieve rules for one SQL fragment, as (candidates, selected).
 
     `MemoryRetriever.retrieve` collapses the two stages into one return value; they
@@ -86,11 +104,14 @@ def _retrieve_rules_for(sql_text: str,
     errors by returning every candidate, so an unmapped 'azure/...' name would
     silently disable filtering rather than fail.
     """
-    candidates = search_index_for_sql(
-        sql_text,
-        tkstore_path,
-        generic_only=False,
-        db=db,
+    candidates = _keep_scope(
+        search_index_for_sql(
+            sql_text,
+            tkstore_path,
+            generic_only=False,
+            db=db,
+        ),
+        rule_scope,
     )
     if use_llm_filtering and candidates:
         resolved = _resolve_model(filter_model)
@@ -577,6 +598,7 @@ def perform_refinement_and_revision(inst: Instance,
                                     tkstore_path: Optional[str] = None,
                                     use_llm_filtering: bool = True,
                                     filter_model: str = 'gpt-4.1',
+                                    rule_scope: str = 'all',
                                     refiner_turns: int = DEFAULT_REFINER_TURNS,
                                     refiner_min_probes: Optional[int] = None,
                                     ) -> Tuple[str, Optional[dict]]:
@@ -598,6 +620,7 @@ def perform_refinement_and_revision(inst: Instance,
             db=inst.db,
             use_llm_filtering=use_llm_filtering,
             filter_model=filter_model,
+            rule_scope=rule_scope,
         )
         retrievals.append({
             'stage': stage,
@@ -732,6 +755,7 @@ def perform_refinement_and_revision(inst: Instance,
                 'n_ctes': len(ctes),
                 'filter_model': filter_model,
                 'use_llm_filtering': bool(use_llm_filtering),
+                'rule_scope': rule_scope,
                 'retrievals': retrievals,
             }, indent=2),
             encoding='utf-8',
@@ -985,6 +1009,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="SQL Agent Runner")
     p.add_argument("--instance-id", action="append", default=[], help="Instance ID to run; can repeat")
     p.add_argument("--run-all-from-file", action="store_true", help="Run all instances from JSONL path")
+    p.add_argument("--rule-scope", choices=RULE_SCOPES, default='all',
+                   help="Which rule scopes may reach the refiner. 'db' drops the generic "
+                        "rules that made up 95%% of what the reference run injected")
     p.add_argument("--refiner-turns", type=int, default=DEFAULT_REFINER_TURNS,
                    help="Probing turns per fragment for the refiner (upstream tkboost.sql uses 5)")
     p.add_argument("--refiner-min-probes", type=int, default=None,
@@ -1200,6 +1227,11 @@ def _refiner_options(args) -> Dict[str, object]:
 def _knowledge_options(args) -> Dict[str, object]:
     """Knowledge kwargs for `perform_refinement_and_revision`, or {} when disabled."""
     if not args.tkstore:
+        if args.rule_scope != 'all':
+            raise ValueError(
+                f"--rule-scope {args.rule_scope} has no effect without --tkstore; "
+                "the run would look like a completed ablation having retrieved nothing"
+            )
         return {}
     if not (args.refine_cte or args.refine_output):
         raise ValueError(
@@ -1212,6 +1244,7 @@ def _knowledge_options(args) -> Dict[str, object]:
         'tkstore_path': args.tkstore,
         'use_llm_filtering': not args.no_llm_filtering,
         'filter_model': args.filter_model,
+        'rule_scope': args.rule_scope,
     }
 
 

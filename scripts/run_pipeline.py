@@ -57,6 +57,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--filter-model", type=str, default=None, help="Model for the FilterKnowledge step")
     p.add_argument("--no-llm-filtering", action="store_true",
                    help="Skip the FilterKnowledge step of retrieval (ablation only)")
+    p.add_argument("--rule-scope", choices=("all", "db", "generic"), default=None,
+                   help="Restrict which rule scopes reach the knowledge arm (omit for all). "
+                        "'db' drops the generic rules that were 95%% of the reference run's "
+                        "injected volume")
     p.add_argument("--refiner-turns", type=int, default=None,
                    help="Probing turns per fragment (omit for the runner default of 25; "
                         "upstream tkboost.sql effectively uses 5)")
@@ -110,6 +114,7 @@ def main() -> int:
             use_llm_filtering=not args.no_llm_filtering,
             refiner_turns=args.refiner_turns,
             refiner_min_probes=args.refiner_min_probes,
+            rule_scope=args.rule_scope,
         )
         code = run_steps(steps, dry_run=args.dry_run)
         if code != 0:
