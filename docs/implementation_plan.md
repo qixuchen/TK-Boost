@@ -1415,3 +1415,118 @@ B10 另有一层后果值得记住：知识只进 refiner 的 `cte_goal`，出�
 （3.3 实测 21 个片段里 13 个如此）。这不算偏离论文——Alg 5 的循环条件 `f ≠ ∅` 本身就允许
 feedback 为空——但它意味着"检索到 N 条规则"与"agent 收到 N 条规则"是两件差很远的事，
 这也正是 `rules_used` 只能给出上界的原因。
+
+---
+
+# 阶段 5 — 把候选 SQL 一并交给 agent（`f` 里带 SQL）
+
+**尚未实现。** 本阶段的设计依据是阶段 4 五轮实验的结论，完整数据见
+[`results_reference_track.md`](./results_reference_track.md)。
+
+## 5.0 为什么要做
+
+五轮实验把问题定位到了一处：**知识信息没有到达真正改写 SQL 的那一步。**
+
+| 轮次 | 修复由谁应用 | 知识净 |
+| --- | --- | --- |
+| A–D | agent 重写（忠于论文 Alg 5） | **−6 / −5 / −1 / −3** |
+| E | 直接采纳 refiner 的 SQL（复现上游） | **+3** |
+
+refiner 的 verdict 一直带着 `suggested_fix_sql`（完整的修正片段）并落盘在
+`refiner_<name>.json`，但 `sql_agent_runner.py` 里这个字段名出现 **0 次**。默认路径只把散文式
+的 `suggested_fix` 转给主 agent，而**那个 agent 从未见过任何规则**。实测这条链损耗极大：
+主 agent 的改写与 refiner 建议的相似度中位数只有 **0.23–0.47**，78–83% 的片段低于 0.5 ——
+主 agent 基本在自己另写一版。
+
+但 E 轮那条捷径有它自己的病：**refiner 的建议有一半跑不通**（108/211 被执行校验拦下），
+其中 **33 条（49%）是"输出契约被破坏"** —— refiner 只看到一个 CTE，不知道下游消费者
+期待什么列，改了输出 schema 就把整条查询打挂。典型如 `local018`：refiner 把
+`category_counts` 的输出从 `(collision_year, total_incidents, speeding_incidents)`
+改成 `(collision_year, pcf_violation_category, n)`，而下游 `percentage_shares`
+还在引用 `speeding_incidents`。
+
+**这类失败在 Alg 5 里结构上不可能发生**，因为论文把 agent 留在环里：第 7 行
+`(s_t, is_final) ← A(C_TK_t)` 规定 SQL 永远由 agent 产出，第 12–13 行
+`R_t ← ExecSQL(s_t)` 与 `concat(..., R_t, f)` 把执行结果回灌上下文，第 5 行
+`while is_final = False ∨ f ≠ ∅` 保证还有反馈就继续。agent 是唯一有全局视野的组件。
+上游 `tkboost.sql()` 把这三件事全拿掉了 —— 它执行了 `refined_sql` 但只把失败写进返回值的
+`execution.ok = False`，照样返回那条跑不通的 SQL。
+
+## 5.1 设计
+
+**只改 `_feedback_text` 的渲染**，把 `suggested_fix_sql` 作为候选 SQL 加进 `f`。
+其余机制一个不动：仍由 agent 产出完整 `<solution>`、仍执行校验、失败仍把 `SQL_ERROR`
+追加进 messages 重试。即论文第 7、12、13 行的闭环完整保留。
+
+```
+[Refiner feedback for CTE <name>]
+Issues:
+- ...（不变）
+
+Suggested fix (reference):
+...（不变，散文）
+
+Candidate SQL from the refiner (reference, not validated):     ← 新增
+WITH ...
+
+Tests / checks to satisfy:
+- ...（不变）
+
+Instruction: Revise ONLY the CTE named '<name>' ...（不变）
+You may reuse or adapt the candidate SQL above, but you are responsible for
+keeping the rest of the query consistent with it -- downstream CTEs and the
+final SELECT must still reference columns that actually exist.   ← 新增
+```
+
+三个要点：
+
+- **标注"未经校验"**：它确实有一半跑不通，要让 agent 保持怀疑而非盲抄。
+- **明确把全局一致性的责任写给 agent**：这是整个设计的核心。refiner 看不见下游，
+  agent 手里有完整的解、看得见。
+- **不动其余任何机制**，以便与 A–E 轮严格可比。
+
+### 它取的是两者各自成立的那一半
+
+| | 知识信息是否完整传到改 SQL 的那一步 | 谁负责全局一致性 |
+| --- | --- | --- |
+| A–D 轮（论文路径） | ❌ 只传散文 | agent ✅ |
+| E 轮 / 上游 | ✅ 完整 SQL | **没有人** ← 33 条契约破坏的根源 |
+| **本阶段** | ✅ 完整 SQL | agent ✅ |
+
+### 仍然忠于论文
+
+Alg 5 只规定 `f ← Feedback(q, c_i, K)`，**没有规定 `f` 的内容形式**。论文正文说 `f` 是
+natural language feedback，而一段带 SQL 的反馈仍是自然语言反馈 —— 如同人类 code review
+既写评语也贴 diff。关键在于第 7 行仍是 `A(C_TK_t)` 产出 `s_t`，agent 仍是唯一作者与整合者。
+
+有一处旁证：refiner 自己的 `tests` 字段里出现过
+`WITH fixed AS (/* use suggested_fix_sql upstream CTEs here */)` ——
+**它写测试时就假设下游能看到 `suggested_fix_sql`**，说明 prompt 的设计意图里它本该被传下去。
+
+## 5.2 可证伪的预测
+
+- 臂 A 应回到 **+1**（与 A–D 轮相同，agent 仍在环里整合）
+- 知识净值应**不差于 E 轮的 +3**
+
+三种失败模式及其后果：
+
+| 失败模式 | 退化到 | 为什么最坏不差于 E 轮 |
+| --- | --- | --- |
+| agent 盲抄候选 SQL 不改下游 | E 轮行为 | 执行校验拦住且**能重试**（最多 5 次，B11）；上游拦不住也不重试 |
+| agent 完全忽略候选 SQL | A–D 轮行为 | 理论下界 −5 |
+| prompt 变长挤压注意力 | 不确定 | 候选 SQL 常几百至上千字符；25 轮配置下风险更大，5 轮配置下较小 |
+
+## 5.3 验收
+
+- 单测：`_feedback_text` 在 `suggested_fix_sql` 非空时渲染候选 SQL 段与责任声明；
+  为空时输出与现在逐字节一致（保证 A–E 轮可复现）
+- 单测：新增段落不改变 `issues` / `suggested_fix` / `tests` 的现有渲染
+- 默认关闭（新增标志），A–E 轮的复现命令不受影响
+- `retrieved_rules.json` 记录该标志，作为区分两臂目录的凭据
+- 跑法：复用同一份裸 agent 产出与 5 轮探库配置，两臂同开该标志
+
+## 5.4 这一阶段的意义
+
+E 轮的结论是"README 报告的增益依赖一个**偏离论文**的实现细节"。如果本阶段的预测成立，
+结论会变成更有建设性的一句：**论文的架构是对的，上游的实现只是把知识传丢了；
+补上传递、保留 agent 整合，两者兼得。** 后者对论文是正面的，也更可能是作者的本意。
