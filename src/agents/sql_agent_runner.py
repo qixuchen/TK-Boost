@@ -649,6 +649,8 @@ def perform_refinement_and_revision(inst: Instance,
                                     refiner_min_probes: Optional[int] = None,
                                     adopt_refiner_sql: bool = False,
                                     include_candidate_sql: bool = False,
+                                    validate_fix_in_context: bool = False,
+                                    verdict_attempts: int = 1,
                                     ) -> Tuple[str, Optional[dict]]:
     """Run per-CTE refiner flow with cooperative revision and final SELECT refinement.
 
@@ -695,9 +697,37 @@ def perform_refinement_and_revision(inst: Instance,
             prev_blocks.append(f"-- CTE: {pname}\n-- Goal: {pgoal}\nWITH {pname} AS (\n{pbody}\n)\n")
         previous_ctes_text = "\n\n".join(prev_blocks).strip()
 
+        # Only the runner can reassemble the query: `previous_ctes` is a display format
+        # carrying one `WITH` per block. So the refiner is shown what reads its output and
+        # handed a closure that judges a fix by the reassembled query.
+        downstream_text = None
+        validate_fix = None
+        if validate_fix_in_context:
+            tail = [f"-- CTE: {x.get('name')}\nWITH {x.get('name')} AS (\n{x.get('body')}\n)"
+                    for x in ctes[idx_cte + 1:]]
+            downstream_text = "\n\n".join(tail + [remainder_sql.strip()]).strip()
+
+            def validate_fix(suggested: str, _idx=idx_cte, _body=cte_body) -> Optional[str]:
+                fixed, _ = parse_ctes_from_sql(suggested or '')
+                if not fixed:
+                    return "suggested_fix_sql does not parse as a CTE"
+                candidate = list(ctes)
+                candidate[_idx] = {**candidate[_idx], 'body': fixed[0].get('body') or _body}
+                try:
+                    executor = make_executor(engine, db_path_or_cred)
+                    executor.execute(rebuild_sql_from_ctes(candidate, remainder_sql))
+                    if hasattr(executor, 'close'):
+                        executor.close()
+                except Exception as e:
+                    return str(e)
+                return None
+
         cte_out = out_dir / f"refiner_{cte_name}.json"
         cte_trace = out_dir / f"refiner_{cte_name}_trace.txt"
         verdict = refiner_run(
+            downstream=downstream_text,
+            validate_fix_sql=validate_fix,
+            max_verdict_attempts=verdict_attempts,
             instance_id=inst.instance_id,
             db_id=inst.db,
             user_query=inst.question,
@@ -773,7 +803,26 @@ def perform_refinement_and_revision(inst: Instance,
         complete_query = rebuild_sql_from_ctes(ctes, remainder_sql)
         final_out = out_dir / "refiner_final_select.json"
         final_trace = out_dir / "refiner_final_select_trace.txt"
+
+        # No downstream to show and nothing to reassemble: at this stage the refiner was
+        # given the complete query, so its suggestion is judged exactly as written.
+        validate_final = None
+        if validate_fix_in_context:
+            def validate_final(suggested: str) -> Optional[str]:
+                if not (suggested or '').strip():
+                    return None
+                try:
+                    executor = make_executor(engine, db_path_or_cred)
+                    executor.execute(suggested)
+                    if hasattr(executor, 'close'):
+                        executor.close()
+                except Exception as e:
+                    return str(e)
+                return None
+
         final_verdict = refiner_run(
+            validate_fix_sql=validate_final,
+            max_verdict_attempts=verdict_attempts,
             instance_id=inst.instance_id,
             db_id=inst.db,
             user_query=inst.question,
@@ -840,6 +889,8 @@ def perform_refinement_and_revision(inst: Instance,
                 'use_llm_filtering': bool(use_llm_filtering),
                 'adopt_refiner_sql': bool(adopt_refiner_sql),
                 'include_candidate_sql': bool(include_candidate_sql),
+                'validate_fix_in_context': bool(validate_fix_in_context),
+                'verdict_attempts': int(verdict_attempts),
                 'retrievals': retrievals,
             }, indent=2),
             encoding='utf-8',
@@ -911,7 +962,10 @@ def run_refinement_on_existing_outputs(args) -> int:
         sys.exit(1)
     
     print(f"📂 Found {len(instance_dirs)} instance directories")
-    print(f"🔍 Running refinement with max_turns=25")
+    # Read off `args`, not hardcoded: this line claimed 25 while a run with
+    # `--refiner-turns 5` was measurably capping probes at 5.
+    print(f"🔍 Running refinement with refiner_turns={args.refiner_turns}, "
+          f"verdict_attempts={args.verdict_attempts}")
     
     # Load instances from JSONL to get metadata
     all_instances_list = load_instances_from_jsonl(args.jsonl_path)
@@ -1097,6 +1151,14 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Substitute the refiner's own suggested_fix_sql instead of asking the "
                         "agent to rewrite. Reproduces upstream tkboost.sql(); the paper has the "
                         "agent act on feedback, so the two targets differ here")
+    p.add_argument("--validate-fix-in-context", action="store_true",
+                   help="Show the refiner what reads its output and judge its suggested_fix_sql "
+                        "by the reassembled query rather than the fragment alone. Requires "
+                        "--adopt-refiner-sql")
+    p.add_argument("--verdict-attempts", type=int, default=1,
+                   help="How many times the refiner may produce a verdict for one fragment. "
+                        "Above 1, a suggestion that fails once substituted is handed back "
+                        "with the error and asked again. Requires --validate-fix-in-context")
     p.add_argument("--include-candidate-sql", action="store_true",
                    help="Pass the refiner's suggested_fix_sql to the agent as part of the "
                         "feedback, so the knowledge-informed SQL reaches the rewrite while the "
@@ -1313,11 +1375,27 @@ def _refiner_options(args) -> Dict[str, object]:
             "adoption never reaches the feedback path, so the flag would be a silent no-op "
             "dressed up as an experimental condition"
         )
+    if args.validate_fix_in_context and not args.adopt_refiner_sql:
+        raise ValueError(
+            "--validate-fix-in-context requires --adopt-refiner-sql: without adoption the "
+            "refiner's SQL is never substituted, so judging it against the full query "
+            "measures nothing"
+        )
+    if args.verdict_attempts < 1:
+        raise ValueError(f"--verdict-attempts must be at least 1: {args.verdict_attempts}")
+    if args.verdict_attempts > 1 and not args.validate_fix_in_context:
+        raise ValueError(
+            "--verdict-attempts above 1 requires --validate-fix-in-context: the retry is "
+            "triggered by the substituted query failing, and without the validator there "
+            "is nothing to trigger it"
+        )
     return {
         'refiner_turns': args.refiner_turns,
         'refiner_min_probes': args.refiner_min_probes,
         'adopt_refiner_sql': bool(args.adopt_refiner_sql),
         'include_candidate_sql': bool(args.include_candidate_sql),
+        'validate_fix_in_context': bool(args.validate_fix_in_context),
+        'verdict_attempts': args.verdict_attempts,
     }
 
 

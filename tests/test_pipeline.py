@@ -79,6 +79,39 @@ class TestPlanSteps:
     def test_the_agent_runs_before_either_arm(self, steps):
         assert [s.name for s in steps] == ["agent", "arm_refonly", "arm_tk"]
 
+    def test_in_context_validation_is_not_passed_unless_asked(self, steps):
+        for step in steps:
+            assert "--validate-fix-in-context" not in step.argv, step.name
+
+    def test_in_context_validation_reaches_both_arms_but_not_the_agent(self, split_file, tmp_path):
+        """It changes how the refiner judges its own fix, which both arms must share."""
+        batch = pipeline.plan_batches(split_file, tmp_path / "test")[0]
+        steps = pipeline.plan_steps(batch, split_file, tkstore="tkstore/tkstore_sqlite.csv",
+                                    adopt_refiner_sql=True, validate_fix_in_context=True)
+
+        assert "--validate-fix-in-context" not in _argv_of(steps, "agent")
+        for name in ("arm_refonly", "arm_tk"):
+            assert "--validate-fix-in-context" in _argv_of(steps, name), name
+
+    def test_the_verdict_budget_is_not_passed_unless_asked(self, steps):
+        """Omitting it leaves the runner's default of one attempt, which is round E."""
+        for step in steps:
+            assert "--verdict-attempts" not in step.argv, step.name
+
+    def test_the_verdict_budget_reaches_both_arms_but_not_the_agent(self, split_file, tmp_path):
+        """It changes how many chances a suggestion gets, so a one-sided setting would make
+        the pairing measure the retry rather than knowledge."""
+        batch = pipeline.plan_batches(split_file, tmp_path / "test")[0]
+        steps = pipeline.plan_steps(batch, split_file, tkstore="tkstore/tkstore_sqlite.csv",
+                                    adopt_refiner_sql=True, validate_fix_in_context=True,
+                                    verdict_attempts=3)
+
+        assert "--verdict-attempts" not in _argv_of(steps, "agent")
+        for name in ("arm_refonly", "arm_tk"):
+            argv = _argv_of(steps, name)
+            assert "--verdict-attempts" in argv, name
+            assert argv[argv.index("--verdict-attempts") + 1] == "3", name
+
     def test_the_candidate_sql_flag_is_not_passed_unless_asked(self, steps):
         for step in steps:
             assert "--include-candidate-sql" not in step.argv, step.name

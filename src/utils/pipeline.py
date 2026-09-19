@@ -97,6 +97,8 @@ def plan_steps(
     refiner_min_probes: Optional[int] = None,
     adopt_refiner_sql: bool = False,
     include_candidate_sql: bool = False,
+    validate_fix_in_context: bool = False,
+    verdict_attempts: Optional[int] = None,
 ) -> List[Step]:
     """The three invocations for one batch, in the order they must run.
 
@@ -127,6 +129,10 @@ def plan_steps(
         budget += ["--adopt-refiner-sql"]
     if include_candidate_sql:
         budget += ["--include-candidate-sql"]
+    if validate_fix_in_context:
+        budget += ["--validate-fix-in-context"]
+    if verdict_attempts is not None:
+        budget += ["--verdict-attempts", str(verdict_attempts)]
 
     refonly = base + [
         "--refine-output", str(batch.agent_dir),

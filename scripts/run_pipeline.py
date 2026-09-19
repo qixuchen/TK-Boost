@@ -61,6 +61,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Substitute the refiner's own suggested_fix_sql in both arms instead of "
                         "asking the agent to rewrite. Reproduces upstream tkboost.sql(), which "
                         "differs from the paper's feedback-then-agent-revises loop")
+    p.add_argument("--validate-fix-in-context", action="store_true",
+                   help="Show the refiner what reads its output and judge its suggested_fix_sql "
+                        "by the reassembled query rather than the fragment alone, in both arms. "
+                        "Requires --adopt-refiner-sql")
+    p.add_argument("--verdict-attempts", type=int, default=None,
+                   help="How many verdicts the refiner may produce per fragment in both arms. "
+                        "Above 1, a suggestion that fails once substituted is handed back with "
+                        "the error and asked again. Requires --validate-fix-in-context")
     p.add_argument("--include-candidate-sql", action="store_true",
                    help="Pass the refiner's suggested_fix_sql to the agent as part of the "
                         "feedback in both arms. Keeps the agent as integrator (unlike "
@@ -95,6 +103,8 @@ def main() -> int:
             refiner_min_probes=args.refiner_min_probes,
             adopt_refiner_sql=args.adopt_refiner_sql,
             include_candidate_sql=args.include_candidate_sql,
+            validate_fix_in_context=args.validate_fix_in_context,
+            verdict_attempts=1 if args.verdict_attempts is None else args.verdict_attempts,
         ))
     except ValueError as e:
         parser.error(str(e))
@@ -122,6 +132,8 @@ def main() -> int:
             refiner_min_probes=args.refiner_min_probes,
             adopt_refiner_sql=args.adopt_refiner_sql,
             include_candidate_sql=args.include_candidate_sql,
+            validate_fix_in_context=args.validate_fix_in_context,
+            verdict_attempts=args.verdict_attempts,
         )
         code = run_steps(steps, dry_run=args.dry_run)
         if code != 0:

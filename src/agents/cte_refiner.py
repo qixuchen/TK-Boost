@@ -13,8 +13,10 @@ import argparse
 import sqlite3
 import threading
 from pathlib import Path
+from typing import Callable, List, Optional, Tuple
 import litellm
 
+from src.utils.agent_utils import parse_ctes_from_sql
 from src.utils.db_paths import get_database_path
 
 
@@ -258,6 +260,32 @@ Only when confident, emit a single <verdict_json> containing:
 """
 
 
+# Sent when the turn budget runs out. Measured in round E to be the origin of every
+# verdict the refiner produced: 708 of 708 fragments reached it.
+FORCED_VERDICT_PROMPT = """TIME LIMIT REACHED. You MUST now provide a <verdict_json> based on ALL the exploration you have done so far.
+
+CRITICAL: Even if you are not 100% certain, you MUST make a decision. Use all the SQL probes, schema exploration, and data analysis you have already performed to make the best possible assessment.
+
+REQUIREMENTS:
+- If you found ANY issues during your exploration (missing tables, incorrect joins, wrong aggregations, etc.), set status to "issues" and provide suggested_fix_sql
+- If the CTE appears correct based on your exploration, set status to "ok" 
+- You MUST provide suggested_fix_sql if status is "issues" - even if it's not perfect, provide your best attempt based on what you discovered
+- Include 1-2 test SQLs in the 'tests' array that demonstrate the issue or confirm the fix
+
+IMPORTANT: Your response must contain ONLY a valid JSON object wrapped in <verdict_json> tags. No other text. Example format:
+<verdict_json>
+{
+  "status": "issues",
+  "issues": ["missing table join"],
+  "suggested_fix": "Add missing join to table X",
+  "suggested_fix_sql": "SELECT ... FROM table1 JOIN table2 ...",
+  "tests": ["SELECT COUNT(*) FROM table1", "SELECT COUNT(*) FROM table2"]
+}
+</verdict_json>
+
+Do NOT ask for more exploration. Make a decision NOW based on what you already know."""
+
+
 QUERY_TIMEOUT_SECONDS = 120.0
 
 # Probes the refiner must run before its own verdict is accepted, one per turn. Callers
@@ -303,7 +331,179 @@ def _execute_with_timeout(conn, cursor, sql: str, fetch_all: bool = True,
     return headers, rows
 
 
-def run_refiner(instance_id: str, db_id: str, user_query: str, cte_text: str, cte_goal: str, predicted_ctes: str = None, previous_ctes: str = None, model: str = "azure/gpt-4.1", max_turns: int = 30, verbose: bool = True, trace_output_path: str = None, use_all_rules: bool = False, tribalknowledge_generic_only: bool = True, external_knowledge: str = None, schema_context: str = None, db_path: str = None, min_required_sql: int = None):
+DOWNSTREAM_CONSTRAINT = (
+    "Your rewrite replaces only [CTE]. Everything above in [DOWNSTREAM] keeps reading this "
+    "CTE's output, so your rewrite must preserve the output column names it references."
+)
+
+# The payload labels its blocks but the base prompt explains only [PREVIOUS_CTES], leaving
+# the model to infer the rest from the label. Adding [DOWNSTREAM] without a guide is how
+# local018 still lost its output contract: the section sat at 1.5% of a 15,791-character
+# payload and the sentence explaining it at 99%, with 13,933 characters of rules between.
+SECTION_GUIDE = """
+Input sections you will be given (in this order):
+- [USER_QUERY]: the natural-language question the whole SQL query must answer.
+- [PREVIOUS_CTES]: CTEs defined before [CTE]. Treat them as existing views you may read.
+- [DOWNSTREAM]: the CTEs defined after [CTE] plus the final SELECT, verbatim. You must NOT
+  rewrite them -- they are the consumers of your CTE. Read them to see which output columns
+  of [CTE] are referenced; renaming or dropping any of those breaks the whole query.
+- [CTE]: the single CTE you are responsible for. Your suggested_fix_sql replaces only this.
+- [CTE_GOAL]: its intended purpose, followed by retrieved tribal knowledge rules. The rules
+  are advisory and may be irrelevant to this CTE; ignore the ones that do not apply.
+- [CTE_NAME]: the name of that CTE.
+- [MANDATORY_PROBES]: checks to run against the database before deciding.
+"""
+
+
+def _system_prompt(*, predicted_ctes: str = None, downstream: str = None) -> str:
+    """The refiner's system prompt, with the section guide when there is downstream context.
+
+    Gated so that rounds A-F, measured without it, stay byte-identical on rerun -- otherwise
+    arm A would move for reasons unrelated to any experiment.
+    """
+    variant = SYSTEM_PROMPT_WITH_PREDICTED if predicted_ctes else SYSTEM_PROMPT_WITHOUT_PREDICTED
+    prompt = SYSTEM_PROMPT_BASE + "\n" + variant
+    if downstream and downstream.strip():
+        prompt += "\n" + SECTION_GUIDE
+    return prompt
+
+
+def _build_user_payload(*, user_query: str, cte_text: str, cte_goal: str,
+                        external_knowledge: str = None, schema_context: str = None,
+                        previous_ctes: str = None, predicted_ctes: str = None,
+                        downstream: str = None) -> str:
+    """Assemble the refiner's user message.
+
+    `downstream` is the one addition of stage 6, and it is what `[PREVIOUS_CTES]` always
+    lacked a counterpart for: the refiner is handed `ctes[:idx]` but never what comes
+    after, so it cannot tell which of its output columns anything still reads. Rewriting
+    them is how 33 of the 108 suggestions blocked in round E broke the query.
+
+    Placed before `[CTE]` so the target fragment stays next to `[CTE_GOAL]` -- what to
+    change beside how. Omitted entirely when absent, which keeps rounds A-F reproducible
+    and covers the last CTE, where there is no downstream.
+    """
+    payload = "[USER_QUERY]\n" + (user_query or "").strip()
+
+    # External knowledge and schema context from tkstore (like BigQuery/Snowflake)
+    if external_knowledge:
+        payload += "\n\n[EXTERNAL_KNOWLEDGE]\n" + external_knowledge.strip()
+    if schema_context:
+        payload += "\n\n[SCHEMA_CONTEXT]\n" + schema_context.strip()
+    if previous_ctes:
+        payload += "\n\n[PREVIOUS_CTES]\n" + previous_ctes.strip()
+    if downstream and downstream.strip():
+        # The constraint goes with the section it constrains, not at the tail of a payload
+        # whose [CTE_GOAL] can run to 14k characters.
+        payload += "\n\n[DOWNSTREAM]\n" + downstream.strip() + "\n\n" + DOWNSTREAM_CONSTRAINT
+    if predicted_ctes:
+        payload += "\n\n[PREDICTED_CTES_PLAN]\n" + predicted_ctes.strip()
+
+    payload += "\n\n[CTE]\n" + cte_text.strip()
+    payload += "\n\n[CTE_GOAL]\n" + cte_goal.strip()
+
+    cte_name_hint = _extract_first_cte_name(cte_text)
+    if cte_name_hint:
+        payload += f"\n\n[CTE_NAME]\n{cte_name_hint}"
+        payload += (
+            "\n\n[Harness tip]\n"
+            f"You may compile-test the CTE by concatenating [PREVIOUS_CTES] + this [CTE], then running: SELECT * FROM {cte_name_hint} LIMIT 10."
+        )
+
+    # Basic mandatory probes - semantic-specific rules now come from tkstore
+    must_probes = [
+        "PRAGMA table_info on all referenced base tables",
+        "Sample rows from referenced tables (LIMIT 5)",
+        "DISTINCT and NULL counts on key filter/derived columns",
+    ]
+    payload += "\n\n[MANDATORY_PROBES]\n- " + "\n- ".join(must_probes)
+
+    if predicted_ctes:
+        payload += "\n\nInstructions: Alternate <think> and <sql> (or a single fenced ```sql code block```) to explore thoroughly. One SQL per turn. Check alignment with predicted plan, validate collision-level vs party-level needs (case_id uniqueness), and related tables if present (e.g., collisions, victims). Only at the end, provide a single <verdict_json>."
+    else:
+        payload += "\n\nInstructions: Alternate <think> and <sql> (or a single fenced ```sql code block```) to explore thoroughly. One SQL per turn. Validate collision-level vs party-level needs (case_id uniqueness), and related tables if present (e.g., collisions, victims). Only at the end, provide a single <verdict_json>."
+
+    return payload
+
+
+def _check_suggested_sql(conn, cursor, suggested_sql: str,
+                         validate_fix_sql=None) -> Tuple[bool, List[str]]:
+    """Whether the refiner's own fix needs another revision, and why.
+
+    Without `validate_fix_sql` this compiles the fragment on its own, which is what the
+    refiner has always done -- and what let a rewrite that renames output columns through,
+    since in isolation it compiles perfectly well.
+
+    With it, the caller decides: only the caller can reassemble the query, because
+    `previous_ctes` is a display format carrying one `WITH` per block rather than
+    concatenable SQL. A rejection flows into the existing revision loop, so no new retry
+    machinery is needed.
+    """
+    if not (suggested_sql or '').strip():
+        return False, []
+
+    if validate_fix_sql is not None:
+        error = validate_fix_sql(suggested_sql)
+        if error:
+            return True, [
+                "your suggested_fix_sql was substituted into the full query, which then "
+                f"failed: {error}. Check [DOWNSTREAM] -- it still reads this CTE's output "
+                "columns. Revise suggested_fix_sql"
+            ]
+        return False, []
+
+    try:
+        _execute_with_timeout(conn, cursor, suggested_sql, fetch_all=False)
+    except Exception as e:
+        return True, ["make suggested_fix_sql a single executable SELECT/CTE statement: " + str(e)]
+    return False, []
+
+
+ISSUE_STATUSES = ('issues', 'issue', 'incorrect')
+
+
+def _proposes_a_fix(verdict: Optional[dict]) -> bool:
+    """Whether this verdict will actually be substituted, and so is worth checking."""
+    verdict = verdict or {}
+    return (str(verdict.get('status', '')).lower() in ISSUE_STATUSES
+            and bool((verdict.get('suggested_fix_sql') or '').strip()))
+
+
+def _verdict_rejection_message(*, suggested_sql: str, error: str,
+                               cte_name_hint: str = '') -> str:
+    """What the refiner is told when its suggestion broke the query.
+
+    The error comes first and always: it is the only thing the verdict is judged on. The
+    two structural notes are explanations, never causes -- 17 of round E's 85 suggestions
+    were structurally wrong yet executed once truncated, so rejecting on structure would
+    have lost them.
+    """
+    message = (
+        "Your suggested_fix_sql was substituted back into the full query, which then "
+        f"failed to execute: {error}\n"
+        "Revise suggested_fix_sql and send a new <verdict_json>."
+    )
+
+    fixed, _ = parse_ctes_from_sql(suggested_sql or '')
+    if len(fixed) > 1:
+        message += (
+            f"\n\nNote: you returned {len(fixed)} CTEs, but only the first one is used and "
+            "the rest are discarded, so a design spread across several of them is cut "
+            "apart. Express the whole fix inside a single CTE."
+        )
+    if fixed and cte_name_hint and (fixed[0].get('name') or '').lower() != cte_name_hint.lower():
+        message += (
+            f"\n\nNote: your suggested_fix_sql defines the CTE `{fixed[0].get('name')}`, but "
+            f"it replaces the CTE named `{cte_name_hint}` and everything downstream still "
+            f"reads `{cte_name_hint}`."
+        )
+    return message
+
+
+def run_refiner(instance_id: str, db_id: str, user_query: str, cte_text: str, cte_goal: str, predicted_ctes: str = None, previous_ctes: str = None, model: str = "azure/gpt-4.1", max_turns: int = 30, verbose: bool = True, trace_output_path: str = None, use_all_rules: bool = False, tribalknowledge_generic_only: bool = True, external_knowledge: str = None, schema_context: str = None, db_path: str = None, min_required_sql: int = None,
+                downstream: str = None,
+                validate_fix_sql: Optional[Callable[[str], Optional[str]]] = None,
+                max_verdict_attempts: int = 1):
     if not db_path:
         db_path = get_database_path(instance_id, db_id)
     
@@ -326,56 +526,25 @@ def run_refiner(instance_id: str, db_id: str, user_query: str, cte_text: str, ct
     try:
         _ = _parse_referenced_tables(cte_text)
 
-        # Build system prompt based on whether predicted CTEs are provided
-        if predicted_ctes:
-            system_prompt = SYSTEM_PROMPT_BASE + "\n" + SYSTEM_PROMPT_WITH_PREDICTED
-        else:
-            system_prompt = SYSTEM_PROMPT_BASE + "\n" + SYSTEM_PROMPT_WITHOUT_PREDICTED
+        system_prompt = _system_prompt(predicted_ctes=predicted_ctes, downstream=downstream)
 
-        # Build user payload
-        user_payload = "[USER_QUERY]\n" + (user_query or "").strip()
-        
         # Log user query to trace
         trace.add_section("USER QUERY", user_query or "")
-        
-        # Add external knowledge and schema context from tkstore (like BigQuery/Snowflake)
-        if external_knowledge:
-            user_payload += "\n\n[EXTERNAL_KNOWLEDGE]\n" + external_knowledge.strip()
-        
-        if schema_context:
-            user_payload += "\n\n[SCHEMA_CONTEXT]\n" + schema_context.strip()
 
-        if previous_ctes:
-            user_payload += "\n\n[PREVIOUS_CTES]\n" + previous_ctes.strip()
-
-        if predicted_ctes:
-            user_payload += "\n\n[PREDICTED_CTES_PLAN]\n" + predicted_ctes.strip()
-
-        user_payload += "\n\n[CTE]\n" + cte_text.strip()
-        user_payload += "\n\n[CTE_GOAL]\n" + cte_goal.strip()
+        user_payload = _build_user_payload(
+            user_query=user_query,
+            cte_text=cte_text,
+            cte_goal=cte_goal,
+            external_knowledge=external_knowledge,
+            schema_context=schema_context,
+            previous_ctes=previous_ctes,
+            predicted_ctes=predicted_ctes,
+            downstream=downstream,
+        )
         # The goal carries any retrieved tribal knowledge, so a verdict can only be
         # attributed to specific rules if it is recorded here.
         trace.add_section("CTE GOAL", cte_goal.strip())
         cte_name_hint = _extract_first_cte_name(cte_text)
-        if cte_name_hint:
-            user_payload += f"\n\n[CTE_NAME]\n{cte_name_hint}"
-            user_payload += (
-                "\n\n[Harness tip]\n"
-                f"You may compile-test the CTE by concatenating [PREVIOUS_CTES] + this [CTE], then running: SELECT * FROM {cte_name_hint} LIMIT 10."
-            )
-        
-        # Basic mandatory probes - semantic-specific rules now come from tkstore
-        must_probes = [
-            "PRAGMA table_info on all referenced base tables",
-            "Sample rows from referenced tables (LIMIT 5)",
-            "DISTINCT and NULL counts on key filter/derived columns",
-        ]
-        user_payload += "\n\n[MANDATORY_PROBES]\n- " + "\n- ".join(must_probes)
-
-        if predicted_ctes:
-            user_payload += "\n\nInstructions: Alternate <think> and <sql> (or a single fenced ```sql code block```) to explore thoroughly. One SQL per turn. Check alignment with predicted plan, validate collision-level vs party-level needs (case_id uniqueness), and related tables if present (e.g., collisions, victims). Only at the end, provide a single <verdict_json>."
-        else:
-            user_payload += "\n\nInstructions: Alternate <think> and <sql> (or a single fenced ```sql code block```) to explore thoroughly. One SQL per turn. Validate collision-level vs party-level needs (case_id uniqueness), and related tables if present (e.g., collisions, victims). Only at the end, provide a single <verdict_json>."
 
         if verbose:
             print("\n--- SYSTEM PROMPT ---")
@@ -395,295 +564,328 @@ def run_refiner(instance_id: str, db_id: str, user_query: str, cte_text: str, ct
         if min_required_sql is None:
             min_required_sql = DEFAULT_MIN_PROBES
         executed_sql_texts = []  # track probes actually run for hard gating
-        for turn in range(1, max_turns + 1):
-            if verbose:
-                print(f"\n========== LLM TURN {turn} ==========")
-            resp = llm(model, messages)
-            msg_obj = _extract_message_obj(resp)
-            raw = _message_to_dict(msg_obj)
-            if verbose:
-                print("[LLM RAW MESSAGE]:")
-                try:
-                    print(json.dumps(raw, indent=2))
-                except Exception:
-                    print(str(raw))
-            content = _extract_content(msg_obj, raw)
-            
-            # Log LLM thinking to trace
-            thinking = extract_tagged(content, "think")
-            if thinking:
-                trace.add_section(f"LLM THINKING (Turn {turn})", thinking)
-            
-            if not content:
-                no_sql_streak += 1
-                if no_sql_streak >= 2:
-                    # Auto-fallback bootstrap: list tables/views
-                    try:
-                        if verbose:
-                            print("\n[Auto SQL]: Listing tables/views")
-                        auto_sql = "SELECT name, type FROM sqlite_master WHERE type IN ('table','view') ORDER BY name"
-                        headers, rows = _execute_with_timeout(conn, cursor, auto_sql)
-                        table_text = _format_table(headers, rows)
-                        if verbose:
-                            print("\n[SQL RESULT]:\n" + table_text)
-                        messages.append({"role": "user", "content": "SQL_RESULT_TABLE:\n" + table_text})
-                        messages.append({"role": "user", "content": "Now emit a single <sql>: PRAGMA table_info(<likely_table>)"})
-                        sql_executed += 1
-                        executed_sql_texts.append(auto_sql)
-                        continue
-                    except Exception as e:
-                        if verbose:
-                            print("[SQL ERROR]:", str(e))
-                messages.append({"role": "user", "content": "Please send exactly one <sql> now (start with listing tables or PRAGMA table_info(<table>))."})
-                continue
+        validation_errors: List[str] = []
+        validated = None
+        attempt = 0
 
-            # If the assistant claims readiness, immediately ask for verdict
-            lower = content.lower()
-            if ("ready to deliver" in lower or "finalized assessment" in lower or "ready to" in lower) and "<verdict_json>" not in lower:
-                messages.append({"role": "user", "content": "Now output <verdict_json> only (no other text)."})
-                continue
+        def record_validation(suggested: str) -> Optional[str]:
+            """The single place a rejection is counted, so both checks agree on the tally.
 
-            # Detect SQL/verdict blocks (both tag and fenced)
-            sql_tag_blocks = re.findall(r"<sql>(.*?)</sql>", content, flags=re.DOTALL | re.IGNORECASE)
-            sql_fence_blocks = re.findall(r"```\s*sql\s*([\s\S]*?)```", content, flags=re.DOTALL | re.IGNORECASE)
-            sql_blocks = sql_tag_blocks + sql_fence_blocks
-            # Generic fenced blocks as fallback (language-agnostic); only accept if looks like SQL
-            if len(sql_blocks) == 0:
-                generic_fences = re.findall(r"```\s*([\s\S]*?)```", content, flags=re.DOTALL)
-                for blk in generic_fences:
-                    blk_trim = blk.strip()
-                    low = blk_trim.lower()
-                    if any(k in low for k in ["select ", "pragma ", "with ", "explain "]):
-                        sql_blocks.append(blk_trim)
-            has_verdict = bool(re.search(r"<verdict_json>.*?</verdict_json>", content, flags=re.DOTALL | re.IGNORECASE))
-
-            if len(sql_blocks) == 0 and not has_verdict:
-                no_sql_streak += 1
-            else:
-                no_sql_streak = 0
-
-            # Multiple SQL in one turn → execute first, nudge for next
-            if len(sql_blocks) > 1:
-                first_sql = sql_blocks[0].strip()
+            There are two: the in-loop one on the verdict branch, and the one after the
+            forced verdict. Only the second was recorded at first, which hid a real
+            in-loop rejection on local018 and left the trace with no reason for it.
+            """
+            error = validate_fix_sql(suggested)
+            if error:
+                validation_errors.append(error)
+                trace.add_section(f"VERDICT REJECTED (attempt {attempt})", error)
                 if verbose:
-                    print("\n[Executing SQL (first of multiple)]:\n" + first_sql)
-                try:
-                    headers, rows = _execute_with_timeout(conn, cursor, first_sql)
-                    table_text = _format_table(headers, rows)
-                    if verbose:
-                        print("\n[SQL RESULT]:\n" + table_text)
-                    messages.append({"role": "user", "content": "SQL_RESULT_TABLE:\n" + table_text + "\nNote: One SQL per turn. Send the next probe in a new message."})
-                    sql_executed += 1
-                    executed_sql_texts.append(first_sql)
-                    try:
-                        if cte_name_hint and (f" from {cte_name_hint.lower()}" in first_sql.lower() or f" from [{cte_name_hint.lower()}]" in first_sql.lower()):
-                            harness_executed = True
-                    except Exception:
-                        pass
-                except Exception as e:
-                    if verbose:
-                        print("[SQL ERROR]:", str(e))
-                    messages.append({"role": "user", "content": f"SQL_ERROR: {str(e)}\nNote: One SQL per turn. Send the next probe in a new message."})
-                continue
+                    print(f"\n[VERDICT REJECTED, attempt {attempt}]: {error}")
+            return error
 
-            # Normal append
-            messages.append({"role": "assistant", "content": content})
+        check_fix = record_validation if validate_fix_sql is not None else None
 
-            # Single SQL block
-            if len(sql_blocks) == 1:
-                sql_text = sql_blocks[0].strip()
+        # The probe budget is spent per attempt, but `sql_executed` and `harness_executed`
+        # carry across: resetting them would make the minimum-probes gate bite again and
+        # compel three fresh probes, when the point is that the refiner *may* probe more.
+        for attempt in range(1, max(1, max_verdict_attempts) + 1):
+            verdict_data = None
+            for turn in range(1, max_turns + 1):
                 if verbose:
-                    print("\n[Executing SQL]:\n" + sql_text)
-                try:
-                    headers, rows = _execute_with_timeout(conn, cursor, sql_text)
-                    table_text = _format_table(headers, rows)
-                    
-                    # Log SQL execution to trace
-                    trace.add_section(f"SQL QUERY (Turn {turn})", sql_text)
-                    trace.add_section(f"SQL RESULT (Turn {turn})", table_text)
-                    
-                    if verbose:
-                        print("\n[SQL RESULT]:\n" + table_text)
-                    messages.append({"role": "user", "content": "SQL_RESULT_TABLE:\n" + table_text})
-                    sql_executed += 1
-                    executed_sql_texts.append(sql_text)
-                    try:
-                        if cte_name_hint and (f" from {cte_name_hint.lower()}" in sql_text.lower() or f" from [{cte_name_hint.lower()}]" in sql_text.lower()):
-                            harness_executed = True
-                    except Exception:
-                        pass
-                except Exception as e:
-                    if verbose:
-                        print("[SQL ERROR]:", str(e))
-                    messages.append({"role": "user", "content": f"SQL_ERROR: {str(e)}"})
-                continue
-
-            # Verdict
-            if has_verdict:
-                # Basic minimum probes requirement
-                if (
-                    sql_executed < min_required_sql
-                    or (cte_name_hint and not harness_executed)
-                ):
-                    needs = []
-                    if sql_executed < min_required_sql:
-                        needs.append(f"more probes ({sql_executed}/{min_required_sql})")
-                    if cte_name_hint and not harness_executed:
-                        needs.append("compile-test the CTE with SELECT * FROM CTE_NAME LIMIT 10")
-                    messages.append({"role": "user", "content": "Before verdict, do: " + ", ".join(needs) + "."})
-                    continue
-                verdict_text = extract_tagged(content, "verdict_json")
-                
-                # Log verdict to trace
-                if verdict_text:
-                    trace.add_section(f"VERDICT JSON (Turn {turn})", verdict_text)
-                
-                try:
-                    verdict_data = json.loads(verdict_text)
-                    # Basic verdict validation - semantic-specific rules now come from tkstore
-                    if verdict_data.get("status"):
-                        need_rev = False
-                        msg_needs = []
-                        suggested_sql = verdict_data.get("suggested_fix_sql") or ""
-                        tests_list = verdict_data.get("tests") or []
-                        
-                        # Require at least one test
-                        if not tests_list:
-                            need_rev = True
-                            msg_needs.append("include 1–3 executable test SQLs in 'tests'")
-                        
-                        # LEFT JOIN + CASE must avoid silent default of NULLs
-                        try:
-                            if " left join " in suggested_sql.lower() and "case" in (suggested_sql or "").lower():
-                                low = suggested_sql.lower()
-                                has_unknown_bucket = "unknown" in low
-                                has_not_null_filter = (" is not null" in low)
-                                uses_inner_join = (" left join " not in low and " join " in low)
-                                if not (has_unknown_bucket or has_not_null_filter or uses_inner_join):
-                                    need_rev = True
-                                    msg_needs.append("for LEFT JOIN + CASE labels: either use INNER JOIN, or WHERE <joined_col> IS NOT NULL, or create explicit 'unknown' bucket")
-                        except Exception:
-                            pass
-                        
-                        # Try to compile suggested_fix_sql as a single statement
-                        if suggested_sql:
-                            try:
-                                _execute_with_timeout(conn, cursor, suggested_sql, fetch_all=False)
-                            except Exception as e:
-                                need_rev = True
-                                msg_needs.append("make suggested_fix_sql a single executable SELECT/CTE statement: " + str(e))
-                        
-                        # Try executing tests (best-effort)
-                        for test_sql in tests_list[:2]:
-                            try:
-                                _execute_with_timeout(conn, cursor, test_sql, fetch_all=False)
-                            except Exception as e:
-                                need_rev = True
-                                msg_needs.append("fix test SQL to be executable: " + str(e))
-                        
-                        if need_rev:
-                            messages.append({"role": "user", "content": "Revise <verdict_json>: " + "; ".join(msg_needs) + "."})
-                            verdict_data = None
-                            continue
-                    break
-                except Exception:
-                    messages.append({"role": "user", "content": "Please re-send <verdict_json> with valid JSON only (no extra text)."})
-                    continue
-
-            # Near end: force verdict request
-            if turn >= max_turns - 1:
-                messages.append({"role": "user", "content": "Time budget nearly exhausted. Output <verdict_json> only (no other text)."})
-                continue
-
-            # General nudge
-            messages.append({"role": "user", "content": "Think, then send the next SQL probe (one per turn). Explore related tables (collisions, victims) and validate joins/keys against the user query."})
-    
-        # If we reached max turns without a verdict, force a final verdict
-        if not verdict_data:
-            if verbose:
-                print(f"\n========== FORCED FINAL VERDICT (max turns reached) ==========")
-            
-            final_message = """TIME LIMIT REACHED. You MUST now provide a <verdict_json> based on ALL the exploration you have done so far.
-
-CRITICAL: Even if you are not 100% certain, you MUST make a decision. Use all the SQL probes, schema exploration, and data analysis you have already performed to make the best possible assessment.
-
-REQUIREMENTS:
-- If you found ANY issues during your exploration (missing tables, incorrect joins, wrong aggregations, etc.), set status to "issues" and provide suggested_fix_sql
-- If the CTE appears correct based on your exploration, set status to "ok" 
-- You MUST provide suggested_fix_sql if status is "issues" - even if it's not perfect, provide your best attempt based on what you discovered
-- Include 1-2 test SQLs in the 'tests' array that demonstrate the issue or confirm the fix
-
-IMPORTANT: Your response must contain ONLY a valid JSON object wrapped in <verdict_json> tags. No other text. Example format:
-<verdict_json>
-{
-  "status": "issues",
-  "issues": ["missing table join"],
-  "suggested_fix": "Add missing join to table X",
-  "suggested_fix_sql": "SELECT ... FROM table1 JOIN table2 ...",
-  "tests": ["SELECT COUNT(*) FROM table1", "SELECT COUNT(*) FROM table2"]
-}
-</verdict_json>
-
-Do NOT ask for more exploration. Make a decision NOW based on what you already know."""
-            
-            messages.append({"role": "user", "content": final_message})
-            
-            try:
+                    print(f"\n========== LLM TURN {turn} ==========")
                 resp = llm(model, messages)
                 msg_obj = _extract_message_obj(resp)
                 raw = _message_to_dict(msg_obj)
-                content = _extract_content(msg_obj, raw)
-                
                 if verbose:
-                    print("[FORCED VERDICT RESPONSE]:")
-                    print(content)
-                
-                verdict_text = extract_tagged(content, "verdict_json")
-                
-                # Log forced verdict to trace
-                trace.add_section("FORCED VERDICT RESPONSE", content)
-                if verdict_text:
-                    trace.add_section("FORCED VERDICT JSON", verdict_text)
-                
-                if verdict_text:
+                    print("[LLM RAW MESSAGE]:")
                     try:
-                        verdict_data = json.loads(verdict_text)
+                        print(json.dumps(raw, indent=2))
+                    except Exception:
+                        print(str(raw))
+                content = _extract_content(msg_obj, raw)
+            
+                # Log LLM thinking to trace
+                thinking = extract_tagged(content, "think")
+                if thinking:
+                    trace.add_section(f"LLM THINKING (Turn {turn})", thinking)
+            
+                if not content:
+                    no_sql_streak += 1
+                    if no_sql_streak >= 2:
+                        # Auto-fallback bootstrap: list tables/views
+                        try:
+                            if verbose:
+                                print("\n[Auto SQL]: Listing tables/views")
+                            auto_sql = "SELECT name, type FROM sqlite_master WHERE type IN ('table','view') ORDER BY name"
+                            headers, rows = _execute_with_timeout(conn, cursor, auto_sql)
+                            table_text = _format_table(headers, rows)
+                            if verbose:
+                                print("\n[SQL RESULT]:\n" + table_text)
+                            messages.append({"role": "user", "content": "SQL_RESULT_TABLE:\n" + table_text})
+                            messages.append({"role": "user", "content": "Now emit a single <sql>: PRAGMA table_info(<likely_table>)"})
+                            sql_executed += 1
+                            executed_sql_texts.append(auto_sql)
+                            continue
+                        except Exception as e:
+                            if verbose:
+                                print("[SQL ERROR]:", str(e))
+                    messages.append({"role": "user", "content": "Please send exactly one <sql> now (start with listing tables or PRAGMA table_info(<table>))."})
+                    continue
+
+                # If the assistant claims readiness, immediately ask for verdict
+                lower = content.lower()
+                if ("ready to deliver" in lower or "finalized assessment" in lower or "ready to" in lower) and "<verdict_json>" not in lower:
+                    messages.append({"role": "user", "content": "Now output <verdict_json> only (no other text)."})
+                    continue
+
+                # Detect SQL/verdict blocks (both tag and fenced)
+                sql_tag_blocks = re.findall(r"<sql>(.*?)</sql>", content, flags=re.DOTALL | re.IGNORECASE)
+                sql_fence_blocks = re.findall(r"```\s*sql\s*([\s\S]*?)```", content, flags=re.DOTALL | re.IGNORECASE)
+                sql_blocks = sql_tag_blocks + sql_fence_blocks
+                # Generic fenced blocks as fallback (language-agnostic); only accept if looks like SQL
+                if len(sql_blocks) == 0:
+                    generic_fences = re.findall(r"```\s*([\s\S]*?)```", content, flags=re.DOTALL)
+                    for blk in generic_fences:
+                        blk_trim = blk.strip()
+                        low = blk_trim.lower()
+                        if any(k in low for k in ["select ", "pragma ", "with ", "explain "]):
+                            sql_blocks.append(blk_trim)
+                has_verdict = bool(re.search(r"<verdict_json>.*?</verdict_json>", content, flags=re.DOTALL | re.IGNORECASE))
+
+                if len(sql_blocks) == 0 and not has_verdict:
+                    no_sql_streak += 1
+                else:
+                    no_sql_streak = 0
+
+                # Multiple SQL in one turn → execute first, nudge for next
+                if len(sql_blocks) > 1:
+                    first_sql = sql_blocks[0].strip()
+                    if verbose:
+                        print("\n[Executing SQL (first of multiple)]:\n" + first_sql)
+                    try:
+                        headers, rows = _execute_with_timeout(conn, cursor, first_sql)
+                        table_text = _format_table(headers, rows)
                         if verbose:
-                            print(f"[FORCED VERDICT SUCCESS]: {verdict_data.get('status', 'unknown')}")
+                            print("\n[SQL RESULT]:\n" + table_text)
+                        messages.append({"role": "user", "content": "SQL_RESULT_TABLE:\n" + table_text + "\nNote: One SQL per turn. Send the next probe in a new message."})
+                        sql_executed += 1
+                        executed_sql_texts.append(first_sql)
+                        try:
+                            if cte_name_hint and (f" from {cte_name_hint.lower()}" in first_sql.lower() or f" from [{cte_name_hint.lower()}]" in first_sql.lower()):
+                                harness_executed = True
+                        except Exception:
+                            pass
                     except Exception as e:
                         if verbose:
-                            print(f"[FORCED VERDICT JSON ERROR]: {e}")
-                        # Save raw verdict text as a fallback - this might still be useful
+                            print("[SQL ERROR]:", str(e))
+                        messages.append({"role": "user", "content": f"SQL_ERROR: {str(e)}\nNote: One SQL per turn. Send the next probe in a new message."})
+                    continue
+
+                # Normal append
+                messages.append({"role": "assistant", "content": content})
+
+                # Single SQL block
+                if len(sql_blocks) == 1:
+                    sql_text = sql_blocks[0].strip()
+                    if verbose:
+                        print("\n[Executing SQL]:\n" + sql_text)
+                    try:
+                        headers, rows = _execute_with_timeout(conn, cursor, sql_text)
+                        table_text = _format_table(headers, rows)
+                    
+                        # Log SQL execution to trace
+                        trace.add_section(f"SQL QUERY (Turn {turn})", sql_text)
+                        trace.add_section(f"SQL RESULT (Turn {turn})", table_text)
+                    
                         if verbose:
-                            print("[FORCED VERDICT]: Saving raw verdict text as fallback")
+                            print("\n[SQL RESULT]:\n" + table_text)
+                        messages.append({"role": "user", "content": "SQL_RESULT_TABLE:\n" + table_text})
+                        sql_executed += 1
+                        executed_sql_texts.append(sql_text)
+                        try:
+                            if cte_name_hint and (f" from {cte_name_hint.lower()}" in sql_text.lower() or f" from [{cte_name_hint.lower()}]" in sql_text.lower()):
+                                harness_executed = True
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        if verbose:
+                            print("[SQL ERROR]:", str(e))
+                        messages.append({"role": "user", "content": f"SQL_ERROR: {str(e)}"})
+                    continue
+
+                # Verdict
+                if has_verdict:
+                    # Basic minimum probes requirement
+                    if (
+                        sql_executed < min_required_sql
+                        or (cte_name_hint and not harness_executed)
+                    ):
+                        needs = []
+                        if sql_executed < min_required_sql:
+                            needs.append(f"more probes ({sql_executed}/{min_required_sql})")
+                        if cte_name_hint and not harness_executed:
+                            needs.append("compile-test the CTE with SELECT * FROM CTE_NAME LIMIT 10")
+                        messages.append({"role": "user", "content": "Before verdict, do: " + ", ".join(needs) + "."})
+                        continue
+                    verdict_text = extract_tagged(content, "verdict_json")
+                
+                    # Log verdict to trace
+                    if verdict_text:
+                        trace.add_section(f"VERDICT JSON (Turn {turn})", verdict_text)
+                
+                    try:
+                        verdict_data = json.loads(verdict_text)
+                        # Basic verdict validation - semantic-specific rules now come from tkstore
+                        if verdict_data.get("status"):
+                            need_rev = False
+                            msg_needs = []
+                            suggested_sql = verdict_data.get("suggested_fix_sql") or ""
+                            tests_list = verdict_data.get("tests") or []
+                        
+                            # Require at least one test
+                            if not tests_list:
+                                need_rev = True
+                                msg_needs.append("include 1–3 executable test SQLs in 'tests'")
+                        
+                            # LEFT JOIN + CASE must avoid silent default of NULLs
+                            try:
+                                if " left join " in suggested_sql.lower() and "case" in (suggested_sql or "").lower():
+                                    low = suggested_sql.lower()
+                                    has_unknown_bucket = "unknown" in low
+                                    has_not_null_filter = (" is not null" in low)
+                                    uses_inner_join = (" left join " not in low and " join " in low)
+                                    if not (has_unknown_bucket or has_not_null_filter or uses_inner_join):
+                                        need_rev = True
+                                        msg_needs.append("for LEFT JOIN + CASE labels: either use INNER JOIN, or WHERE <joined_col> IS NOT NULL, or create explicit 'unknown' bucket")
+                            except Exception:
+                                pass
+                        
+                            # Check suggested_fix_sql -- in the full query when the caller can
+                            # reassemble it, otherwise compiled on its own.
+                            fix_needs_rev, fix_msgs = _check_suggested_sql(
+                                conn, cursor, suggested_sql, validate_fix_sql=check_fix
+                            )
+                            if fix_needs_rev:
+                                need_rev = True
+                                msg_needs.extend(fix_msgs)
+                        
+                            # Try executing tests (best-effort)
+                            for test_sql in tests_list[:2]:
+                                try:
+                                    _execute_with_timeout(conn, cursor, test_sql, fetch_all=False)
+                                except Exception as e:
+                                    need_rev = True
+                                    msg_needs.append("fix test SQL to be executable: " + str(e))
+                        
+                            if need_rev:
+                                messages.append({"role": "user", "content": "Revise <verdict_json>: " + "; ".join(msg_needs) + "."})
+                                verdict_data = None
+                                continue
+                        break
+                    except Exception:
+                        messages.append({"role": "user", "content": "Please re-send <verdict_json> with valid JSON only (no extra text)."})
+                        continue
+
+                # Near end: force verdict request
+                if turn >= max_turns - 1:
+                    messages.append({"role": "user", "content": "Time budget nearly exhausted. Output <verdict_json> only (no other text)."})
+                    continue
+
+                # General nudge
+                messages.append({"role": "user", "content": "Think, then send the next SQL probe (one per turn). Explore related tables (collisions, victims) and validate joins/keys against the user query."})
+    
+            # If we reached max turns without a verdict, force a final verdict
+            if not verdict_data:
+                if verbose:
+                    print(f"\n========== FORCED FINAL VERDICT (max turns reached) ==========")
+            
+                messages.append({"role": "user", "content": FORCED_VERDICT_PROMPT})
+            
+                try:
+                    resp = llm(model, messages)
+                    msg_obj = _extract_message_obj(resp)
+                    raw = _message_to_dict(msg_obj)
+                    content = _extract_content(msg_obj, raw)
+                
+                    if verbose:
+                        print("[FORCED VERDICT RESPONSE]:")
+                        print(content)
+                
+                    verdict_text = extract_tagged(content, "verdict_json")
+                
+                    # Log forced verdict to trace
+                    trace.add_section("FORCED VERDICT RESPONSE", content)
+                    if verdict_text:
+                        trace.add_section("FORCED VERDICT JSON", verdict_text)
+                
+                    if verdict_text:
+                        try:
+                            verdict_data = json.loads(verdict_text)
+                            if verbose:
+                                print(f"[FORCED VERDICT SUCCESS]: {verdict_data.get('status', 'unknown')}")
+                        except Exception as e:
+                            if verbose:
+                                print(f"[FORCED VERDICT JSON ERROR]: {e}")
+                            # Save raw verdict text as a fallback - this might still be useful
+                            if verbose:
+                                print("[FORCED VERDICT]: Saving raw verdict text as fallback")
+                            verdict_data = {
+                                "status": "issues",
+                                "issues": ["forced_verdict_json_parse_error"],
+                                "suggested_fix": "Unable to parse verdict JSON - see raw_verdict_text for details",
+                                "suggested_fix_sql": "",
+                                "tests": [],
+                                "raw_verdict_text": verdict_text,
+                                "notes": f"JSON parse error: {str(e)}"
+                            }
+                    else:
+                        if verbose:
+                            print("[FORCED VERDICT FAILED]: No verdict_json found in response")
+                        # Save raw response as fallback
                         verdict_data = {
-                            "status": "issues",
-                            "issues": ["forced_verdict_json_parse_error"],
-                            "suggested_fix": "Unable to parse verdict JSON - see raw_verdict_text for details",
+                            "status": "issues", 
+                            "issues": ["forced_verdict_no_json_tags"],
+                            "suggested_fix": "No verdict JSON provided - see raw_response for details",
                             "suggested_fix_sql": "",
                             "tests": [],
-                            "raw_verdict_text": verdict_text,
-                            "notes": f"JSON parse error: {str(e)}"
+                            "raw_response": content,
+                            "notes": "No <verdict_json> tags found in LLM response"
                         }
-                else:
-                    if verbose:
-                        print("[FORCED VERDICT FAILED]: No verdict_json found in response")
-                    # Save raw response as fallback
-                    verdict_data = {
-                        "status": "issues", 
-                        "issues": ["forced_verdict_no_json_tags"],
-                        "suggested_fix": "No verdict JSON provided - see raw_response for details",
-                        "suggested_fix_sql": "",
-                        "tests": [],
-                        "raw_response": content,
-                        "notes": "No <verdict_json> tags found in LLM response"
-                    }
                     
-            except Exception as e:
-                if verbose:
-                    print(f"[FORCED VERDICT ERROR]: {e}")
-                verdict_data = None
-    
+                except Exception as e:
+                    if verbose:
+                        print(f"[FORCED VERDICT ERROR]: {e}")
+                    verdict_data = None
+
+            # Stage 7. The in-loop self-check runs only on the verdict branch above, which
+            # round E never once reached -- every verdict came from the forced path, which
+            # executes nothing. So the suggestion is checked here, where the verdicts are.
+            if validate_fix_sql is None or not _proposes_a_fix(verdict_data):
+                break
+
+            suggested_sql = verdict_data.get('suggested_fix_sql') or ''
+            error = record_validation(suggested_sql)
+            if not error:
+                validated = True
+                break
+
+            validated = False
+            if attempt >= max_verdict_attempts:
+                break
+
+            messages.append({"role": "user", "content": _verdict_rejection_message(
+                suggested_sql=suggested_sql, error=error, cte_name_hint=cte_name_hint,
+            )})
+
+        if validate_fix_sql is not None and verdict_data is not None:
+            # The runner keeps the original SQL when a suggestion fails to run, so these
+            # are the only record that the refiner was asked again and still could not.
+            verdict_data['verdict_attempts'] = attempt
+            if validated is not None:
+                verdict_data['verdict_validated'] = validated
+            if validation_errors:
+                verdict_data['verdict_validation_errors'] = validation_errors
+
     finally:
         try:
             cursor.close()
