@@ -96,6 +96,7 @@ def plan_steps(
     refiner_turns: Optional[int] = None,
     refiner_min_probes: Optional[int] = None,
     adopt_refiner_sql: bool = False,
+    include_candidate_sql: bool = False,
 ) -> List[Step]:
     """The three invocations for one batch, in the order they must run.
 
@@ -124,6 +125,8 @@ def plan_steps(
     # setting would make the pairing measure adoption rather than knowledge.
     if adopt_refiner_sql:
         budget += ["--adopt-refiner-sql"]
+    if include_candidate_sql:
+        budget += ["--include-candidate-sql"]
 
     refonly = base + [
         "--refine-output", str(batch.agent_dir),

@@ -213,21 +213,47 @@ def _adopt_refiner_sql(
     return suggested_sql
 
 
-def _feedback_text(verdict: dict, target: str, instruction: str) -> Optional[str]:
-    """Render a refiner verdict as agent-facing feedback, or None when it found no issues."""
+CANDIDATE_SQL_HEADER = "Candidate SQL from the refiner (reference, not validated):"
+
+CONSISTENCY_NOTE = (
+    "You may reuse or adapt the candidate SQL above, but you are responsible for keeping "
+    "the rest of the query consistent with it -- downstream CTEs and the final SELECT must "
+    "still reference columns that actually exist."
+)
+
+
+def _feedback_text(verdict: dict, target: str, instruction: str,
+                   include_candidate_sql: bool = False) -> Optional[str]:
+    """Render a refiner verdict as agent-facing feedback, or None when it found no issues.
+
+    `include_candidate_sql` adds the refiner's own `suggested_fix_sql`, which the prose-only
+    default drops -- the agent that rewrites has then never seen a rule, and its rewrite
+    matches the refiner's suggestion with a similarity of only 0.23-0.47. Adopting that SQL
+    outright instead (see `_adopt_refiner_sql`) transfers it intact but broke output
+    contracts in a third of cases, because the refiner sees one CTE and cannot know what
+    downstream consumers read. Passing it *as feedback* keeps the agent as the integrator.
+
+    Off by default: rounds A-E were all measured with the prose-only rendering, and a
+    verdict carrying no `suggested_fix_sql` renders identically either way.
+    """
     if str((verdict or {}).get('status', '')).lower() not in ('issues', 'issue', 'incorrect'):
         return None
     issues = verdict.get('issues') if isinstance((verdict or {}).get('issues'), list) else []
     suggested = verdict.get('suggested_fix') or ''
+    candidate = (verdict.get('suggested_fix_sql') or '').strip() if include_candidate_sql else ''
     tests = verdict.get('tests') if isinstance(verdict.get('tests'), list) else []
     lines = [f"[Refiner feedback for {target}]", "Issues:"]
     lines.extend([f"- {it}" for it in issues[:10]] or ["- <none>"])
     if suggested:
         lines.append("\nSuggested fix (reference):\n" + suggested)
+    if candidate:
+        lines.append(f"\n{CANDIDATE_SQL_HEADER}\n{candidate}")
     if tests:
         lines.append("\nTests / checks to satisfy:")
         lines.extend([f"- {t}" for t in tests[:5]])
     lines.append(instruction)
+    if candidate:
+        lines.append(CONSISTENCY_NOTE)
     return "\n".join(lines)
 
 
@@ -622,6 +648,7 @@ def perform_refinement_and_revision(inst: Instance,
                                     refiner_turns: int = DEFAULT_REFINER_TURNS,
                                     refiner_min_probes: Optional[int] = None,
                                     adopt_refiner_sql: bool = False,
+                                    include_candidate_sql: bool = False,
                                     ) -> Tuple[str, Optional[dict]]:
     """Run per-CTE refiner flow with cooperative revision and final SELECT refinement.
 
@@ -714,6 +741,7 @@ def perform_refinement_and_revision(inst: Instance,
                 f"CTE {cte_name}",
                 f"\nInstruction: Revise ONLY the CTE named '{cte_name}' in your previous solution. Keep other CTEs unchanged.\n"
                 "Output a complete <solution> that includes the revised CTE.",
+                include_candidate_sql=include_candidate_sql,
             )
             if feedback:
                 revised = _revise_from_feedback(
@@ -788,6 +816,7 @@ def perform_refinement_and_revision(inst: Instance,
                 "the final SELECT",
                 "\nInstruction: Revise the final SELECT of your previous solution. Keep the CTEs unchanged.\n"
                 "Output a complete <solution>.",
+                include_candidate_sql=include_candidate_sql,
             )
         if feedback:
             revised = _revise_from_feedback(
@@ -810,6 +839,7 @@ def perform_refinement_and_revision(inst: Instance,
                 'filter_model': filter_model,
                 'use_llm_filtering': bool(use_llm_filtering),
                 'adopt_refiner_sql': bool(adopt_refiner_sql),
+                'include_candidate_sql': bool(include_candidate_sql),
                 'retrievals': retrievals,
             }, indent=2),
             encoding='utf-8',
@@ -1067,6 +1097,10 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Substitute the refiner's own suggested_fix_sql instead of asking the "
                         "agent to rewrite. Reproduces upstream tkboost.sql(); the paper has the "
                         "agent act on feedback, so the two targets differ here")
+    p.add_argument("--include-candidate-sql", action="store_true",
+                   help="Pass the refiner's suggested_fix_sql to the agent as part of the "
+                        "feedback, so the knowledge-informed SQL reaches the rewrite while the "
+                        "agent stays responsible for keeping the query consistent")
     p.add_argument("--refiner-turns", type=int, default=DEFAULT_REFINER_TURNS,
                    help="Probing turns per fragment for the refiner (upstream tkboost.sql uses 5)")
     p.add_argument("--refiner-min-probes", type=int, default=None,
@@ -1273,10 +1307,17 @@ def _refiner_options(args) -> Dict[str, object]:
             f"for the verdict itself. Lower --refiner-min-probes "
             f"(upstream tkboost.sql pairs 5 turns with 3 probes)."
         )
+    if args.adopt_refiner_sql and args.include_candidate_sql:
+        raise ValueError(
+            "--include-candidate-sql has no effect together with --adopt-refiner-sql: "
+            "adoption never reaches the feedback path, so the flag would be a silent no-op "
+            "dressed up as an experimental condition"
+        )
     return {
         'refiner_turns': args.refiner_turns,
         'refiner_min_probes': args.refiner_min_probes,
         'adopt_refiner_sql': bool(args.adopt_refiner_sql),
+        'include_candidate_sql': bool(args.include_candidate_sql),
     }
 
 

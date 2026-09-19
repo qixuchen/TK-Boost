@@ -78,7 +78,7 @@ class TestRefinerOptions:
         options = runner._refiner_options(_args(["--instance-id", "local001"]))
 
         assert options == {"refiner_turns": 25, "refiner_min_probes": None,
-                           "adopt_refiner_sql": False}
+                           "adopt_refiner_sql": False, "include_candidate_sql": False}
 
     def test_the_upstream_configuration_passes_through(self):
         options = runner._refiner_options(
@@ -87,7 +87,7 @@ class TestRefinerOptions:
         )
 
         assert options == {"refiner_turns": 5, "refiner_min_probes": 3,
-                           "adopt_refiner_sql": False}
+                           "adopt_refiner_sql": False, "include_candidate_sql": False}
 
     def test_a_probe_minimum_the_budget_cannot_reach_is_rejected(self):
         """`--refiner-turns 5` with the default minimum of 8 is the trap this guards."""

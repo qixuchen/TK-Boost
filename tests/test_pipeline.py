@@ -79,6 +79,21 @@ class TestPlanSteps:
     def test_the_agent_runs_before_either_arm(self, steps):
         assert [s.name for s in steps] == ["agent", "arm_refonly", "arm_tk"]
 
+    def test_the_candidate_sql_flag_is_not_passed_unless_asked(self, steps):
+        for step in steps:
+            assert "--include-candidate-sql" not in step.argv, step.name
+
+    def test_the_candidate_sql_flag_reaches_both_arms_but_not_the_agent(self, split_file, tmp_path):
+        """It changes how a verdict is rendered, which both arms must share or the pairing
+        measures the rendering rather than knowledge."""
+        batch = pipeline.plan_batches(split_file, tmp_path / "test")[0]
+        steps = pipeline.plan_steps(batch, split_file, tkstore="tkstore/tkstore_sqlite.csv",
+                                    include_candidate_sql=True)
+
+        assert "--include-candidate-sql" not in _argv_of(steps, "agent")
+        for name in ("arm_refonly", "arm_tk"):
+            assert "--include-candidate-sql" in _argv_of(steps, name), name
+
     def test_adoption_is_not_passed_unless_asked(self, steps):
         for step in steps:
             assert "--adopt-refiner-sql" not in step.argv, step.name

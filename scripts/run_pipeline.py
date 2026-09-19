@@ -61,6 +61,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Substitute the refiner's own suggested_fix_sql in both arms instead of "
                         "asking the agent to rewrite. Reproduces upstream tkboost.sql(), which "
                         "differs from the paper's feedback-then-agent-revises loop")
+    p.add_argument("--include-candidate-sql", action="store_true",
+                   help="Pass the refiner's suggested_fix_sql to the agent as part of the "
+                        "feedback in both arms. Keeps the agent as integrator (unlike "
+                        "--adopt-refiner-sql) while letting the knowledge-informed SQL through")
     p.add_argument("--refiner-turns", type=int, default=None,
                    help="Probing turns per fragment (omit for the runner default of 25; "
                         "upstream tkboost.sql effectively uses 5)")
@@ -90,6 +94,7 @@ def main() -> int:
             refiner_turns=args.refiner_turns if args.refiner_turns is not None else DEFAULT_REFINER_TURNS,
             refiner_min_probes=args.refiner_min_probes,
             adopt_refiner_sql=args.adopt_refiner_sql,
+            include_candidate_sql=args.include_candidate_sql,
         ))
     except ValueError as e:
         parser.error(str(e))
@@ -116,6 +121,7 @@ def main() -> int:
             refiner_turns=args.refiner_turns,
             refiner_min_probes=args.refiner_min_probes,
             adopt_refiner_sql=args.adopt_refiner_sql,
+            include_candidate_sql=args.include_candidate_sql,
         )
         code = run_steps(steps, dry_run=args.dry_run)
         if code != 0:
