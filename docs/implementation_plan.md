@@ -1606,6 +1606,13 @@ _execute_with_timeout(conn, cursor, suggested_sql, fetch_all=False)
 **这一段孤立执行完全正确** —— 语法对、列都在。于是自检通过、verdict 产出；到我们这边替换
 进整条 SQL 才炸。**refiner 检片段、我们检整体，中间这道缝就是那 33 条的全部来源。**
 
+> ### ⚠️ 上面这个前提已被实测证伪，见 6.8
+>
+> "refiner 已有自检重试循环，只是检错了对象"**是错的**。那个循环挂在"循环内收到 verdict"
+> 的路径上，而实测 **708/708 个片段都走兜底路径**（轮数耗尽后的强制出 verdict），
+> 该路径完全绕过自检。所以那套自检**从未执行过一次** —— 在上游也一样。
+> 阶段 6 的改动因此在现状下不产生任何效果，两次 `local018` 实测的校验器调用次数都是 0。
+
 ## 6.1 与 E 轮的差异，只有两处
 
 | | E 轮（现状） | G 轮 |
@@ -1713,3 +1720,226 @@ runner 传入闭包，内容就是 `_adopt_refiner_sql` 现在那套：解析建
 > 全局一致性的前提下改写子查询 —— 论文这里给的信息比实现所需要的更少，而这不是实现的疏忽。
 
 这比"传递方式"更本质，也能独立成立。
+
+## 6.8 实测发现：refiner 从未在循环内出过 verdict
+
+**这一节推翻了 6.0 的前提，并且是七轮实验里最重要的一个实现层发现。**
+
+`local018` 实跑两次（一次 `max_turns=5`、一次 8），`validate_fix_sql` 都是 **0 次调用**。
+追查 E 轮全部 trace 后确认：
+
+| 度量 | 值 |
+| --- | --- |
+| 两臂片段总数 | 708 |
+| **走兜底路径（轮数耗尽后强制出 verdict）** | **708（100%）** |
+| 其中循环内一次合法 verdict 都没出过 | 708（100%） |
+| 走兜底那些片段的探库次数中位数 | **2** |
+
+**不是探库把轮数耗光了**，而是模型从不主动交结论。以 `local018` / `category_counts` 为例，
+5 轮全是探库：`sqlite_master` → `PRAGMA table_info(collisions)` →
+`SELECT * FROM collisions LIMIT 5` → `DISTINCT pcf_violation_category` → `COUNT(*) ... IS NULL`。
+
+### 为什么
+
+`cte_refiner.py:622-634` 的接收闸门有两个条件，任一成立就把 verdict 打回：
+
+```python
+if has_verdict:
+    if (sql_executed < min_required_sql            # 条件 A：探库不足 3 次
+        or (cte_name_hint and not harness_executed)):  # 条件 B：没跑过 CTE 自身
+        ...
+        continue
+```
+
+`local018` 探了 5 次，**条件 A 通过**。卡住的是**条件 B**：`harness_executed` 只在某条探库
+SQL 里出现 `FROM <当前CTE名>` 时才置真（`:579`、`:611`），而那 5 条查询全在探基表
+`collisions`，**一条都没碰 `category_counts`**。
+
+而这道要求模型很难自发满足：系统提示里那句 `[Harness tip]` 措辞是
+`You may compile-test the CTE by ...` —— **是"可以"不是"必须"**，位置在 payload 的 95% 处。
+相比之下 `[MANDATORY_PROBES]` 那三条标着 mandatory，模型老老实实做了，正是上面第 2–5 轮。
+**它做了被明确要求的，没做只是"可以"的。**
+
+### 兜底路径做什么
+
+四步，**一次 SQL 都不跑**：追加 `"TIME LIMIT REACHED... Make a decision NOW"` → 调一次
+LLM → 抠 `<verdict_json>` → `json.loads` 返回。不执行 `suggested_fix_sql`、不执行 `tests`、
+不重试。所以那 107 次 `does not run` 是在 runner 替换时才第一次被发现的。
+
+模型对强制指令**高度服从**：1404 个 verdict 里 1401（99.8%）给出合法 JSON，
+仅 3 个解析失败，0 个漏标签。这说明"带着错误再要一次"很可能奏效 —— 阶段 7 的基础。
+
+### 三个后果
+
+1. **上游完全一样。** `tkboost/__init__.py:574` 导入的就是同一个 `run_refiner`，
+   CTE 阶段传的也是 `max_turns=5`、`min_required_sql=3`（`:641-642`、`:687-688`）。
+   所以 **README 报的 +3.6%～+16.9% 是在"每个 verdict 都被催出来、且 `suggested_fix_sql`
+   未经任何验证"的状态下测出的。**
+2. **`run_refiner` 的整套自检是死代码** —— `tests` 非空检查、LEFT JOIN + CASE 空值检查、
+   `suggested_fix_sql` 编译检查，七轮里一次都没执行。
+3. **refiner 不在做"局部修正"。** 实测 85 条 CTE 阶段建议：与原 CTE body 相似度中位数
+   **0.48**、**55% 基本重写**、**53% 连 CTE 名字都改了**、**62% 返回多个 CTE**。
+   而上游 `fixed_ctes[0]` 只取第一个、丢掉其余 —— `local018` 那份
+   `annual_counts → ranked_2021 → target_category → category_shares` 四段联动方案
+   被截断后逻辑就断了。**它写的不是"修好的那个 CTE"，是一套新解法。**
+
+---
+
+# 阶段 7 — verdict 的校验—重试环（H 轮）
+
+**已实现，未跑实验。** 建立在 6.8 的发现之上：既然 verdict 全部来自兜底路径、
+且从未被验证过，就在兜底路径之后补上校验与重试。
+
+开关是 `--verdict-attempts N`（默认 1 = 关，即 E 轮行为），要求 `--validate-fix-in-context`，
+两臂同传。落地位置：`cte_refiner.run_refiner` 的兜底路径之后（`max_verdict_attempts` 参数）、
+`sql_agent_runner`（CTE 阶段与 final SELECT 阶段各一个校验闭包）、
+`pipeline.plan_steps`、`scripts/run_pipeline.py`（跑 agent 步之前就校验参数组合）。
+测试 `tests/test_verdict_retry.py`（33 例），全套 397 例通过。
+
+## 7.0 核心
+
+refiner 交出 `verdict_json` 后**不直接采信**：把 `suggested_fix_sql` 的第一个 CTE 替换回
+整条 SQL 执行一遍。跑不通就带着具体错误让它重来，最多 **3 次**；仍不行则放弃该片段、
+保留原 SQL、进下一个。
+
+对应 Alg 5 第 12–13 行（`R_t ← ExecSQL(s_t)`、错误进上下文），只是接收反馈的是 refiner
+而非主 agent。
+
+## 7.1 判据只有一条：整条 SQL 能否执行
+
+**结构问题不作为拒收理由，只用来丰富错误信息。**
+
+```
+拿到 verdict_json
+  ├─ 解析 suggested_fix_sql，取第一个 CTE 的 body
+  ├─ 替换进原位置 → rebuild_sql_from_ctes → 执行
+  ├─ 跑得通 → 采纳（即使名字不匹配、即使返回了多个 CTE）
+  └─ 跑不通 → 拼错误信息 → 重试
+```
+
+依据是 E 轮臂 B 那 85 条建议的交叉验证：
+
+| 结构检查（单 CTE + 名字匹配） | 执行 | 条数 |
+| --- | --- | --- |
+| 不通过 | 失败 | 41（48%） |
+| **不通过** | **通过** | **17（20%）** ← 放行，见下 |
+| 通过 | 通过 | 16（19%） |
+| **通过** | **失败** | **11（13%）** ← 只有执行校验能发现 |
+
+**决策：那 17 条结构不合但能跑的放行。** 若按结构直接拒收会损失它们，而它们截断后仍执行
+通过。同时那 11 条结构合规却执行失败的说明**光有结构检查不够**，执行校验是必需的。
+
+## 7.2 错误信息的拼法
+
+**总是包含**执行报错：
+
+> Substituted into the full query it failed: `no such column: speeding_incidents`.
+> `[DOWNSTREAM]` still reads that column.
+
+**若返回了多个 CTE**（实测 62%）追加：
+
+> You returned 4 CTEs, but **only the first is used and the rest are discarded** — your
+> design is broken by that truncation. Express the entire fix inside a single CTE.
+
+**若名字不匹配**（实测 53%）追加：
+
+> Your suggested_fix_sql defines CTE `annual_counts`, but it must be the CTE named
+> `category_counts`. Return exactly one CTE under that name.
+
+## 7.3 重试机制
+
+**位置**：紧接兜底路径之后，**续用同一对话**（refiner 刚探过库，schema 在上下文里）。
+
+**探库 budget 重置**：重置 `turn` 计数器（给 5 轮新预算），但 **`sql_executed` 不清零** ——
+清零会让"至少 3 次探库"那道闸门重新生效、强迫它再探 3 次；不清零则它**可以**继续探库、
+但不被强迫。
+
+```
+for attempt in 1..3:
+    跑轮次循环（最多 max_turns 轮）→ 出 verdict（实测总是走兜底）
+    校验（替换后执行整条 SQL）
+    若通过 → 结束
+    否则 → 错误追加进对话，重置 turn 计数，继续
+3 次都失败 → 返回 None，保留原 SQL
+```
+
+**一个必然后果**：`harness_executed` 不清零仍是 `False`，条件 B 会继续挡住循环内出 verdict，
+所以**每次重试仍会走满轮数再走兜底**。因此每次重试的成本是**一整个探库周期**（约 6 次
+LLM 调用），而非单次调用。
+
+## 7.4 与前面各轮的关系
+
+**A–F 不修改**（已决策）。H 轮的臂 A 与前六轮的 37/34/35 不可直接比 —— refiner 的产出质量
+变了。H 轮自己的臂 A vs 臂 B 仍严格配对，那才是知识增益的归因依据。
+
+**阶段 6 的代码在这里被用上**：`[DOWNSTREAM]` 让 refiner 事前看见下游、段说明让它理解各段
+含义、`validate_fix_sql` 闭包正好是这里要用的校验器。阶段 6 唯一白做的部分是把校验挂在了
+循环内那条从不执行的路上 —— 挪到兜底路径之后，那段代码就活了。
+
+## 7.5 验收
+
+- ✅ **校验器实际被调用**（阶段 6 两次实测都是 0 次，这是最基本的活性检查）。
+  构造同型场景（模型从不主动交结论、建议改了 CTE 名）实测：校验器 3 次调用、
+  拒收信息回传 2 次、`verdict_attempts=3`、`verdict_validated=False`
+- ✅ 每片段的重试次数与结果记进 `refiner_<name>.json`：
+  `verdict_attempts` / `verdict_validated` / `verdict_validation_errors`；
+  `retrieved_rules.json` 记本次配置
+- ✅ 默认关闭（`--verdict-attempts 1`），两臂同传（`plan_steps` 只发给两臂不发给 agent 步）
+- ✅ 关闭时行为与 E 轮一致：无校验器时不加任何审计字段、不多调一次 LLM
+  （`TestWithoutAValidatorNothingChanges`）。兜底 prompt 提为模块常量 `FORCED_VERDICT_PROMPT`
+  时逐字节未动，266 行缩进经内容级比对确认只改了缩进
+- ✅ 循环内那次校验拒收也计入审计。实测发现重试会让 refiner 去跑编译自检，
+  从而解锁 §6.8 里那道 `harness_executed` 闸门，于是循环内的自检第一次真正执行并拦下一条
+  建议 —— 起初只记了兜底那次，导致这次拒收不可见、trace 也没留原因。
+  现在两处校验共用同一个记录入口（`record_validation`），既不漏也不重复计数
+- ⬜ 监控 `forced_verdict_no_json_tags` 与 `forced_verdict_json_parse_error`
+  （实测 1404 个 verdict 里 3 个解析失败；重试次数增加后可能上升）
+
+实测行为核验见 `results_reference_track.md` §15（4 个实例，三条路径各命中一次）。
+
+## 7.8 跑 H 轮的指令
+
+臂 A/B 都要重跑（refiner 产出质量变了），agent 步可复用：
+
+```bash
+source .env && python scripts/run_pipeline.py \
+  --split data/splits/spider2_sqlite_test_no_reference_leak.txt \
+  --out-prefix outputs/h_retry --tkstore tkstore/tkstore_sqlite.csv \
+  --refiner-turns 5 --refiner-min-probes 3 \
+  --adopt-refiner-sql --validate-fix-in-context --verdict-attempts 3
+```
+
+加 `--dry-run` 只打印三条子命令。中断可直接重跑同一条命令，两条路径都按实例续跑。
+
+## 7.6 成本
+
+| | 值 |
+| --- | --- |
+| E 轮两臂执行失败的片段 | 107 |
+| 触发至少一次重试的比例（臂 B、CTE 阶段） | 52/85 = **61%** |
+| 每次重试 | 最多 5 轮探库 + 1 次兜底 ≈ **6 次调用** |
+| 最坏情况额外调用 | 107 × 3 × 6 ≈ 1900 |
+| 实际预期 | **700–1100 次**，约 +1.5 小时/臂 |
+
+合计约 **8 小时**。
+
+## 7.7 预期与止损点
+
+采纳数应从 E 轮臂 B 的 58 涨向 **80 以上**，臂 A 回到 **36–37**，知识净 **≥ +3**。
+
+**止损点（现在就定）**：若采纳数涨了但知识净仍在 0 附近，指向 **E 轮那个 +3 本身不稳定**
+（3.5%，仅略高于 §11 测得的 ±2% 噪声线）。那时应先重跑一次 E 轮验稳定性，
+而不是继续加设计。
+
+> ### ⚠️ 4 实例探针已经踩到止损线，但踩法和上面设想的不同
+>
+> 见 `results_reference_track.md` §15。17 个片段实测：跑不通的建议从 E 的 9–10 条压到 1 条，
+> 但**采纳数没涨**（E 2–4 → H 3），涨的是"什么都不做"（ok 从 3–6 → 13）。
+> 用同配置重跑 E 一次做噪声基线，确认这不是方差。
+>
+> **归因到阶段 6 而非阶段 7**：重试只介入 3 个片段，12 个 ok 出现在重试没触发的地方 ——
+> 是 `[DOWNSTREAM]` 可见性让 refiner 不再动手。知识只能经由编辑动作起效，
+> 编辑面从 14/17 压到 4/17，两臂就都趋近裸 agent、知识净差按构造趋近 0。
+>
+> 所以在跑 86 实例之前，应先把阶段 6 拆成两个开关（可见性 vs 校验器），
+> 定位是哪一个让 refiner 变哑；若是可见性，可只留校验器 + 重试以保住编辑面。
