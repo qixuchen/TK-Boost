@@ -79,20 +79,20 @@ class TestPlanSteps:
     def test_the_agent_runs_before_either_arm(self, steps):
         assert [s.name for s in steps] == ["agent", "arm_refonly", "arm_tk"]
 
-    def test_the_rule_scope_is_not_passed_unless_asked(self, steps):
+    def test_adoption_is_not_passed_unless_asked(self, steps):
         for step in steps:
-            assert "--rule-scope" not in step.argv, step.name
+            assert "--adopt-refiner-sql" not in step.argv, step.name
 
-    def test_the_rule_scope_reaches_only_the_knowledge_arm(self, split_file, tmp_path):
-        """`arm_refonly` carries no store, and the runner rejects a scope without one."""
+    def test_adoption_reaches_both_arms_but_not_the_agent(self, split_file, tmp_path):
+        """It changes how the refiner's verdict is applied, which both arms must share
+        or the pairing measures adoption rather than knowledge."""
         batch = pipeline.plan_batches(split_file, tmp_path / "test")[0]
         steps = pipeline.plan_steps(batch, split_file, tkstore="tkstore/tkstore_sqlite.csv",
-                                    rule_scope="db")
+                                    adopt_refiner_sql=True)
 
-        assert "--rule-scope" not in _argv_of(steps, "agent")
-        assert "--rule-scope" not in _argv_of(steps, "arm_refonly")
-        tk = _argv_of(steps, "arm_tk")
-        assert tk[tk.index("--rule-scope") + 1] == "db"
+        assert "--adopt-refiner-sql" not in _argv_of(steps, "agent")
+        for name in ("arm_refonly", "arm_tk"):
+            assert "--adopt-refiner-sql" in _argv_of(steps, name), name
 
     def test_the_refiner_budget_is_not_passed_unless_asked(self, steps):
         """Omitting it keeps the runner's default, so the reference run stays reproducible."""

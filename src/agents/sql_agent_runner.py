@@ -72,29 +72,11 @@ def llm_completion(model: str, messages: list, **params):
 
 
 # ----------------- Tribal Knowledge Retrieval (Alg 4) -----------------
-RULE_SCOPES = ('all', 'db', 'generic')
-
-
-def _keep_scope(candidates: List[dict], rule_scope: str) -> List[dict]:
-    """Restrict candidates to one scope.
-
-    Done here rather than in `tkstore/tagger_index.py` to leave the vendored upstream
-    retrieval untouched, and before FilterKnowledge so no LLM call is spent ranking
-    rules that are already excluded.
-    """
-    if rule_scope == 'all':
-        return candidates
-    wanted_generic = (rule_scope == 'generic')
-    return [c for c in candidates
-            if ((c.get('scope') or '').strip().lower() == 'generic') == wanted_generic]
-
-
 def _retrieve_rules_for(sql_text: str,
                         tkstore_path: str,
                         db: Optional[str],
                         use_llm_filtering: bool,
-                        filter_model: str,
-                        rule_scope: str = 'all') -> Tuple[List[dict], List[dict]]:
+                        filter_model: str) -> Tuple[List[dict], List[dict]]:
     """Retrieve rules for one SQL fragment, as (candidates, selected).
 
     `MemoryRetriever.retrieve` collapses the two stages into one return value; they
@@ -104,14 +86,11 @@ def _retrieve_rules_for(sql_text: str,
     errors by returning every candidate, so an unmapped 'azure/...' name would
     silently disable filtering rather than fail.
     """
-    candidates = _keep_scope(
-        search_index_for_sql(
-            sql_text,
-            tkstore_path,
-            generic_only=False,
-            db=db,
-        ),
-        rule_scope,
+    candidates = search_index_for_sql(
+        sql_text,
+        tkstore_path,
+        generic_only=False,
+        db=db,
     )
     if use_llm_filtering and candidates:
         resolved = _resolve_model(filter_model)
@@ -190,6 +169,48 @@ def _revise_from_feedback(
         write_csv(headers_new, rows_new, out_dir / f"execution_result_after_{artifact_suffix}.csv")
         return new_sol
     return None
+
+
+def _adopt_refiner_sql(
+    *,
+    verdict: dict,
+    suggested_sql: str,
+    artifact_suffix: str,
+    engine: str,
+    db_path_or_cred,
+    out_dir: Path,
+) -> Optional[str]:
+    """Adopt the refiner's own corrected SQL, as upstream `tkboost.sql()` does.
+
+    The refiner emits a complete corrected fragment in `suggested_fix_sql`, which the
+    default path discards in favour of handing the prose rationale to an agent that has
+    never seen a rule. Upstream substitutes it directly (`tkboost/__init__.py:648-654`)
+    and the README's gains come from that path -- while the paper has the *agent* act on
+    feedback (Alg 5 line 13), so the two targets conflict here and this stays opt-in.
+
+    Two departures from upstream: the query is executed before being adopted, since an
+    unrunnable body would poison every later fragment; and a failure is not handed back
+    to the agent, because mixing both adoption paths in one run would measure neither.
+
+    Returns the adopted SQL, or None when there is nothing to adopt.
+    """
+    if str((verdict or {}).get('status', '')).lower() not in ('issues', 'issue', 'incorrect'):
+        return None
+    if not (suggested_sql or '').strip():
+        return None
+
+    try:
+        executor = make_executor(engine, db_path_or_cred)
+        headers, rows = executor.execute(suggested_sql)
+        if hasattr(executor, 'close'):
+            executor.close()
+    except Exception as e:
+        print(f"⚠️  Refiner's suggested SQL for {artifact_suffix} does not run, keeping the original: {e}")
+        return None
+
+    (out_dir / f"execution_query_after_{artifact_suffix}.sql").write_text(suggested_sql, encoding='utf-8')
+    write_csv(headers, rows, out_dir / f"execution_result_after_{artifact_suffix}.csv")
+    return suggested_sql
 
 
 def _feedback_text(verdict: dict, target: str, instruction: str) -> Optional[str]:
@@ -598,9 +619,9 @@ def perform_refinement_and_revision(inst: Instance,
                                     tkstore_path: Optional[str] = None,
                                     use_llm_filtering: bool = True,
                                     filter_model: str = 'gpt-4.1',
-                                    rule_scope: str = 'all',
                                     refiner_turns: int = DEFAULT_REFINER_TURNS,
                                     refiner_min_probes: Optional[int] = None,
+                                    adopt_refiner_sql: bool = False,
                                     ) -> Tuple[str, Optional[dict]]:
     """Run per-CTE refiner flow with cooperative revision and final SELECT refinement.
 
@@ -620,7 +641,6 @@ def perform_refinement_and_revision(inst: Instance,
             db=inst.db,
             use_llm_filtering=use_llm_filtering,
             filter_model=filter_model,
-            rule_scope=rule_scope,
         )
         retrievals.append({
             'stage': stage,
@@ -670,26 +690,45 @@ def perform_refinement_and_revision(inst: Instance,
         )
         cte_out.write_text(json.dumps(verdict, indent=2), encoding='utf-8')
 
-        feedback = _feedback_text(
-            verdict,
-            f"CTE {cte_name}",
-            f"\nInstruction: Revise ONLY the CTE named '{cte_name}' in your previous solution. Keep other CTEs unchanged.\n"
-            "Output a complete <solution> that includes the revised CTE.",
-        )
-        if feedback:
-            revised = _revise_from_feedback(
-                feedback=feedback,
-                artifact_suffix=cte_name,
-                messages=messages,
-                model=model,
-                engine=engine,
-                db_path_or_cred=db_path_or_cred,
-                out_dir=out_dir,
+        revised = None
+        if adopt_refiner_sql:
+            # Upstream hands the refiner one CTE but it rewrites its context too in
+            # roughly a third of fragments, so only the first CTE of the suggestion is
+            # taken -- the same `fixed_ctes[0]` narrowing upstream applies.
+            suggested_ctes, _ = parse_ctes_from_sql(verdict.get('suggested_fix_sql') or '')
+            if suggested_ctes:
+                candidate = list(ctes)
+                candidate[idx_cte] = {**candidate[idx_cte],
+                                      'body': suggested_ctes[0].get('body') or cte_body}
+                revised = _adopt_refiner_sql(
+                    verdict=verdict,
+                    suggested_sql=rebuild_sql_from_ctes(candidate, remainder_sql),
+                    artifact_suffix=cte_name,
+                    engine=engine,
+                    db_path_or_cred=db_path_or_cred,
+                    out_dir=out_dir,
+                )
+        else:
+            feedback = _feedback_text(
+                verdict,
+                f"CTE {cte_name}",
+                f"\nInstruction: Revise ONLY the CTE named '{cte_name}' in your previous solution. Keep other CTEs unchanged.\n"
+                "Output a complete <solution> that includes the revised CTE.",
             )
-            if revised:
-                final_sql = revised
-                # Refresh CTE bodies from adopted solution
-                ctes, remainder_sql = parse_ctes_from_sql(final_sql)
+            if feedback:
+                revised = _revise_from_feedback(
+                    feedback=feedback,
+                    artifact_suffix=cte_name,
+                    messages=messages,
+                    model=model,
+                    engine=engine,
+                    db_path_or_cred=db_path_or_cred,
+                    out_dir=out_dir,
+                )
+        if revised:
+            final_sql = revised
+            # Refresh CTE bodies from adopted solution
+            ctes, remainder_sql = parse_ctes_from_sql(final_sql)
 
         idx_cte += 1
 
@@ -729,12 +768,27 @@ def perform_refinement_and_revision(inst: Instance,
         )
         final_out.write_text(json.dumps(final_verdict, indent=2), encoding='utf-8')
 
-        feedback = _feedback_text(
-            final_verdict,
-            "the final SELECT",
-            "\nInstruction: Revise the final SELECT of your previous solution. Keep the CTEs unchanged.\n"
-            "Output a complete <solution>.",
-        )
+        if adopt_refiner_sql:
+            # The refiner saw the complete query at this stage, so its suggestion is the
+            # complete query and needs no reassembly.
+            revised = _adopt_refiner_sql(
+                verdict=final_verdict,
+                suggested_sql=(final_verdict.get('suggested_fix_sql') or ''),
+                artifact_suffix='final_select',
+                engine=engine,
+                db_path_or_cred=db_path_or_cred,
+                out_dir=out_dir,
+            )
+            if revised:
+                final_sql = revised
+            feedback = None
+        else:
+            feedback = _feedback_text(
+                final_verdict,
+                "the final SELECT",
+                "\nInstruction: Revise the final SELECT of your previous solution. Keep the CTEs unchanged.\n"
+                "Output a complete <solution>.",
+            )
         if feedback:
             revised = _revise_from_feedback(
                 feedback=feedback,
@@ -755,7 +809,7 @@ def perform_refinement_and_revision(inst: Instance,
                 'n_ctes': len(ctes),
                 'filter_model': filter_model,
                 'use_llm_filtering': bool(use_llm_filtering),
-                'rule_scope': rule_scope,
+                'adopt_refiner_sql': bool(adopt_refiner_sql),
                 'retrievals': retrievals,
             }, indent=2),
             encoding='utf-8',
@@ -1009,9 +1063,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="SQL Agent Runner")
     p.add_argument("--instance-id", action="append", default=[], help="Instance ID to run; can repeat")
     p.add_argument("--run-all-from-file", action="store_true", help="Run all instances from JSONL path")
-    p.add_argument("--rule-scope", choices=RULE_SCOPES, default='all',
-                   help="Which rule scopes may reach the refiner. 'db' drops the generic "
-                        "rules that made up 95%% of what the reference run injected")
+    p.add_argument("--adopt-refiner-sql", action="store_true",
+                   help="Substitute the refiner's own suggested_fix_sql instead of asking the "
+                        "agent to rewrite. Reproduces upstream tkboost.sql(); the paper has the "
+                        "agent act on feedback, so the two targets differ here")
     p.add_argument("--refiner-turns", type=int, default=DEFAULT_REFINER_TURNS,
                    help="Probing turns per fragment for the refiner (upstream tkboost.sql uses 5)")
     p.add_argument("--refiner-min-probes", type=int, default=None,
@@ -1221,17 +1276,13 @@ def _refiner_options(args) -> Dict[str, object]:
     return {
         'refiner_turns': args.refiner_turns,
         'refiner_min_probes': args.refiner_min_probes,
+        'adopt_refiner_sql': bool(args.adopt_refiner_sql),
     }
 
 
 def _knowledge_options(args) -> Dict[str, object]:
     """Knowledge kwargs for `perform_refinement_and_revision`, or {} when disabled."""
     if not args.tkstore:
-        if args.rule_scope != 'all':
-            raise ValueError(
-                f"--rule-scope {args.rule_scope} has no effect without --tkstore; "
-                "the run would look like a completed ablation having retrieved nothing"
-            )
         return {}
     if not (args.refine_cte or args.refine_output):
         raise ValueError(
@@ -1244,7 +1295,6 @@ def _knowledge_options(args) -> Dict[str, object]:
         'tkstore_path': args.tkstore,
         'use_llm_filtering': not args.no_llm_filtering,
         'filter_model': args.filter_model,
-        'rule_scope': args.rule_scope,
     }
 
 
