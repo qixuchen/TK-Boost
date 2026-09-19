@@ -1530,3 +1530,186 @@ natural language feedback，而一段带 SQL 的反馈仍是自然语言反馈 �
 E 轮的结论是"README 报告的增益依赖一个**偏离论文**的实现细节"。如果本阶段的预测成立，
 结论会变成更有建设性的一句：**论文的架构是对的，上游的实现只是把知识传丢了；
 补上传递、保留 agent 整合，两者兼得。** 后者对论文是正面的，也更可能是作者的本意。
+
+## 5.5 实测结果（F 轮）：预测不成立
+
+已实现为 `--include-candidate-sql`，跑在同一份裸 agent 产出与 5 轮探库配置上。
+
+| 轮次 | 修复由谁应用 | 裸 | 臂 A | 臂 B | refiner 净 | 知识净 |
+| --- | --- | --- | --- | --- | --- | --- |
+| B | agent 重写（只传散文） | 36 | 37 | 32 | +1 | −5 |
+| E | refiner 的 SQL（上游） | 36 | 34 | 37 | −2 | **+3** |
+| **F** | agent 重写 + 候选 SQL | 36 | **35** | 35 | −1 | **+0** |
+
+**5.2 那两个预测都没成立**：臂 A 没有回到 +1（是 −1），知识净没有 ≥ +3（是 0）。
+F 轮的 3 修好 3 改坏全在噪声内（±1/54），唯一能确定的是**它没有复现 E 轮的 +3**。
+
+### 但诊断排除了"agent 忽略候选 SQL"
+
+| | 主 agent 改写与 refiner 建议的相似度 |
+| --- | --- |
+| B 轮（只传散文） | 中位数 **0.23**，>0.9 的 1 个 |
+| F 轮 臂 B | 中位数 **0.45**，>0.9 的 6 个 |
+| F 轮 臂 A | 中位数 **0.48**，>0.9 的 11 个 |
+
+**候选 SQL 确实传到了并被部分采信**（相似度翻倍、完全照抄的从 1 涨到 6–11 个），
+三种失败模式一个都没完全命中 —— 既非盲抄（该接近 1.0）也非忽略（该还在 0.23）。
+问题是"部分采信"没有转化成分数。
+
+顺带一个反常现象：臂 A 的相似度（0.48）**高于**臂 B（0.45），采纳数也略多（74 vs 70），
+而有知识时 refiner 判 `issues` 的比例反而降了（25% → 22%）—— 与前几轮"知识让 refiner
+更爱挑问题"方向相反。
+
+### 由此得到的结论
+
+**5.4 那句话不能用了。** 现有证据更支持：E 轮那个 +3 **不是**来自"知识信息传递得更完整"，
+因为 F 轮把信息传过去了却没拿到增益。**传递不是关键变量。**
+
+E 轮与 F 轮真正的差别在于 **agent 的任务形态**：F 轮的指令仍是"改写 CTE X、输出完整
+`<solution>`"，agent 要从头组装整条查询，候选 SQL 只是旁边的参考；E 轮则是 refiner 的
+SQL 直接成为结果。这个观察引出阶段 6。
+
+---
+
+# 阶段 6 — 让 refiner 的自检对准整条 SQL（G 轮）
+
+**尚未实现。** 以 **E 轮**（`--adopt-refiner-sql`，目前唯一有正增益的配置）为基线。
+**明确定位为"在上游实现基础上的改进"，不是论文复现** —— Alg 5 第 7 行规定 SQL 由 agent
+产出，而这里主 agent 只写初版、之后纯粹是执行器。报告时归入"超出论文的设计探索"。
+依据是 E 轮已证明偏离论文的上游路径反而有正增益，而忠于论文的 A–D 轮没有。
+
+## 6.0 问题的精确定位
+
+E 轮拦下 107 条建议，**其中 33 条（可归因的 49%）是"输出契约被破坏"**：refiner 改掉了
+CTE 原本产出的列，下游还在引用。典型 `local018`：输出从
+`(collision_year, total_incidents, speeding_incidents)` 改成
+`(collision_year, pcf_violation_category, n)`，而 `percentage_shares` 还在读
+`speeding_incidents`。
+
+根因有两层，**第二层是本阶段的关键发现**：
+
+**一、refiner 看不见下游。** `sql_agent_runner.py:693-696` 的 `prev_blocks` 取
+`ctes[:idx_cte]`，下标严格小于当前位置。所以 CTE 阶段 refiner 只看得见自己和前面的 CTE，
+**看不见后续 CTE 与 final SELECT**。它一生中只在最后一个片段才见过全貌。
+
+**二、refiner 已有自检重试循环，但检错了对象。** `cte_refiner.py:570-590`：它打算给出
+verdict 前会执行一次 `suggested_fix_sql`，跑不通就把报错追进**自己的对话**、清空
+`verdict_data`、`continue` 重新出 verdict。机制完整、同对话续跑、成本低。
+
+问题在第 571 行：
+
+```python
+_execute_with_timeout(conn, cursor, suggested_sql, fetch_all=False)
+#                                   ↑ 只是 WITH category_counts AS (...) 这一段
+```
+
+**这一段孤立执行完全正确** —— 语法对、列都在。于是自检通过、verdict 产出；到我们这边替换
+进整条 SQL 才炸。**refiner 检片段、我们检整体，中间这道缝就是那 33 条的全部来源。**
+
+## 6.1 与 E 轮的差异，只有两处
+
+| | E 轮（现状） | G 轮 |
+| --- | --- | --- |
+| refiner 的 payload | `[PREVIOUS_CTES]`、`[CTE]`、`[CTE_GOAL]`… | **多一段 `[DOWNSTREAM]` + 一句约束指令** |
+| refiner 自检执行的对象 | 只有 `suggested_fix_sql` 片段本身 | **替换回整条 SQL 之后的完整查询** |
+| 自检失败后的重试 | 已存在（`need_rev` 分支） | **不动，直接复用** |
+| 主 agent 的角色 | 只写初版，之后纯执行器 | 同 |
+| `_adopt_refiner_sql` 的执行校验 | 保留 | 保留（成为第二道防线） |
+| 其余一切 | | 不动 |
+
+**没有新增重试循环。** 这是本方案相对早期草案的关键简化：那个循环已经存在，只需把它自检的
+对象换对。也因此**不需要**让 `run_refiner` 暴露对话历史。
+
+### payload 的 before / after（`local018` / `category_counts` 实例）
+
+新增只有两处，插在 `[CTE]` 之前以保持"上游／下游／目标片段"的顺序：
+
+```
+[USER_QUERY]      ...
+[PREVIOUS_CTES]   已有（此例为空，category_counts 是第一个 CTE）
+[DOWNSTREAM]      ★新增 —— ctes[idx+1:] 原文 + remainder_sql
+[CTE]             已有
+[CTE_GOAL]        已有（含注入的知识）
+[CTE_NAME] / [Harness tip] / [MANDATORY_PROBES] / Instructions   已有
+★ Your rewrite replaces only [CTE]. Everything in [DOWNSTREAM] keeps reading this
+  CTE's output, so your rewrite must preserve the output column names it references.
+```
+
+实测该例 payload 从 1069 → 1665 字符（**+596**）。`speeding_incidents`、
+`total_incidents`、`collision_year` 三个列名从此直接出现在 refiner 眼前。
+
+**不加 `[FULL_QUERY]`。** 它与 `[PREVIOUS_CTES]` + `[CTE]` + `[DOWNSTREAM]` 完全重复，
+实测会让新增量从 418 涨到 1175 字符（多 64%）。F 轮已暴露"上下文变长挤压注意力"的风险
+（那轮 +1376 字符、结果 +0），所以精简不只是省钱。
+
+**重试时不重复任何 SQL。** 续用同一对话，只追加约 150 字符的报错 turn，并指回
+`[DOWNSTREAM]`。两个改动共用同一段上下文，报错不需自带解释材料。
+
+## 6.2 实现方式：把校验器传下去，不要把重组逻辑搬过去
+
+`previous_ctes` 是**每段各带一个 `WITH`** 的展示格式（实测确认），拼起来不是合法 SQL，
+所以 refiner 无法自行重组整条查询。而 runner 手里有 `ctes` 与 `remainder_sql`。
+
+因此给 `run_refiner` 加一个可选参数：
+
+```python
+validate_fix_sql: Optional[Callable[[str], Optional[str]]] = None
+#   入参：refiner 的 suggested_fix_sql
+#   返回：None 表示整条 SQL 跑得通；否则返回报错字符串
+```
+
+runner 传入闭包，内容就是 `_adopt_refiner_sql` 现在那套：解析建议 → 取
+`fixed_ctes[0].body` → 替换 `candidate[idx_cte]` → `rebuild_sql_from_ctes` → 执行 →
+返回报错。`cte_refiner.py:571` 改成优先调 `validate_fix_sql`，未传时退回现有的孤立检查。
+
+这样**重组与校验逻辑只存在一处**（runner），refiner 完全不必知道 CTE 如何装配。
+`run_refiner` 的调用方只有 runner、`tkboost/__init__.py` 和它自己的 `main()`，
+新增可选参数对后两者零影响。
+
+## 6.3 三点风险与对策
+
+**报错措辞要指向原因。** 闭包返回的报错经 `need_rev` 进对话，必须让 refiner 明白是下游坏了
+而非自己的片段坏了。拼成 `substituted into the full query, which then failed: <error>`
+并提示去看 `[DOWNSTREAM]`。
+
+**重试预算与 `max_turns` 共用。** `need_rev` 走 `continue`，消耗同一个探库轮数预算（5 轮）。
+自检变严后可能出现"轮数耗尽仍无可用建议"，最终落到 `no_verdict` 兜底
+（`status: "issues"`、`issues: ["no_verdict"]`）—— 而它在我们的 runner 里**会触发改写**。
+前六轮 `no_verdict` 一直是 0，**本轮必须重新监控**；必要时把 `--refiner-turns` 提到 8。
+
+**自检的 DB 开销上升。** 从"执行一个片段"变成"执行整条查询"，更容易撞 120 秒超时
+（E 轮已有 2 例）。
+
+## 6.4 验收
+
+- 测试钉住：传入 `validate_fix_sql` 时，自检通过与否由**它的返回值**决定，而非孤立片段
+- 测试钉住：**不传时行为与现在逐字节一致**（A–F 六轮必须保持可复现，这条已吃过一次亏）
+- 测试钉住：`downstream` 为空时（最后一个 CTE、或无 CTE 的实例）`[DOWNSTREAM]` 不出现
+- 默认关闭（新标志），两臂同开，与 `--include-candidate-sql` 互斥
+- 产物记录：标志、`no_verdict` 片段数、自检重试次数
+
+## 6.5 预期与可证伪点
+
+臂 A 应回到 **36–37**（E 轮是 34，因为坏 SQL 被放弃；现在能在 refiner 侧修好），
+知识净 **≥ +3**。三种结局各有明确读法：
+
+| 结局 | 读法 |
+| --- | --- |
+| 契约破坏大幅减少且知识净 ≥ +3 | 方案成立，结论转为"**知识有用，但 refiner 需要足够上下文才能正确应用它**" |
+| 契约破坏减少但知识净仍 ≈ 0 | 指向 **E 轮那个 +3 本身不稳定**（仅 3.5%，略高于 ±2% 噪声线）。应先重跑 E 轮验稳定性，而非继续加设计 |
+| `no_verdict` 明显上升 | 自检变严挤爆轮数预算，需调 `--refiner-turns` |
+
+## 6.6 成本
+
+两臂都要重跑（机制变了），约 **2.5–3 小时/臂**，合计 5–6 小时。不新增 LLM 调用 ——
+只是每次自检的 DB 执行更重，payload 每片段多约 600 字符。
+
+## 6.7 若成立，结论是什么
+
+前六轮的叙事是"README 的增益依赖一个偏离论文的实现"。若 G 轮成立，会变成更本质的一句：
+
+> **知识是有用的，但需要 refiner 有足够的上下文才能正确应用它。** 论文把
+> `Feedback(q, c_i, K)` 的输入限定为问题、单个 CTE 和知识，这个信息量不足以让它在不破坏
+> 全局一致性的前提下改写子查询 —— 论文这里给的信息比实现所需要的更少，而这不是实现的疏忽。
+
+这比"传递方式"更本质，也能独立成立。
