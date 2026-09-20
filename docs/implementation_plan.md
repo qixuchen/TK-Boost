@@ -1899,17 +1899,53 @@ LLM 调用），而非单次调用。
 
 ## 7.8 跑 H 轮的指令
 
-臂 A/B 都要重跑（refiner 产出质量变了），agent 步可复用：
+两臂都要重跑（refiner 产出质量变了），**agent 步直接复用 E 轮的 `outputs/adopt5_agent`** ——
+那里 86 个实例的 `execution_query.sql` 都在。这么做省掉约 2 小时，更重要的是让 H 轮与 E 轮
+**逐实例共享同一份起始 SQL**，于是 E vs H 也成为配对比较，而不只是臂 A vs 臂 B。
+`--refine-output` 只读源目录（先 sync 到目标再精修），不会改动 `adopt5_agent`。
+
+因此不走 `run_pipeline.py`（它的 agent 步会从头再跑一遍），直接发两条臂命令：
 
 ```bash
-source .env && python scripts/run_pipeline.py \
-  --split data/splits/spider2_sqlite_test_no_reference_leak.txt \
-  --out-prefix outputs/h_retry --tkstore tkstore/tkstore_sqlite.csv \
+# 臂 A：有 refiner、无知识
+source .env && python -u -m src.agents.sql_agent_runner \
+  --refine-output outputs/adopt5_agent \
+  --refine-output-dir outputs/h_retry_refonly \
+  --model gpt-4.1 \
   --refiner-turns 5 --refiner-min-probes 3 \
-  --adopt-refiner-sql --validate-fix-in-context --verdict-attempts 3
+  --adopt-refiner-sql --validate-fix-in-context --verdict-attempts 3 \
+  2>&1 | tee outputs/h_retry_refonly.log
+
+# 臂 B：有 refiner、有知识
+source .env && python -u -m src.agents.sql_agent_runner \
+  --refine-output outputs/adopt5_agent \
+  --refine-output-dir outputs/h_retry_tk \
+  --tkstore tkstore/tkstore_sqlite.csv \
+  --model gpt-4.1 --filter-model gpt-4.1 \
+  --refiner-turns 5 --refiner-min-probes 3 \
+  --adopt-refiner-sql --validate-fix-in-context --verdict-attempts 3 \
+  2>&1 | tee outputs/h_retry_tk.log
 ```
 
-加 `--dry-run` 只打印三条子命令。中断可直接重跑同一条命令，两条路径都按实例续跑。
+两条除 `--tkstore` / `--filter-model` 外逐字相同，这是配对的前提。可并行（输出目录不同、
+互不写同一文件），也可串行。中断后重跑同一条命令即按实例续跑。
+
+评测与对比：
+
+```bash
+python evaluation/evaluate.py --result_dir outputs/h_retry_refonly --gold_dir evaluation/gold
+python evaluation/evaluate.py --result_dir outputs/h_retry_tk      --gold_dir evaluation/gold
+python scripts/compare_arms.py \
+  --arm-a outputs/h_retry_refonly --arm-b outputs/h_retry_tk \
+  --tkstore tkstore/tkstore_sqlite.csv --out outputs/h_retry_comparison.csv
+```
+
+### 成本（按 E 轮同配置实测重估）
+
+`results_reference_track.md` §9 那个"9 小时/臂"是 **25 轮**时代的数，不适用。E 轮
+（5 轮 / 3 探针）实测：臂 A **1.5 小时**、臂 B **2.3 小时**，合计 3.8 小时。H 轮只在重试
+触发时加成本（4 实例探针里 3/17 个片段触发，每次约 6 次调用），预计**臂 A 约 2 小时、
+臂 B 约 3 小时**，合计 4–6 小时；并行则墙上时间取较长的那条。
 
 ## 7.6 成本
 
