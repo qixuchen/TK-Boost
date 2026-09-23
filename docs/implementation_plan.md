@@ -1947,6 +1947,485 @@ python scripts/compare_arms.py \
 触发时加成本（4 实例探针里 3/17 个片段触发，每次约 6 次调用），预计**臂 A 约 2 小时、
 臂 B 约 3 小时**，合计 4–6 小时；并行则墙上时间取较长的那条。
 
+**实际**：臂 A 1.58 小时、臂 B 3.09 小时，与预估一致。结果见
+`results_reference_track.md` §16 —— 知识净 +3 → **−1**，且损伤全部集中在没有 db 规则的
+34 个实例上（净 −2）。下面两个阶段针对这个结果。
+
+---
+
+# 阶段 8 — 关掉"别库 generic 规则"的注入（I 轮）
+
+**代码已落地，86 实例的 I 轮尚未跑。** `--cross-db-generic` 默认 `never`；J 轮全量故意
+传了 `always`，与 H 轮同一套候选。四实例探针（`never` + 新 FilterKnowledge）见
+`results_reference_track.md` §17。针对 §16.2：H 轮全部的知识损伤集中在那 34 个"所在库在
+store 里一条规则都没有"的实例上，它们能收到的 100% 是从别库挖出来的 generic 规则。
+
+## 8.0 现状判据
+
+`tkstore/tagger_index.py:566-572` 的保留条件是"**scope 是 generic** 或 **库名匹配**"：
+
+```python
+if db is not None:
+    is_generic = (scope_lower == 'generic')
+    db_matches = (row_db == 'all' or row_db == db.lower())
+    if not is_generic and not db_matches:
+        continue
+```
+
+`is_generic` 一为真就短路，`db_matches` 算了也不用。
+
+## 8.1 "在各字段上过滤"实际只有一个字段能起作用
+
+原始设想是"让 generic 规则也在各字段上过滤"。实测 store 里 52 条 generic 规则的取值：
+
+| 字段 | generic 52 条 | 加过滤能排除吗 |
+| --- | --- | --- |
+| `table` | **全 52 条是 `all`** | 不能，`all` 按定义匹配一切 |
+| `column` | **全 52 条是 `all`** | 不能 |
+| `nulls` | 49 条 `all`，3 条 `yes` | 几乎不能 |
+| `data_type` | 34 条 `all`，18 条具体值 | **现有判据已在过滤** |
+| `sql_operations` | 平均 3.8 个操作 | **现有判据已在过滤** |
+| `db` | 全 52 条具体库名，**0 条 `all`** | **只有这个能排除** |
+
+所以本阶段等价于"按库名过滤 generic 规则"。B2 那条偏离（`table`/`column` 不参与过滤）
+只对 66 条 db 规则有意义 —— 它们里 56/53 条带具体表名列名，那是**另一个**改动。
+
+## 8.2 两种切法，效果对 −2 相同，对另外 52 个实例不同
+
+| | 做法 | 34 个无 db 规则的实例 | 另外 52 个实例 |
+| --- | --- | --- | --- |
+| **全局版** | 删掉 `is_generic` 短路 | 可见规则归零，臂 B ≡ 臂 A | generic 也被删，只剩同库规则 |
+| **条件版** | 仅当该实例没有任何同库规则时关闭 generic 注入 | 同上 | **不变**，与 H 轮逐实例可比 |
+
+全局版改动后每实例可见规则数（实测）：
+
+| 可见规则数 | 实例数 |
+| --- | --- |
+| **0 条** | **34** |
+| 2–6 条 | 32 |
+| 10–19 条 | 20 |
+
+归零的 34 个实例所在库为 `complex_oracle`、`log`、`oracle_sql`、`f1`、`imdb_movies`、
+`electronic_sales`、`BowlingLeague`、`EntertainmentAgency`、`school_scheduling` ——
+在 store 里 **db 和 generic 规则都没有**。
+
+**预期**：两种切法都会把 −2 消掉，但**不是修正，是关闭**。剩余增益落在 0～+1，
+仍在 §11 的 ±2% 噪声带内。全局版额外给出一个有价值的上界：**同库知识单独值多少**；
+代价是有效样本从 86 缩到 52，跨库迁移变成未测。
+
+## 8.3 只需重跑臂 B
+
+臂 A 不带 store，本阶段对它零影响，`outputs/h_retry_refonly` 直接复用。成本约 3 小时。
+
+## 8.4 验收
+
+- 新标志默认关闭，关闭时检索结果与 H 轮**逐条相同**（mem_id 序列可直接比对）
+- 打开后：那 34 个实例的 `retrieved_rules.json` 里 `selected` 全空
+- `retrieved_rules.json` 记录本次配置，供审计
+- 34 个实例上臂 B 的最终 SQL 与臂 A **逐字节相同**（这是"等于关闭"的最强检查）
+
+---
+
+# 阶段 9 — 让 FilterKnowledge 用完整任务上下文筛规则（J 轮）
+
+**已实现，并已用 `always` + `--context-filter` 跑完 86 实例。** 结果见
+`results_reference_track.md` §17：知识净差仍是 −1，伤害从无 db 规则组挪到了有 db 规则组。
+实现前 FilterKnowledge 只看当前 CTE 和候选规则。它不知道用户真正要什么、
+这个 CTE 在整条 SQL 中的职责、上下游是否已经完成了规则所要求的工作，也不知道主 agent
+已经观察到了哪些事实。它因此实际在回答“规则文字与局部 SQL 是否有词面关联”，而不是
+“规则能否帮助验证这个 CTE，且不会诱导 refiner 改坏整条查询”。
+
+这不是把 FilterKnowledge 改成严格的语义裁判。**决策：保持高召回原则：宁可保留可能
+相关的规则，只排除已有明确反证的规则。** H 轮已经表明有害但可运行的规则会真的落地，
+但反过来把不确定规则过早删掉也会偏离 Alg 4 的 Retrieve 目标。
+
+## 9.0 当前 prompt 的信息缺口
+
+一条规则要经过两步筛选才能到 refiner 手里。第一步是**代码筛选**，函数
+`search_index_for_sql`（`tkstore/tagger_index.py:492`）逐行读 store 的 CSV，按 SQL 操作、
+数据类型、空值处理挑出候选，把每条规则打包成一个 Python 字典返回。第二步是**LLM 筛选**，
+也就是 FilterKnowledge，函数 `_llm_filter_relevant_rules`（`:753`）把候选渲染成文字清单
+放进 prompt，让模型挑出真正要用的。
+
+第二步的 user prompt 目前只有：
+
+- 当前数据库名；
+- 当前 CTE 的文本；
+- 候选规则的 `mem_id`、`scope`、`sql_operations`、`data_type`、`nulls` 和 rule 文本
+  （截断到 500 字符）；
+- “不确定就保留”“约 70% 相关就保留”的指令。
+
+它**不含**完整用户问题、主 agent 的探库结果或错误、schema、`[PREVIOUS_CTES]`、
+`[DOWNSTREAM]`，也不含候选规则的 `table` / `column` 字段。
+
+> **更正一处此前的错误记载。** 本节原先写着 prompt 含"候选规则的来源 db"，那是错的。
+> 实测把 `local330` 的 6 条候选按 `_llm_filter_relevant_rules` 的渲染方式打印出来，
+> 每一条都是 `db=all`：
+>
+> ```
+> mem_id=26 | scope=generic | db=all | table=all | column=all
+> mem_id=42 | scope=generic | db=all | table=all | column=all
+> ```
+>
+> 原因见 §9.1 的缺陷一。**FilterKnowledge 从来不知道任何规则来自哪个数据库**，
+> 所以它连"这条规则来自别的库、迁过来要小心"这个念头都没有机会产生。
+
+`local330 / normalized_activity` 是直接例子。FilterKnowledge 只见到一个路径归一化的
+`CASE`，从 6 条候选中选出了：
+
+| mem_id | scope | 来源 db | 规则主题 |
+| --- | --- | --- | --- |
+| 26 | generic | `California_Traffic_Collision` | CASE / 类别值必须显式处理 |
+| 42 | generic | `SQLITE_SAKILA` | 下游引用的 CTE 必须被定义 |
+
+但它没看见：用户问事件数；bare `/` 的特殊处理是故意的；主 agent 已查到 `/x` 与 `/x/`
+并存；下游 `session_land_exit` 已按 `(session, path)` 去重。规则 26 随后诱导 refiner
+给事件日志 CTE 加 `SELECT DISTINCT`，改变了事件计数（§16.4）。
+
+## 9.1 两个既有缺陷，都出在两步筛选的交接处
+
+### 缺陷一：第一步没把来源库传给第二步，第二步的分桶与排序因此从未生效
+
+第一步 `search_index_for_sql` 在打包返回字典时列举的字段是
+`mem_id`、`instance_id`、`scope`、`sql_operations`、`table`、`column`、`data_type`、
+`nulls`、`rule`、`matches`（`tkstore/tagger_index.py:650-661`）。**其中没有 `db`。**
+函数内部其实读过每行的库名（存在局部变量 `row_db` 里，用于库名匹配），但打包时没放进字典，
+这个信息在返回的那一刻就丢了。实测确认：该函数返回的字典键只有上面那十个。
+
+第二步 `_llm_filter_relevant_rules` 一开始要把候选分成"本库专属规则"和"通用规则"两桶，
+让本库规则排在前面。分桶判断是 `rule.get('scope') == 'db' and db and rule.get('db') == db`
+（`:778`）。`rule.get('db')` 在字典里找不到 `db` 键，返回 `None`；参数 `db` 是当前库名
+（例如 `'log'`）。`None == 'log'` 恒为假，所以**本库规则那一桶始终是空的，所有规则都落进
+通用桶**，"本库规则排前面"这个设计从未生效。渲染那行写的是
+`db={rule.get('db', 'all')}`（`:837`），取不到就用 `'all'` 顶上，于是每条规则都显示
+`db=all`。
+
+后果有三层，第三层最糟：
+
+1. **排序失效** —— 本库专属规则本该最先呈现，实际与别库通用规则混在一起。
+2. **信息缺失** —— 模型看不到来源库，无法对跨库迁移保持警惕。
+3. **prompt 含一句假陈述** —— 正文明确告诉模型规则已排好序、本库专属的在最前面
+   （`:934-936`：`Database-specific rules for {db} come FIRST`），而实际顺序并非如此。
+   模型被引导去相信一个不存在的顺序，可能因此更信任排在前面的规则，
+   而那些只是恰好排在前面的别库通用规则。
+
+同一个 `db` 键缺失还让 chunk 路径的重排函数 `rerank_priority`（`:859`）失效：
+它用 `db_name = rule.get('db', '').lower()` 取来源库，恒为空字符串，
+于是"本库 db 规则得 1000 分"那条分支永不触发。
+
+### 缺陷二：prompt 在代码里有两份副本，改一份等于只改一半
+
+`_llm_filter_relevant_rules` 按候选数量分两条路。候选**超过** 15 条时，把规则切成每 15 条
+一组，逐组调用辅助函数 `_process_rule_chunk`，prompt 写在那个函数里（`:672-714`）。
+候选**不超过** 15 条时，它不调用那个辅助函数，而是在函数体内部另拼一份 prompt
+（`:921-982`）并自己调 `litellm.completion`。两份措辞高度重合但不相同 —— 短的那份筛选标准
+有 4 条，长的那份有 10 条。也就是说同一个 store、同一个 refiner，会因候选规则多还是少
+而收到两套不同的筛选指令。
+
+实测 H 轮臂 B 的 354 个片段，两条路都不是边缘情况：
+
+| 路径 | 片段数 | 占比 |
+| --- | --- | --- |
+| 候选 > 15 条，走 `_process_rule_chunk` | 198 | 56% |
+| 候选 ≤ 15 条，走函数体内联的那份 | 156 | **44%** |
+
+只改其中一份，44% 的片段会静默留在旧 prompt 上，而日志和产物不会有任何迹象。
+这与阶段 6 踩的坑同型：那次自检挂在一条从不执行的分支上，实测 708/708 个片段绕过了它。
+
+## 9.2 决策一：新实现放在我们自己的文件，上游一行不动
+
+**已决策：在 `src/agents/sql_agent_runner.py` 里写一份新的 FilterKnowledge，
+`tkstore/tagger_index.py` 保持原样。新标志关闭时继续调用上游那份。**
+
+三条理由：
+
+**两份 prompt 副本的风险从结构上消失。** 我们只写一个函数、一份 prompt，不存在"改了一半"
+的可能。
+
+**"关闭时与 H 轮逐字节一致"成为结构性保证而非测试纪律。** 关闭时调用的就是同一个未修改的
+上游函数。若改上游，这条一致性只能靠测试保证，而阶段 6 已经证明测试通过也可能实际走的是
+另一条分支。
+
+**改动量已接近重写。** 要增加用户问题、探库证据、上游 CTE、下游 CTE 四个段落，
+并替换整套筛选标准；放进上游文件反而更难说清哪部分是上游的、哪部分是我们的。
+
+代价是两份实现并存，但每次运行只走其中一条：标志关闭走上游那份，打开走我们那份。
+
+## 9.3 决策二：补上 `db` 字段，并让本库规则真正排到前面
+
+**已决策：用阶段 8 已有的 `_store_rule_index` 给候选补 `db` 字段，
+并且让"本库规则排前面"这个分桶第一次真正生效。**
+
+补 `db` 的方法是现成的。阶段 8 实现的 `_store_rule_index`
+（`src/agents/sql_agent_runner.py`）读 store 的 CSV，返回两样东西：每条规则的 `mem_id`
+到其来源库名的映射（字段 `db_of`），以及哪些库拥有 db 作用域规则的集合
+（方法 `has_db_rules`）。用它就能在候选进入我们的 FilterKnowledge 之前补上 `db` 字段，
+不需要动上游的 `search_index_for_sql`。
+
+> ### ⚠️ J 轮因此是复合改动，解读结果时必须写清
+>
+> 打开新标志后，J 轮同时改变了两件事：prompt 里多了完整任务上下文与新筛选标准，
+> 规则呈现顺序也从"全部混在通用桶里"变成"本库规则在前"。**如果 J 轮结果变好，
+> 无法区分是模型看到完整上下文后选得更准，还是本库规则终于排到前面更容易被选中。**
+>
+> 这是明知的取舍：本库规则优先本身是合理设计，方向上也与"减少别库通用规则的伤害"一致，
+> 不值得为了单变量而刻意保留一个已知失效的排序。但记录 J 轮结果时必须把这句话写进结论，
+> 不能把差值整体归因给 prompt。若 J 轮出现退步且需要定位，下一轮应把排序单独关掉复测。
+
+顺序修正生效后，§9.0 引用的那句 `Database-specific rules for {db} come FIRST`
+就不再是假陈述，可以在我们的新 prompt 里保留 —— 但措辞要与实际实现一致。
+
+## 9.4 新 prompt：完整上下文，但不搬重复品
+
+每个候选规则 chunk 的 FilterKnowledge prompt 改为明确分段：
+
+```text
+[USER_QUESTION]
+完整用户问题
+
+[DATABASE]
+当前库名
+
+[AGENT_PROBE_EVIDENCE]
+主 agent 已执行的 <sql> 探针及其紧随的 SQL_RESULT_TABLE / SQL_ERROR
+
+[PREVIOUS_CTES]
+当前 CTE 之前的 CTE
+
+[CURRENT_CTE]
+当前要验证的 CTE
+
+[DOWNSTREAM]
+当前 CTE 之后的 CTE 与最终 SELECT
+
+[CANDIDATE_RULES]
+每条：mem_id、scope、source_db、sql_operations、table、column、data_type、nulls、rule
+```
+
+`[AGENT_PROBE_EVIDENCE]` 直接从 `messages.json` 提取**原始**探针—结果对，不做 schema
+摘要；但不搬主 agent system prompt、原始问题、`<think>` / 无 SQL 的评述，或最终
+`<solution>`。这些要么已在其他段出现，要么是思考流而非可核验证据。86/86 个 agent
+目录都有 `messages.json`，且都能抽出至少一组这样的探针对。
+
+这与阶段 10 共用一个“从 `messages.json` 提取探针—结果对”的 helper；本阶段把它渲染为
+FilterKnowledge 的一个 `[AGENT_PROBE_EVIDENCE]` 段，阶段 10 把同一组消息作为 refiner
+对话轮次注入。**提取代码在本阶段落地，阶段 10 复用**，因为阶段 9 先需要它。
+
+在 `--refine-output` 路径下，`messages.json` 由 `_sync_instance_dirs` 连同整个实例目录
+一起复制进臂目录，所以直接从正在精修的那个实例目录读即可，不必回头去找 agent 目录。
+
+两处段落的取值需要明确：
+
+**最终 SELECT 阶段用 `[FULL_QUERY]`，不输出 `[DOWNSTREAM]`。** 那一阶段
+`perform_refinement_and_revision` 调用检索时传的 SQL 文本是**整条查询**
+（`retrieve_for('final_select', '_final_select', complete_query)`），因为 refiner 在该阶段
+审的就是整条查询，所以没有下游。硬塞一个空的 `[DOWNSTREAM]` 段只会让模型困惑。
+
+**下游 CTE 文本的计算要从 `--validate-fix-in-context` 底下抽出来。** 目前
+`sql_agent_runner.py` 的 CTE 循环里，下游文本只在 `--validate-fix-in-context` 打开时才计算
+（那是阶段 6 加的标志，作用是让 refiner 看到谁在读它的输出）。阶段 9 也要用这段文本，
+所以要把计算逻辑抽成两个标志共用，否则阶段 9 会莫名依赖阶段 6 的标志。
+
+## 9.5 高召回选择规则
+
+替换当前“70% 可能相关 / 不确定就保留”的模糊口径为下列可审计规则：
+
+> 优先保留可能帮助验证当前 CTE 的规则。只要规则与当前 CTE、用户问题或上下游职责存在
+> 合理关联，就保留；不能因为当前证据不足以**证明**规则适用而排除它。
+>
+> 仅在下列情况明确成立时排除：
+>
+> 1. 规则要求当前 CTE 完成的工作，已经明确由上游或下游 CTE 完成，且当前 CTE 的职责
+>    与该规则检查的内容无关；
+> 2. schema 或主 agent 已观察到的结果**直接反驳**规则的前提；
+> 3. 规则依赖当前数据库明确不存在的表、列、函数或数据形态；
+> 4. 规则来自其他数据库，且其适用依赖来源库专有 schema / 业务语义；当前问题、schema、
+>    CTE、上下游与探库证据均没有对应支持。
+>
+> 不要仅因规则来自其他数据库而排除它；不要因为当前 CTE 自身没有做某事就排除它；
+> 两者都可能是规则发现真实 bug 的信号。
+
+这保留 generic 跨库迁移的可能性；阶段 8 只是先对没有任何同库知识锚点的实例做硬保护，
+不把“来源 db 不同”本身当作 FilterKnowledge 的排除理由。
+
+## 9.6 规则元数据必须完整呈现
+
+即使阶段 8 的实测发现所有 generic 规则 `table=all` / `column=all`，FilterKnowledge
+仍应看到这些字段：
+
+- 对 db scope 规则，56/66 条有具体 table、53/66 条有具体 column；
+- `all` 本身是证据：它表示该规则没有 schema 级锚点，不能与精确指向当前表列的规则享有
+  同等的迁移可信度；
+- 否则即使以后修 B2 让代码预筛使用 table / column，LLM 筛选层仍然看不见这些依据。
+
+## 9.7 chunk、体量与成本
+
+候选规则仍按 15 条一组分块，不合并为一个长列表。分块的目的是避免规则太多时模型对清单中部
+注意力下降；如果我们不分块，候选超过 15 条的那 198 个片段就会同时改变上下文和分块方式，
+又多一个变量。
+
+完整上下文会在每个分块重发。实测估算每次调用多带的体量：主 agent 的原始探针—结果对中位
+5,820 字符（最大 36,554），整条 SQL 中位 1,161 字符（最大 5,234），合计中位约 6,982 字符，
+按四字符一 token 折算约 **1,745 token**。H 轮臂 B 的 FilterKnowledge 调用次数实测约
+**580 次**（354 个片段，超过 15 条候选的按每 15 条一次），因此额外输入约 **1.0M token**。
+墙上时间增加不多，主要是 token 成本。
+
+如果实测发现 context window 或成本不可接受，后续才讨论“仅携带当前片段所引用表的探针”。
+那是**筛选**而非摘要，但本阶段默认不做，以免再引入未经验证的选择机制。
+
+## 9.8 顺带处理的两处，都在同一段代码里
+
+**把模型返回的 `reasoning` 记进产物。** 模型返回的 JSON 里除了 `selected_indices`
+（被选中规则的编号列表）还有一个 `reasoning` 字段，是它对"为什么选这几条"的简短说明。
+上游代码只读 `selected_indices`（`:729` 与 `:998`），`reasoning` 解析出来后从未被读取、
+直接丢弃。我们自己那份实现要把它记下来，这样"某条有害规则当初为什么被选中"就能事后查证，
+而现在完全查不到 —— §16.4 里分析 `local330` 为什么选中规则 26 时，只能靠事后重跑推断。
+
+**不要把上游的一处变量名覆盖抄过来。** `search_index_for_sql` 有一个参数叫 `instance_id`，
+供调用方限定只看某个实例的规则；而循环体内第一行又写了
+`instance_id = row.get('instance_id')`（`:532`），把参数值覆盖成当前这一行自己的实例号。
+结果是从第二行起，那个"按实例号过滤"的条件比较的是同一个值、永远不会过滤掉任何东西。
+我们目前调用时不传 `instance_id`，所以现在没有影响；写新实现时不要复制这个模式。
+
+## 9.9 验收
+
+- 新标志默认关闭。关闭时走上游 `_llm_filter_relevant_rules` 原函数，
+  selected 的 mem_id 序列与 H 轮逐条一致（这由"上游一行不动"结构性保证，测试只需确认
+  关闭时确实调的是上游那个函数）；
+- 打开后，`retrieved_rules.json` 每个片段记下 candidates、selected、**excluded** 的
+  mem_id，以及模型返回的 `reasoning`。完整 prompt 默认不落盘（580 次调用 × 约 7,000 字符
+  太大），需要时另加一个标志；
+- **活性检查：候选 ≤ 15 条与 > 15 条的片段都必须走新实现**。这是缺陷二的直接防线，
+  实测两类片段分别占 44% 和 56%，只覆盖一类等于只改了一半；
+- 补 `db` 字段后，prompt 里每条规则显示的是真实来源库而非 `db=all`；本库规则确实排在
+  别库规则之前（这两条要分别断言，因为它们由同一个字段驱动但是两件事）；
+- `local330 / normalized_activity` 定为固定用例：prompt 必须同时含用户问题、
+  主 agent 探到的路径样本、下游按 `(session, path)` 去重的逻辑，以及规则 26 的来源库
+  `California_Traffic_Collision` 与它的 `table=all` / `column=all` 元数据；
+- 明确反证的规则被排除，而只是不确定的规则仍被保留（§9.5 的两类各写一条测试）；
+- FilterKnowledge 调用或解析失败时沿用当前 fail-open 行为：返回候选全集，并记录失败，
+  不得静默把规则丢掉。
+
+## 9.10 实验与顺序
+
+原计划阶段 8（I 轮）先跑。实际顺序反过来：先在四实例上分别探了 `always` 与 `never`，
+再把 **`always` + `--context-filter`** 作为臂 B 跑满 86 实例（I 轮全量未跑）。臂 A
+复用 H 轮的 `outputs/h_retry_refonly`。FilterKnowledge 只在有 store 的臂 B 调用。
+
+因为候选集合与 H 轮相同（`always`），这轮的主比较是 **J 轮臂 B 对 H 轮臂 B / 臂 A**，
+而不是对尚未跑的阶段 8 臂 B。阶段 9 自身仍是 §9.3 的复合改动（prompt 上下文与规则顺序
+同时变）。结果见 `results_reference_track.md` §17。
+
+---
+
+# 阶段 10 — 让 refiner 继承主 agent 的探库消息（K 轮）
+
+**尚未实现。** 针对一个独立于知识的信息断点：主 agent 探过的库，refiner 完全看不到。
+
+## 10.0 现状与实测动机
+
+两套对话完全独立。`run_refiner` 自建 `messages = [system, user_payload]`
+（`cte_refiner.py:556-559`），不接收也不合并主 agent 的 history；
+`--refine-output` 路径只读 `execution_query.sql`，连已有的 `messages.json` 都不读
+（§4.1 当时的决策是"不改"，本阶段**反转**该决策，但只为 refiner 反转）。
+
+实测代价：
+
+| 度量 | 实测 |
+| --- | --- |
+| 主 agent 探库次数 | 中位 **9** 次/实例（25 turn 预算，未跑满） |
+| refiner 探查的表中主 agent 已探过的比例 | **中位 100%，均值 98%** |
+| refiner 探针类型 | `PRAGMA` 457、`sqlite_master` 353、`LIMIT` 抽样 186、`COUNT/DISTINCT` 109 |
+| refiner **前两轮**的探针 | `sqlite_master` 353 + `PRAGMA` 129 = **482/494 是 schema 发现** |
+| 两者字面完全相同的探针 | 仅 4 条（1%）|
+
+`sqlite_master` 出现 353 次≈354 个片段各一次，因为 system prompt 硬性要求第一轮必须列表。
+**5 轮预算里头两轮几乎固定用于重新发现 schema**，而主 agent 早就拿到了。这直接连上 §6.8
+的病根：轮数耗尽 → 全部走兜底 → 阶段 6 的自检永不执行。
+
+字面重复只有 1%，所以**省不下"相同 SQL"** —— 要省的是同一批信息的不同问法。
+
+**`local330` 是直接证据**（§16.4 里被知识改坏的一条）。主 agent 的历史第 25 条明确记着两件
+refiner 不知道的事：bare `/` 的特殊处理是**故意的**，以及去重**已经在下游
+`session_land_exit` 里按 `(session, path)` 做过**。臂 B 的 refiner 恰恰给
+`normalized_activity` 加了 `SELECT DISTINCT` 才把它弄坏。
+
+## 10.1 做法：按原样注入为对话轮次，不做摘要
+
+**决策：不蒸馏成 schema 摘要块。** `messages.json` 结构规整、可靠配对 —— 带 `<sql>` 的
+assistant 消息紧跟一条以 `SQL_RESULT_TABLE:` 或 `SQL_ERROR:` 开头的 user 消息
+（实测 86/86 都能抽出探针对，0 个失败）。所以按原样搬，作为**对话轮次**注入而非拼进
+payload 文本：
+
+```
+system    refiner 的 system prompt
+user      refiner payload（问题、CTE、CTE_GOAL+规则、PREVIOUS_CTES、DOWNSTREAM）
+assistant <sql>SELECT name FROM sqlite_master WHERE type='table';</sql>   ← 继承
+user      SQL_RESULT_TABLE: ...                                           ← 继承
+assistant <sql>PRAGMA table_info(activity_log);</sql>                     ← 继承
+user      SQL_RESULT_TABLE: ...                                           ← 继承
+（refiner 的轮次循环从这里继续）
+```
+
+这样"同一段信息在 payload 里出现好多遍"天然不存在 —— 它们是独立消息，不是被复制的文本。
+
+## 10.2 不搬的三类，去掉它们是"不搬重复品"而非摘要
+
+| 不搬 | 理由 |
+| --- | --- |
+| 主 agent 的 system prompt 与第一条 user 消息 | 问题已在 `[USER_QUERY]`、hints 已在 `[PREDICTED_CTES_HINT]`，搬过去是同一段话出现两遍 |
+| `<think>` 与无 SQL 的评述消息 | 占 `messages.json` 大头（`local330` 28 条消息里探针对只占 12 条），是思考流而非证据 |
+| `<solution>` 那条 | 最终 SQL 已以 `[CTE]` + `[PREVIOUS_CTES]` + `[DOWNSTREAM]` 三段呈现，再搬一份完整 SQL 会与拆解版本并存互扰 |
+
+## 10.3 体量与成本
+
+| | 中位 | 最大 |
+| --- | --- | --- |
+| 继承块（只留探针+结果） | 5,813 字符 | 36,544 |
+| 额外输入 token/实例（中位 4 片段 × 约 6 次调用） | 34,533 | 493,344 |
+| 86 实例合计 | **约 4.0M token** | — |
+
+放大来自"每片段都要带、每次调用都要重发"。一个**不涉及摘要**的收缩办法：
+每个片段只继承涉及**它所引用表**的探针（筛选而非提炼，还顺带提高相关性）——
+中位降到 3,103 字符/片段，合计约 **2.0M token**。
+
+## 10.4 必须一起改的三处闸门
+
+不改会重演阶段 6 那种"代码写了但从未生效"：
+
+**探库下限 `min_required_sql=3`** 现在只数 refiner 自己的探针。继承的要不要计入？
+计入则它第一轮就能出 verdict（也就让阶段 6 的自检第一次有机会执行）；
+不计入则省下的轮数被闸门吃掉、收益归零。
+
+**`[MANDATORY_PROBES]` 与 system prompt 里"第一轮必须 `sqlite_master`"** 要同步改，
+否则模型会照做、把继承的 schema 再查一遍。
+
+**`harness_executed` 那道闸门保留。** §6.8 与 `local018` 都证明"编译自检"是唯一能让
+循环内 verdict 通过的钥匙；主 agent 从不按 CTE 名探库（CTE 不是表），所以继承不会误触它。
+
+## 10.5 与上游的关系
+
+**这不是修复回归，是在上游之上新增能力。** 上游 `tkboost.sql()` 调 `run_refiner` 时也只传
+问题、CTE、前序 CTE、规则、库路径，没有 agent history 参数（`tkboost/__init__.py:633-645`）；
+它自己生成 draft 更是单次 LLM 调用、完全不探库（`:500-521`）。写结论时必须说清，
+免得日后被当成"对齐上游"。
+
+## 10.6 验收
+
+- 新标志默认关闭，关闭时 refiner 的 `messages` 与 J 轮前**逐条相同**
+- 打开后 trace 能看到继承的探针（需要一个新的 trace section，否则无法审计继承了什么）
+- refiner 自己的 `sqlite_master` 探针数从 353 显著下降（活性检查：没下降就说明闸门没改对）
+- 循环内出 verdict 的片段数 > 0（§6.8 实测为 0；若继承计入探库下限，这里应该动）
+
+## 10.7 顺序：阶段 8、9 先行，三者不可同轮
+
+阶段 8 改变候选规则集合，阶段 9 改变 FilterKnowledge 从其中选出什么，阶段 10 才改变
+refiner 在收到规则后的证据基础。同时上则无法判断收益或损伤来自哪一层。且 `local330`
+同时落在三者的作用范围内（无 db 规则、被错误 generic 规则选中、主 agent 已有可反驳的
+探库证据），是它们会互相掩盖的现成例子。
+
+阶段 8 只重跑臂 B（约 3 小时），阶段 9 也只重跑臂 B，阶段 10 两臂都要重跑。
+
 ## 7.6 成本
 
 | | 值 |
