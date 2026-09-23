@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Experience-Based SQL Correction for Text-to-SQL</title>
+<style>
+:root {
+  --navy: #1a2b4a;
+  --teal: #2a7f8e;
+  --slate: #4a5568;
+  --light: #5a6577;
+  --bg: #f7f8fa;
+  --card: #ffffff;
+  --border: #e2e8f0;
+  --accent: #e8f4f6;
+  --emerald: #276749;
+  --amber: #b7791f;
+  --violet: #6b46c1;
+  --ff: 'Segoe UI', system-ui, sans-serif;
+  --fm: 'Cascadia Code', Consolas, 'Courier New', monospace;
+  --fs: 30px;
+  --s: 1;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: #0f172a; color: #1a202c; font-family: var(--ff);
+  overflow-x: hidden;
+  padding: 26px 0;
+}
+
+/* continuous document scroll, like a PDF viewer: pages stacked with a gutter */
+.page {
+  width: 100vw;
+  display: flex; justify-content: center;
+  padding: 13px 0;
+}
+.frame {
+  position: relative; overflow: hidden;
+  width: min(94vw, calc((100vh - 60px) * 16 / 9));
+  aspect-ratio: 16 / 9;
+  background: var(--bg);
+  box-shadow: 0 18px 50px rgba(0,0,0,0.45);
+}
+.slide {
+  position: absolute; top: 0; left: 0;
+  width: 1920px; height: 1080px;
+  transform-origin: top left; transform: scale(var(--s));
+  background: var(--bg);
+  padding: 46px 60px 86px;
+  display: flex; flex-direction: column; gap: 18px;
+  overflow: hidden;
+}
+.slide.title { justify-content: center; gap: 26px; }
+
+.hdr {
+  display: flex; align-items: center; justify-content: space-between;
+  padding-bottom: 12px; border-bottom: 3px solid var(--border); flex-shrink: 0;
+}
+.tag {
+  font-size: var(--fs); font-weight: 700; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--teal);
+  background: var(--accent); padding: 5px 14px; border-radius: 6px;
+}
+.num { font-size: var(--fs); color: var(--light); font-weight: 600; }
+
+h1 { font-size: 78px; font-weight: 700; color: var(--navy); line-height: 1.1; letter-spacing: -1px; }
+h1 span { color: var(--teal); }
+h2 { font-size: 46px; font-weight: 700; color: var(--navy); line-height: 1.15; flex-shrink: 0; }
+.lead { font-size: 34px; color: var(--slate); line-height: 1.35; flex-shrink: 0; }
+
+.body { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 18px; }
+.grid2 { flex: 1; min-height: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.grid3 { flex: 1; min-height: 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+
+.card {
+  background: var(--card); border: 2px solid var(--border); border-radius: 14px;
+  padding: 22px 24px; min-height: 0; overflow: hidden;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.ctitle {
+  font-size: 34px; font-weight: 700; color: var(--navy); line-height: 1.2;
+  display: flex; align-items: flex-start; gap: 12px; flex-shrink: 0;
+}
+.dot { width: 12px; height: 12px; border-radius: 50%; background: var(--teal); flex-shrink: 0; margin-top: 14px; }
+.dot.amber { background: var(--amber); }
+.dot.violet { background: var(--violet); }
+.dot.emerald { background: var(--emerald); }
+.dot.slate { background: var(--slate); }
+.card p { font-size: var(--fs); line-height: 1.34; color: #1a202c; }
+.card .kicker { font-size: var(--fs); font-weight: 700; color: var(--teal); }
+
+ul.list { list-style: none; display: flex; flex-direction: column; gap: 12px; min-height: 0; }
+ul.list li {
+  font-size: var(--fs); line-height: 1.32; color: #1a202c;
+  padding-left: 26px; position: relative;
+}
+ul.list li::before {
+  content: ''; position: absolute; left: 0; top: 13px;
+  width: 9px; height: 9px; border-radius: 50%; background: var(--teal);
+}
+ul.list.amber li::before { background: var(--amber); }
+ul.list.slate li::before { background: var(--slate); }
+
+ol.agenda { list-style: none; display: flex; flex-direction: column; gap: 18px; flex: 1; justify-content: center; }
+ol.agenda li { font-size: 38px; line-height: 1.3; color: var(--navy); display: flex; gap: 22px; }
+ol.agenda li .n {
+  font-size: 34px; font-weight: 700; color: var(--teal); background: var(--accent);
+  border-radius: 8px; padding: 2px 16px; flex-shrink: 0; height: fit-content;
+}
+ol.agenda li .d { font-size: var(--fs); color: var(--slate); display: block; margin-top: 6px; line-height: 1.3; }
+
+.diagram {
+  flex: 1; min-height: 0; background: var(--card); border: 2px solid var(--border);
+  border-radius: 16px; padding: 18px; overflow: hidden;
+}
+.diagram svg { display: block; width: 100%; height: 100%; }
+.diagram .node { stroke: #cbd5e1; stroke-width: 3; }
+.diagram .node.input { fill: #eff6ff; stroke: #93c5fd; }
+.diagram .node.agent { fill: #ecfdf5; stroke: #6ee7b7; }
+.diagram .node.sql { fill: #f0fafa; stroke: var(--teal); }
+.diagram .node.check { fill: #fffbeb; stroke: #fcd34d; }
+.diagram .node.final { fill: #f5f3ff; stroke: #c4b5fd; }
+.diagram .node.knowledge { fill: #fdf3e2; stroke: #f6ad55; }
+.diagram .node.guideline { fill: #e3f4f7; stroke: var(--teal); }
+.diagram .stage { font-size: 30px; font-weight: 700; letter-spacing: .08em; }
+.diagram .title { font-size: 34px; font-weight: 700; fill: var(--navy); }
+.diagram .copy { font-size: 30px; fill: var(--slate); }
+.diagram .label { font-size: 30px; fill: var(--slate); font-weight: 600; }
+.diagram .arrow { stroke: #94a3b8; stroke-width: 4; fill: none; }
+.diagram .arrow.magic { stroke: var(--teal); stroke-width: 6; }
+.diagram .arrow.tk { stroke: var(--amber); stroke-width: 6; }
+.diagram .arrow.mira { stroke: var(--violet); stroke-width: 6; stroke-dasharray: 12 10; }
+.diagram .work-label { font-size: 32px; font-weight: 700; }
+.diagram .work-label.magic { fill: var(--teal); }
+.diagram .work-label.tk { fill: var(--amber); }
+.diagram .work-label.mira { fill: var(--violet); }
+
+table.cmp {
+  width: 100%; border-collapse: collapse;
+  background: var(--card); border: 2px solid var(--border);
+  border-radius: 14px; overflow: hidden; flex-shrink: 0;
+}
+table.cmp th, table.cmp td {
+  padding: 16px 18px; text-align: left;
+  font-size: var(--fs); line-height: 1.28;
+  border-bottom: 1px solid var(--border); vertical-align: middle;
+}
+table.cmp th { background: var(--accent); color: var(--navy); font-weight: 700; }
+table.cmp tr:last-child td { border-bottom: none; }
+table.cmp td.num-cell { text-align: center; font-variant-numeric: tabular-nums; }
+table.cmp td.delta { text-align: center; font-weight: 700; font-size: 34px; }
+table.cmp td.delta.pos { color: var(--emerald); }
+table.cmp td.delta.neg { color: var(--amber); }
+table.cmp td.delta.flat { color: var(--slate); }
+
+.footer {
+  position: absolute; bottom: 22px; left: 60px; right: 60px;
+  display: flex; justify-content: space-between;
+  font-size: var(--fs); color: var(--light); line-height: 1.2;
+}
+.footer .cite { font-style: italic; max-width: 70%; text-align: right; }
+
+code {
+  font-family: var(--fm); font-size: var(--fs);
+  background: #edf2f7; color: #1a365d; padding: 2px 8px; border-radius: 5px; font-weight: 600;
+}
+.pill {
+  display: inline-block; padding: 3px 14px; border-radius: 999px;
+  font-size: var(--fs); font-weight: 700; background: #c6f6d5; color: var(--emerald);
+}
+.pill.grey { background: #edf2f7; color: var(--slate); }
+.pill.amber { background: #fdf3e2; color: #7a4f08; }
+
+ul.rules {
+  list-style: none; display: flex; flex-direction: column; gap: 16px;
+  min-height: 0; overflow: auto;
+}
+ul.rules li { font-size: var(--fs); line-height: 1.22; color: #1a202c; }
+ul.rules .scope { display: block; font-weight: 700; color: var(--teal); margin-bottom: 2px; }
+ul.rules.dbscope .scope { color: var(--amber); }
+
+#hint {
+  position: fixed; bottom: 18px; right: 22px; z-index: 20;
+  font-size: var(--fs); color: rgba(255,255,255,0.45); pointer-events: none;
+}
+
+@media print {
+  body { padding: 0; }
+  .page { padding: 0; page-break-after: always; }
+  .frame { width: 100vw; box-shadow: none; }
+  #hint { display: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- 1 -->
+<div class="page"><div class="frame"><section class="slide title">
+  <div class="hdr"><span class="tag">Work in progress</span><span class="num">1 / 10</span></div>
+  <h1>Experience-Based<br/><span>SQL Correction</span> for Text-to-SQL</h1>
+  <p class="lead">Aligning SQLFixAgent, MAGIC, TK-Boost and MIRA on one agent pipeline —<br/>then a small Spider evaluation of TK-Boost</p>
+  <div class="footer"><span>1 / 10</span><span class="cite">Internal notes · Sep 2026</span></div>
+</section></div></div>
+
+<!-- 2 -->
+<div class="page"><div class="frame"><section class="slide">
+  <div class="hdr"><span class="tag">Task</span><span class="num">2 / 10</span></div>
+  <h2>The text-to-SQL agent loop</h2>
+  <div class="body">
+    <p class="lead">No experience yet. This is the shell every method below plugs into.</p>
+    <div class="diagram">
+      <svg viewBox="0 0 1800 650" role="img" aria-label="Text-to-SQL agent flow from question and database through schema exploration, initial SQL, iterative rewrites, and final SQL">
+        <defs>
+          <marker id="base-arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 Z" fill="#94a3b8"/></marker>
+        </defs>
+        <rect x="70" y="360" width="280" height="150" rx="18" class="node input"/>
+        <text x="210" y="420" text-anchor="middle" class="title">User query</text>
+        <text x="210" y="465" text-anchor="middle" class="title">+ database</text>
+
+        <rect x="490" y="360" width="430" height="150" rx="18" class="node agent"/>
+        <text x="705" y="420" text-anchor="middle" class="title">Initial query generation</text>
+        <text x="705" y="457" text-anchor="middle" class="copy">produce the first SQL</text>
+        <text x="705" y="490" text-anchor="middle" class="copy">possibly with CTEs</text>
+
+        <rect x="490" y="55" width="430" height="160" rx="18" class="node sql"/>
+        <text x="705" y="115" text-anchor="middle" class="title">Schema exploration</text>
+        <text x="705" y="160" text-anchor="middle" class="copy">inspect tables and columns</text>
+        <text x="705" y="195" text-anchor="middle" class="copy">inspect sample values</text>
+
+        <rect x="1080" y="360" width="350" height="150" rx="18" class="node check"/>
+        <text x="1255" y="420" text-anchor="middle" class="title">Query rewrite</text>
+        <text x="1255" y="465" text-anchor="middle" class="copy">revise the current SQL</text>
+
+        <rect x="1600" y="360" width="180" height="150" rx="18" class="node final"/>
+        <text x="1690" y="445" text-anchor="middle" class="title">Final SQL</text>
+
+        <path d="M350 435 L490 435" class="arrow" marker-end="url(#base-arrow)"/>
+        <path d="M920 435 L1080 435" class="arrow" marker-end="url(#base-arrow)"/>
+        <path d="M1430 435 L1600 435" class="arrow" marker-end="url(#base-arrow)"/>
+
+        <path d="M620 360 L620 215" class="arrow" marker-end="url(#base-arrow)"/>
+        <text x="545" y="295" class="label">probe</text>
+        <path d="M810 215 L810 360" class="arrow" marker-end="url(#base-arrow)"/>
+        <text x="830" y="295" class="label">evidence</text>
+
+        <path d="M1365 360 L1365 310 Q1365 290 1345 290 L1165 290 Q1145 290 1145 310 L1145 360" class="arrow" marker-end="url(#base-arrow)"/>
+        <text x="1255" y="260" text-anchor="middle" class="label">repeat until the agent accepts the current SQL</text>
+      </svg>
+    </div>
+  </div>
+  <div class="footer"><span>2 / 10</span><span class="cite">The agent first learns the database, then iterates on SQL</span></div>
+</section></div></div>
+
+<!-- 3 -->
+<div class="page"><div class="frame"><section class="slide">
+  <div class="hdr"><span class="tag">Experience-based correction</span><span class="num">3 / 10</span></div>
+  <h2>Turn past SQL repairs into reusable experience</h2>
+  <div class="body">
+    <p class="lead">Experience-based SQL correction learns from historical mistakes: it contrasts an incorrect SQL with its ground-truth answer, attempts a repair, and distills reusable experience to guide future tasks.</p>
+    <table class="cmp">
+      <tr><th>Method</th><th>Persisted artifact</th><th>How a later task uses it</th></tr>
+      <tr><td><b>SQLFixAgent</b></td><td>Historical error records and similar repairs</td><td>Retrieve a similar repair while selecting a candidate fix</td></tr>
+      <tr><td><b>MAGIC</b></td><td>One self-correction guideline</td><td>Audit and rewrite the full SQL</td></tr>
+      <tr><td><b>TK-Boost / MIRA</b></td><td>Fine-grained repair knowledge: applicability rules or evidence-verifiable memory items</td><td>Repair the relevant subquery; MIRA activates a repair only when database evidence supports it</td></tr>
+    </table>
+  </div>
+  <div class="footer"><span>3 / 10</span><span class="cite">Same source: wrong SQL versus correct SQL; different artifacts</span></div>
+</section></div></div>
+
+<!-- 4 -->
+<div class="page"><div class="frame"><section class="slide">
+  <div class="hdr"><span class="tag">Positioning</span><span class="num">4 / 10</span></div>
+  <h2>Where experience can help, on the same pipeline</h2>
+  <div class="body">
+    <p class="lead">The same base loop from slide 2, now with the attachment points for MAGIC, TK-Boost and MIRA.</p>
+    <div class="diagram">
+      <svg viewBox="0 0 1800 650" role="img" aria-label="Text-to-SQL flow with MAGIC, TK-Boost, and MIRA attachment points">
+        <defs>
+          <marker id="enhance-arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 Z" fill="#94a3b8"/></marker>
+          <marker id="magic-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#2a7f8e"/></marker>
+          <marker id="tk-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#b7791f"/></marker>
+        </defs>
+        <!-- Base flow: identical geometry to the current slide 2 -->
+        <rect x="70" y="320" width="280" height="150" rx="18" class="node input"/>
+        <text x="210" y="380" text-anchor="middle" class="title">User query</text><text x="210" y="425" text-anchor="middle" class="title">+ database</text>
+        <rect x="490" y="320" width="430" height="150" rx="18" class="node agent"/>
+        <text x="705" y="380" text-anchor="middle" class="title">Initial query generation</text>
+        <text x="705" y="417" text-anchor="middle" class="copy">produce the first SQL</text><text x="705" y="450" text-anchor="middle" class="copy">possibly with CTEs</text>
+        <rect x="490" y="15" width="430" height="160" rx="18" class="node sql"/>
+        <text x="705" y="75" text-anchor="middle" class="title">Schema exploration</text>
+        <text x="705" y="120" text-anchor="middle" class="copy">inspect tables and columns</text><text x="705" y="155" text-anchor="middle" class="copy">inspect sample values</text>
+        <rect x="1080" y="320" width="350" height="150" rx="18" class="node check"/>
+        <text x="1255" y="380" text-anchor="middle" class="title">Query rewrite</text><text x="1255" y="425" text-anchor="middle" class="copy">revise the current SQL</text>
+        <rect x="1600" y="320" width="180" height="150" rx="18" class="node final"/><text x="1690" y="405" text-anchor="middle" class="title">Final SQL</text>
+        <path d="M350 395 L490 395 M920 395 L1080 395 M1430 395 L1600 395" class="arrow" marker-end="url(#enhance-arrow)"/>
+        <path d="M620 320 L620 175 M810 175 L810 320" class="arrow" marker-end="url(#enhance-arrow)"/>
+        <text x="545" y="255" class="label">probe</text><text x="830" y="255" class="label">evidence</text>
+        <path d="M1365 320 L1365 270 Q1365 250 1345 250 L1165 250 Q1145 250 1145 270 L1145 320" class="arrow" marker-end="url(#enhance-arrow)"/>
+        <text x="1255" y="220" text-anchor="middle" class="label">repeat until the agent accepts the current SQL</text>
+
+        <!-- Shared experience-knowledge group -->
+        <rect x="450" y="540" width="1110" height="105" rx="18" fill="none" stroke="#94a3b8" stroke-width="3" stroke-dasharray="12 10"/>
+        <rect x="475" y="522" width="350" height="42" rx="8" fill="#ffffff"/>
+        <text x="495" y="553" class="work-label" fill="#4a5568">Experience knowledge</text>
+
+        <!-- MAGIC guides the initial query generation -->
+        <rect x="490" y="570" width="430" height="75" rx="18" class="node guideline"/>
+        <text x="705" y="605" text-anchor="middle" class="title">Global skill / guideline</text>
+        <text x="705" y="635" text-anchor="middle" class="copy">MAGIC</text>
+        <path d="M705 570 L705 470" class="arrow magic" marker-end="url(#magic-arrow)"/>
+
+        <!-- TK-Boost and MIRA share a single subquery-rewrite attachment -->
+        <rect x="1020" y="570" width="500" height="75" rx="18" class="node knowledge"/>
+        <text x="1270" y="605" text-anchor="middle" class="title">Fine-grained repair knowledge</text>
+        <text x="1270" y="635" text-anchor="middle" class="copy">TK-Boost / MIRA</text>
+        <path d="M1255 570 L1255 470" class="arrow tk" marker-end="url(#tk-arrow)"/>
+      </svg>
+    </div>
+  </div>
+  <div class="footer"><span>4 / 10</span><span class="cite">Candidate attachment points — not a system we have built</span></div>
+</section></div></div>
+
+<!-- 5 -->
+<div class="page"><div class="frame"><section class="slide">
+  <div class="hdr"><span class="tag">Plan</span><span class="num">5 / 10</span></div>
+  <h2>Current process</h2>
+  <div class="body" style="justify-content:center; gap:28px;">
+    <p class="lead">A small local eval of the methods to see whether any of them is promising on our setup.</p>
+    <p class="lead"><b>TK-Boost</b> is not public; we obtained the code from the authors.</p>
+    <p class="lead"><b>MAGIC</b> has public code.</p>
+    <p class="lead"><b>MIRA</b> is not public; and the author replied that the code is not available yet.</p>
+    <p class="lead">Evaluation of <b>TK-Boost</b> and <b>MAGIC</b> has already started.</p>
+  </div>
+  <div class="footer"><span>5 / 10</span><span class="cite">Reproduce first, then decide what to stack</span></div>
+</section></div></div>
+
+<!-- 6 -->
+<div class="page"><div class="frame"><section class="slide">
+  <div class="hdr"><span class="tag">Results</span><span class="num">6 / 10</span></div>
+  <h2>TK-Boost on Spider: does the knowledge help?</h2>
+  <div class="body">
+    <p class="lead">TK-Boost mines tribal knowledge from repairing traces during training. It later provides related knowledge during CTE refinement.</p>
+    <table class="cmp">
+      <tr>
+        <th>Agent type</th><th>No knowledge</th><th>With Knowledge</th>
+        <th style="text-align:center">&Delta; knowledge</th><th style="text-align:center">Fixed</th><th style="text-align:center">Harmed</th>
+      </tr>
+      <tr>
+        <td><b>Agent provided by paper repo</b><br/><span style="color:var(--slate)">adopts the refiner's SQL directly</span></td>
+        <td class="num-cell">34/86</td><td class="num-cell">37/86</td>
+        <td class="delta pos">+3</td><td class="num-cell">4</td><td class="num-cell">1</td>
+      </tr>
+      <tr>
+        <td><b>A stronger agent from me</b><br/><span style="color:var(--slate)">by providing context to the refiner</span></td>
+        <td class="num-cell">36/86</td><td class="num-cell">35/86</td>
+        <td class="delta neg">&minus;1</td><td class="num-cell">3</td><td class="num-cell">4</td>
+      </tr>
+    </table>
+    <div class="grid2" style="flex:0 0 auto">
+      <div class="card">
+        <ul class="list">
+          <li>With the repo's agent, knowledge gains <b>+3</b> over Arm A: 4 fixed, 1 harmed.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <ul class="list amber">
+          <li>With a stronger agent, the same knowledge is <b>&minus;1</b>: 3 fixed, 4 harmed</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="footer"><span>6 / 10</span><span class="cite">Paired runs on the Spider split; counts are instances, not percentages</span></div>
+</section></div></div>
+
+<!-- 7 -->
+<div class="page"><div class="frame"><section class="slide">
+  <div class="hdr"><span class="tag">Knowledge store</span><span class="num">7 / 10</span></div>
+  <h2>What the shipped TK-Store rules look like</h2>
+  <div class="body">
+    <p class="lead">118 rules in the shipped store: 52 generic, 66 db-scoped. Text below is verbatim from <code>tkstore/tkstore_sqlite.csv</code>.</p>
+    <p class="lead">In test, most of the rules retrieved are generic. Only a small protion of rules are DB-scoped (<b>which can be problematic as later discussed.</b>)</p>
+    <div class="grid2">
+      <div class="card">
+        <div class="ctitle"><span class="dot"></span>Generic</div>
+        <ul class="rules">
+          <li><span class="scope">Rule 1</span>Output numeric type/precision matches evaluation expectations (integer-like vs decimal)</li>
+          <li><span class="scope">Rule 2</span>Calendar-aware date parts (year/month/day extraction) are preferred over average-day approximations when exact component semantics matter</li>
+          <li><span class="scope">Rule 3</span>If category assignment depends on a related table, enforce membership with EXISTS (or equivalent) before aggregation</li>
+          <li><span class="scope">Rule 4</span>directionality of entity-pairs is explicitly respected in queries when measuring routes, flows, or connections</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="ctitle"><span class="dot amber"></span>DB-scoped</div>
+        <ul class="rules dbscope">
+          <li><span class="scope">E_commerce · order_payments.payment_value</span>When computing AOV from integer-like aggregates, verify whether SQLite integer division is expected before forcing float math</li>
+          <li><span class="scope">Baseball · player.debut, player.final_game</span>For year-span components in SQLite date arithmetic, prefer STRFTIME-based component extraction over julianday/365 approximations</li>
+          <li><span class="scope">California_Traffic_Collision · parties.party_safety_equipment_1</span>When segmenting collisions by helmet usage, first restrict to cases with motorcycle-related safety-equipment evidence using EXISTS against parties</li>
+          <li><span class="scope">Brazilian_E_Commerce · olist_order_payments.order_id</span>In order-level payment analyses joined to item-level tables, deduplicate order-payment pairs before counting category-level totals</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="footer"><span>7 / 10</span><span class="cite">VERIFY / ENSURE clauses from tkstore/tkstore_sqlite.csv</span></div>
+</section></div></div>
+
+<!-- 8 -->
+<div class="page"><div class="frame"><section class="slide">
+  <div class="hdr"><span class="tag">Results</span><span class="num">8 / 10</span></div>
+  <h2>MAGIC on BIRD Mini-Dev: does the guideline help?</h2>
+  <div class="body">
+    <p class="lead">MAGIC generate a guideline from failed training sql repairment. The guideline is used to correct test sqls.</p>
+    <div class="grid3" style="flex:0 0 auto">
+      <div class="card">
+        <div class="ctitle"><span class="dot slate"></span>Initial SQL (CodeS)</div>
+        <p style="font-size:52px; font-weight:700; color:var(--navy); line-height:1.1;">147<span style="font-size:30px; color:var(--slate); font-weight:600;"> / 270</span></p>
+        <p style="color:var(--slate);">54.4%</p>
+      </div>
+      <div class="card">
+        <div class="ctitle"><span class="dot emerald"></span>Correction w. guideline (GPT-5)</div>
+        <p style="font-size:52px; font-weight:700; color:var(--emerald); line-height:1.1;">230<span style="font-size:30px; color:var(--slate); font-weight:600;"> / 270</span></p>
+        <p style="color:var(--slate);">85.2%</p>
+      </div>
+      <div class="card">
+        <div class="ctitle"><span class="dot"></span>Correction w/o. guideline (GPT-5)</div>
+        <p style="font-size:52px; font-weight:700; color:var(--navy); line-height:1.1;">227<span style="font-size:30px; color:var(--slate); font-weight:600;"> / 270</span></p>
+        <p style="color:var(--slate);">84.1%</p>
+      </div>
+    </div>
+    <table class="cmp">
+      <tr>
+        <th>What changes</th>
+        <th style="text-align:center">Net EX</th>
+        <th style="text-align:center">Fixed</th>
+        <th style="text-align:center">Harmed</th>
+        <th>Reading</th>
+      </tr>
+      <tr>
+        <td><b>Initial → correct + guideline</b></td>
+        <td class="delta pos">+83</td>
+        <td class="num-cell">92</td>
+        <td class="num-cell">9</td>
+        <td>Correction with guideline improves SQL EX a lot, but...</td>
+      </tr>
+      <tr>
+        <td><b>No guideline → with guideline</b></td>
+        <td class="delta pos">+3</td>
+        <td class="num-cell">13</td>
+        <td class="num-cell">10</td>
+        <td>The major gain comes from the correction itself.</td>
+      </tr>
+    </table>
+  </div>
+  <div class="footer"><span>8 / 10</span><span class="cite">BIRD Mini-Dev · 270 scored of 271 · numbers from SynQo run-correct</span></div>
+</section></div></div>
+
+<!-- 9 -->
+<div class="page"><div class="frame"><section class="slide">
+  <div class="hdr"><span class="tag">Guideline</span><span class="num">9 / 10</span></div>
+  <h2>What MAGIC's generated guideline looks like</h2>
+  <div class="body">
+    <p class="lead">One global checklist mined from failed training repairs, then given to the corrector on test SQL.</p>
+    <ol class="agenda" style="gap:22px; justify-content:flex-start;">
+      <li><span class="n">1</span><span>Always aggregate at the correct entity level and handle ties when comparing segment-level minimums; compute all requested differences, not just one</span></li>
+      <li><span class="n">2</span><span>Select the right attribute from the correct table and join by the right key</span></li>
+      <li><span class="n">3</span><span>When computing a customer-specific rate, first identify the CustomerID from the triggering event</span></li>
+      <li><span class="n">4</span><span>Return event type from the event table when asked for event category at a location; avoid unnecessary joins that can drop rows</span></li>
+      <li><span class="n">5</span><span>Use the correct definition and quoting for T-BIL; list patient IDs per sex with GROUP_CONCAT and filter by the proper threshold</span></li>
+    </ol>
+  </div>
+  <div class="footer"><span>9 / 10</span><span class="cite">MAGIC guideline used on BIRD Mini-Dev in the SynQo run-correct experiment</span></div>
+</section></div></div>
+
+<!-- 10 -->
+<div class="page"><div class="frame"><section class="slide">
+  <div class="hdr"><span class="tag">Next</span><span class="num">10 / 10</span></div>
+  <h2>Observations & Conclusions</h2>
+  <div class="body">
+    <ol class="agenda" style="gap:56px;">
+      <li><span class="n">1</span><span>Generic guideline/knowledge provided by <b>TK-Boost</b> / <b>MAGIC</b> brings limited gains.</span></li>
+      <li><span class="n">2</span><span>Gains from generic knowledge diminishes with the use of stronger LLMs / better agents.</span></li>
+      <li><span class="n">3</span><span>We need to extract knowledge that are <b>orthongonal</b> to generic knowledge, <b>domain specific</b> knowledge (e.g., knowledge related to underlying data asset) seems more promising to be mined.</span></li>
+    </ol>
+  </div>
+  <div class="footer"><span>10 / 10</span><span class="cite">Questions and objections welcome</span></div>
+</section></div></div>
+
+<div id="hint">scroll ↓</div>
+
+<script>
+function fit() {
+  var frame = document.querySelector('.frame');
+  if (!frame) return;
+  document.documentElement.style.setProperty('--s', frame.clientWidth / 1920);
+}
+window.addEventListener('resize', fit);
+fit();
+</script>
+</body>
+</html>
