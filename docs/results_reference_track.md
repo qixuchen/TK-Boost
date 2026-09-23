@@ -1081,11 +1081,112 @@ B2（`table`/`column` 两维不参与过滤）与 B6（generic 且只命中一�
 
 ---
 
-## 17. 待办
+## 17. J 轮：`always` + 带任务上下文的 FilterKnowledge
+
+配置相对 H 轮臂 B 只多两处：`--context-filter`（阶段 9 的 FilterKnowledge：完整用户问题、
+主 agent 探库对、上下游 CTE、规则带来源库，且本库 db 规则排在前面），以及显式
+`--cross-db-generic always`（阶段 8 的库名过滤保持关闭，与 H 轮同一套候选）。
+默认的 `never` 这轮**没有**打开。臂 A 直接复用 `outputs/h_retry_refonly`，起始 SQL 仍是
+`outputs/adopt5_agent`。这是计划 §9.3 写明的**复合改动**（prompt 与规则顺序同时变），
+不能把差值整体归因给其中一件。
+
+完整性：臂 B 86/86、`❌ Failed: 0`。`retrieved_rules.json` 实测
+`context_filter: true`、`cross_db_generic: always`，store sha1 与 H 轮相同
+（`3f75f1690f84600c12c1c67ac9902f69634e8f62`，118 条）。
+
+86 实例跑之前有两次四实例探针（H 轮臂 B 改坏的 `local061` / `local274` / `local302` /
+`local330`），不计入总分，只作机制预演：
+
+| 探针 | `local061` | `local274` | `local330` | `local302` |
+| --- | --- | --- | --- | --- |
+| H 轮臂 B | 0 | 0 | 0 | 0 |
+| `always` + 新 FilterKnowledge | **1** | **1** | **1** | 0 |
+| `never` + 新 FilterKnowledge | **1** | **1** | 0 | 0 |
+
+四实例上 `always` 修回 3 条、`never` 修回 2 条；全量跑选择了 `always`。四实例不能外推：
+全量里 `local274` / `local330` 再次为 0。
+
+### 17.1 主结果：知识净差仍是 −1，分组方向翻转了
+
+| | 裸 agent | 臂 A（refiner 无知识） | 臂 B（refiner + 知识） | 知识净差 | 修好 | 改坏 |
+| --- | --- | --- | --- | --- | --- | --- |
+| H 轮 | 36 | 36 | 35 | **−1** | 3 | 4 |
+| J 轮 | 36 | 36 | 35 | **−1** | 3 | 4 |
+
+总分与 H 轮逐格相同。臂 B 相对 H 轮臂 B 有 **6** 个实例分数对调，净零
+（修好 `local061`、`local335`、`local355`；弄坏 `local070`、`local300`、`local310`）。
+±1 仍在 §11 的 ±2% 噪声带内，定性仍是**看不出知识增益**。
+
+按"有无 db 规则"分组则与 H 轮相反：
+
+| | n | 裸 | 臂 A | 臂 B | 知识净差 | 修好 | 改坏 |
+| --- | --- | --- | --- | --- | --- | --- |
+| J 轮 · **无 db 规则** | 34 | 13 | 13 | 13 | **+0** | 2 | 2 |
+| J 轮 · 有 db 规则 | 52 | 23 | 23 | 22 | **−1** | 1 | 2 |
+| H 轮 · 无 db 规则 | 34 | 13 | 13 | 11 | **−2** | | |
+| H 轮 · 有 db 规则 | 52 | 23 | 23 | 24 | **+1** | | |
+
+H 轮全部损伤在 34 个无锚点实例上；J 轮这 34 个回到 ±0，**净 −1 改到有 12 条本库规则的
+`bank_sales_trading` 一侧**（`local300`、`local302`）。新 FilterKnowledge 没有消除跨库
+generic 的伤害，只是把伤害从"无本库规则"挪到了"有本库规则仍注入别库 generic"。
+
+### 17.2 七处翻转，先剔除不可归因的三条
+
+知识造成的翻转共 7 处。`local049`、`local335`、`local330` 的 `rules_used` 为空 ——
+没有任何带规则的片段被采纳，分数差来自两臂各自独立跑 refiner 的随机差异。
+H 轮已经用 `local049` / `local070` 说明过这一点；J 轮再次出现。
+
+**改坏 4 条（其中 1 条不可归因）：**
+
+| 实例 | 库（db 规则数） | 片段 | 发生了什么 |
+| --- | --- | --- | --- |
+| `local300` | `bank_sales_trading`（12） | `daily_net` | **新出现。** 臂 A 判 ok。臂 B 用规则 26（generic，来自 `California_Traffic_Collision`："CASE 必须显式覆盖所有类别"）把 `ELSE -txn_amount` 改成 `deposit` 正 / `withdrawal` 负 / **`ELSE 0`**。该表 `txn_type` 实测还有 `purchase`（1617 行），被归零后余额算错。refiner issue 原文写 "Tribal knowledge requires explicit handling of all known categorical values" |
+| `local302` | `bank_sales_trading`（12） | `percent_changes` | **与 H 轮同一条。** 两臂都改、方向不同。臂 A 改成条件聚合，对了；臂 B 按规则 46（generic，来自 `modern_data`：分组列滤 NULL/空值）去加 `WHERE attribute IS NOT NULL`。新 FilterKnowledge 仍把 46 留在该片段的 17 条 selected 里 |
+| `local274` | `oracle_sql`（0） | final SELECT | **E、H、J 三轮都被知识改坏。** 两臂都诊断"FIFO 无法实现"。臂 A 改完仍是 `AVG(pl.qty)`；臂 B 改成 `SUM` 并 `ORDER BY MIN(line_no)`。gold 要平均值。注入 12 条全是别库 generic；最贴合 "不要直接 AVG" 的是规则 35（来自 `IPL`），但是推断，refiner 没有点名编号 |
+| `local330` | `log`（0） | `session_land_exit` | **`rules_used` 为空，不可归因。** 臂 A 判 issues，用窗口函数取首末页，把裸 agent 的 0 修成 1。臂 B 判 ok，原样留下 `MIN/MAX(stamp)` UNION。H 轮是规则 26 加 `SELECT DISTINCT` 改坏；J 轮是知识在场时漏掉了臂 A 做过的修复，机制不同 |
+
+**改好 3 条（其中 2 条不可归因）：**
+
+| 实例 | 库 | 可归因？ |
+| --- | --- | --- |
+| `local355` | `f1`（0） | 可。`rules_used` 非空（27 条）。裸 0 → 臂 A 0 → 臂 B 1 |
+| `local049` | `modern_data`（3） | 否。`rules_used` 空；H 轮也出现过同方向、同样不可归因 |
+| `local335` | `f1`（0） | 否。`rules_used` 空 |
+
+H 轮改坏的 `local061`（规则 26 把 INNER JOIN 改成 UNION+LEFT JOIN）这轮臂 B 判 ok，
+最终 SQL 与臂 A 相同，分数回到 1，**不再出现在翻转表里**。四实例探针预演了这一条，
+全量跑证实了。
+
+### 17.3 和 H 轮比：总分不动，伤害换了位置
+
+H 轮点名的两条跨库 generic 在 J 轮仍然活着：规则 26 改坏了 `local300`，规则 46 继续改坏
+`local302`。两者都发生在**有 12 条本库规则**的 `bank_sales_trading` 上，所以
+`--cross-db-generic known-db` 拦不住（那个模式只在本库一条 db 规则都没有时才关跨库）；
+`never` 会把 26 和 46 挡在门外，但四实例探针里 `never` 在 `local302` 上仍是 0 分 ——
+同库规则自己也能把它引到 LEFT JOIN 那条错路上。
+
+结论（读 `outputs/j_always_comparison.csv` 与四条 `refiner_*.json` / 最终 SQL 得出，
+不是外推）：阶段 9 的 FilterKnowledge **没有**把知识净差拉出噪声带，也**没有**稳定修掉
+H 轮那四条 harm。它改变了哪些实例被改坏，并把净损伤从无锚点组挪到了有本库规则的组。
+
+### 17.4 产物位置
+
+| 目录 | 内容 |
+| --- | --- |
+| `outputs/h_retry_refonly/` | 臂 A（与 H 轮共用） |
+| `outputs/j_always_tk/` | 臂 B（`always` + `--context-filter`） |
+| `outputs/j_always_comparison.csv` | 逐实例对比表 |
+| `outputs/j_probe4_tk/` | 四实例探针：`always` + 新 FilterKnowledge |
+| `outputs/j_probe4_never_tk/` | 四实例探针：`never` + 新 FilterKnowledge |
+
+---
+
+## 18. 待办
 
 §7 的四条候选原因现在全部有了结论：第 1 条（generic 淹没）由 C 轮证明不能靠 scope 分流解决，
 第 2 条（剪断的链）由 **E 轮证实是关键**，第 3 条（refiner 太强）由 B 轮证伪，
-第 4 条的 prompt 污染尚未登记。下一步的重点从"找原因"转为"把 E 轮的结论坐实"。
+第 4 条的 prompt 污染尚未登记。J 轮表明"给 FilterKnowledge 更多上下文"不足以消除
+跨库 generic 的 harm，下一步若还走知识侧，对应的是阶段 8 的 `never`（86 实例尚未跑）。
 
 - [ ] **E 轮只有 86 个实例、+3 刚过噪声线，需要提高置信度**。最便宜的做法是同配置重复一次
       （约 4–5 小时），看 +3 是否稳定；或放到 test 全量 111 个上
