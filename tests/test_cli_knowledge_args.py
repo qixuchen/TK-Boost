@@ -63,6 +63,8 @@ class TestKnowledgeOptions:
             "tkstore_path": store_csv,
             "use_llm_filtering": True,
             "filter_model": "gpt-4.1",
+            "cross_db_generic": "never",
+            "context_filter": False,
         }
 
     def test_filtering_can_be_disabled(self, store_csv):

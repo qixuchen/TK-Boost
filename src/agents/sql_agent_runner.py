@@ -11,7 +11,7 @@ import time
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, FrozenSet, List, NamedTuple, Optional, Tuple
 import pandas as pd
 
 import litellm
@@ -72,11 +72,329 @@ def llm_completion(model: str, messages: list, **params):
 
 
 # ----------------- Tribal Knowledge Retrieval (Alg 4) -----------------
+CROSS_DB_GENERIC_MODES = ('always', 'never', 'known-db')
+
+
+class _StoreRuleIndex(NamedTuple):
+    """Which database each rule came from, and which databases have db-scoped rules.
+
+    `search_index_for_sql` reads every row's `db` but leaves it out of what it returns,
+    so the mapping has to be recovered from the store to filter on it.
+    """
+
+    db_of: Dict[str, str]
+    dbs_with_db_rules: FrozenSet[str]
+
+    def has_db_rules(self, db: Optional[str]) -> bool:
+        return (db or '').strip().lower() in self.dbs_with_db_rules
+
+
+def _store_rule_index(tkstore_path: str) -> _StoreRuleIndex:
+    """Read the store's scope and db columns. An unreadable store yields an empty index,
+    matching `_store_provenance`: a broken store must not lose the whole run."""
+    db_of: Dict[str, str] = {}
+    with_db_rules = set()
+    try:
+        text = Path(tkstore_path).read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return _StoreRuleIndex({}, frozenset())
+
+    for row in csv.DictReader(io.StringIO(text)):
+        mem_id = str(row.get('mem_id') or '').strip()
+        row_db = (row.get('db') or '').strip()
+        if mem_id:
+            db_of[mem_id] = row_db
+        if str(row.get('scope') or '').strip().lower() != 'generic':
+            with_db_rules.add(row_db.lower())
+    return _StoreRuleIndex(db_of, frozenset(with_db_rules))
+
+
+def _filter_cross_db_generic(candidates: List[dict], *, tkstore_path: str,
+                             db: Optional[str], mode: str) -> List[dict]:
+    """Drop generic rules mined from a database other than this one.
+
+    Round H localised the harm to the 34 instances whose database has no db-scoped rule,
+    which can therefore only receive generic rules mined elsewhere; three of the four
+    regressions read no rule from their own database. Retrieval permits this because
+    `scope == 'generic'` short-circuits the db check entirely, while every generic rule in
+    the store does carry a concrete database name.
+
+    `never` stops the crossing outright. `known-db` allows it only into a database the
+    store already has db-scoped rules for, which leaves the 52 instances that were not
+    harmed exactly as round H had them.
+
+    db-scoped rules pass through untouched: retrieval already required their db to match.
+    """
+    if mode == 'always' or not candidates:
+        return candidates
+
+    index = _store_rule_index(tkstore_path)
+    if mode == 'known-db' and index.has_db_rules(db):
+        return candidates
+
+    target = (db or '').strip().lower()
+    kept: List[dict] = []
+    for rule in candidates:
+        if str(rule.get('scope') or '').strip().lower() != 'generic':
+            kept.append(rule)
+            continue
+        mem_id = str(rule.get('mem_id'))
+        if mem_id not in index.db_of:
+            # Retrieval returned an id the store does not explain; dropping it silently
+            # would hide that disagreement, so keep it and let the report show it.
+            kept.append(rule)
+            continue
+        if index.db_of[mem_id].strip().lower() in ('all', target):
+            kept.append(rule)
+    return kept
+
+
+def _probe_exchanges(messages: List[dict]) -> List[Tuple[str, str]]:
+    """The agent's probing history as (probe SQL, result or error) pairs.
+
+    `run_agent` writes one assistant message per `<sql>` probe and appends the outcome as
+    the next user message, prefixed `SQL_RESULT_TABLE:` on success or `SQL_ERROR:` on
+    failure, so the pairing is positional. Measured on the 86 shared agent outputs: every
+    one yields at least one pair.
+
+    Only those pairs are returned. The agent's `<think>` messages and prose commentary are
+    its reasoning stream rather than checkable evidence, its system prompt and opening
+    question repeat what the caller already shows in its own sections, and its final
+    `<solution>` repeats the SQL that the caller shows split into fragments.
+    """
+    pairs: List[Tuple[str, str]] = []
+    for idx, message in enumerate(messages or []):
+        if message.get('role') != 'assistant':
+            continue
+        content = str(message.get('content') or '')
+        if '<solution>' in content.lower():
+            continue
+        blocks = re.findall(r"<sql>(.*?)</sql>", content, flags=re.DOTALL | re.IGNORECASE)
+        if not blocks:
+            continue
+        following = str(messages[idx + 1].get('content') or '') if idx + 1 < len(messages) else ''
+        if following.startswith(('SQL_RESULT_TABLE:', 'SQL_ERROR:')):
+            pairs.append((blocks[0].strip(), following.strip()))
+    return pairs
+
+
+def _agent_probe_exchanges(out_dir: Path) -> List[Tuple[str, str]]:
+    """`_probe_exchanges` for the instance being refined.
+
+    `_sync_instance_dirs` copies the whole instance directory into the arm, so the agent's
+    `messages.json` sits beside the SQL under refinement. A missing or unreadable history
+    yields no evidence rather than failing the instance.
+    """
+    try:
+        raw = (Path(out_dir) / 'messages.json').read_text(encoding='utf-8', errors='replace')
+        return _probe_exchanges(json.loads(raw))
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def _rules_for_context_filter(candidates: List[dict], *, tkstore_path: str,
+                              db: Optional[str]) -> List[dict]:
+    """Candidates with their source database filled in, rules for this database first.
+
+    `search_index_for_sql` reads every row's `db` but leaves it out of the dictionaries it
+    returns, so upstream's bucketing test `rule.get('db') == db` compares None against the
+    database name and never fires: measured on local330, all six candidates rendered as
+    `db=all` and no rule was ever promoted. `_store_rule_index` already reads that column
+    for stage 8, so the gap closes without touching `tkstore/tagger_index.py`.
+
+    Only the db-scoped/other split is introduced. Rules keep their incoming order within
+    each group, because reordering them among themselves would be a second unmeasured
+    change. A rule mined from this database but tagged generic stays in the second group:
+    it carries no schema anchor, so it has not earned the db-specific slot.
+    """
+    index = _store_rule_index(tkstore_path)
+    target = (db or '').strip().lower()
+
+    own, rest = [], []
+    for rule in candidates:
+        source = index.db_of.get(str(rule.get('mem_id')))
+        resolved = dict(rule)
+        resolved['db'] = source if source is not None else 'unknown'
+        is_own_db = (str(rule.get('scope') or '').strip().lower() == 'db'
+                     and source is not None
+                     and source.strip().lower() == target)
+        (own if is_own_db else rest).append(resolved)
+    return own + rest
+
+
+CONTEXT_FILTER_SELECTION_RULES = """CRITERIA FOR SELECTION:
+When in doubt, keep the rule. This step is retrieval, not adjudication: a rule that is
+offered but turns out not to apply costs the refiner one checked hypothesis, while a rule
+wrongly dropped here can never catch the error it was mined for. Keep any rule with a
+plausible connection to the current fragment, the user's question, or the contract between
+this fragment and its neighbours. Do NOT exclude a rule merely because the evidence
+available here is not sufficient to prove that it applies.
+
+Exclude a rule only when one of these is clearly true:
+1. The work the rule asks for is already done by an upstream or downstream fragment, and
+   what this fragment is responsible for has nothing to do with what the rule checks.
+2. The schema, or a result the agent already observed, directly contradicts the rule's
+   premise.
+3. The rule depends on a table, column, function or data shape that does not exist in this
+   database.
+4. The rule was mined from another database AND its applicability depends on that
+   database's own schema or business meaning, with nothing in the question, the schema,
+   the fragment, its neighbours or the observed evidence to support it here.
+
+Do not exclude a rule solely because it was mined from another database: carrying general
+lessons across databases is the point. Do not exclude a rule merely because this fragment
+does not currently do what the rule asks -- that may be the very error it catches."""
+
+
+def _context_filter_prompt(*, rules: List[dict], user_question: str, db: Optional[str],
+                           probe_exchanges: List[Tuple[str, str]], previous_ctes: str,
+                           current_sql: str, downstream: str, full_query: bool) -> str:
+    """The FilterKnowledge prompt, with the task context the upstream one lacks.
+
+    Upstream shows the fragment and the candidate rules and nothing else, so the model can
+    only judge surface resemblance. Sections absent from a given fragment are omitted
+    rather than emitted empty.
+    """
+    parts = [
+        "You are selecting which validation rules a SQL refiner should be given for one "
+        "fragment of a larger query.",
+        "[USER_QUESTION]\n" + (user_question or '').strip(),
+        "[DATABASE]\n" + (db or 'unknown'),
+    ]
+
+    if probe_exchanges:
+        rendered = "\n\n".join(
+            f"-- probe {n}\n{sql}\n{result}" for n, (sql, result) in enumerate(probe_exchanges, 1))
+        parts.append(
+            "[AGENT_PROBE_EVIDENCE]\nWhat the agent that wrote this query already ran "
+            "against the database, and what came back:\n\n" + rendered)
+
+    if (previous_ctes or '').strip():
+        parts.append("[PREVIOUS_CTES]\nDefined before the fragment below; treat them as "
+                     "existing views:\n\n" + previous_ctes.strip())
+
+    if full_query:
+        parts.append("[FULL_QUERY]\nThe whole query is under review at this stage:\n\n"
+                     + (current_sql or '').strip())
+    else:
+        parts.append("[CURRENT_CTE]\nThe single fragment the rules will be used to check:\n\n"
+                     + (current_sql or '').strip())
+        if (downstream or '').strip():
+            parts.append("[DOWNSTREAM]\nReads the fragment above and must keep working; "
+                         "rules demanding work that happens here are not finding a bug:\n\n"
+                         + downstream.strip())
+
+    lines = []
+    for position, rule in enumerate(rules, 1):
+        ops = rule.get('sql_operations') or []
+        ops_text = ', '.join(ops) if isinstance(ops, list) else str(ops)
+        lines.append(
+            f"[{position}] mem_id={rule.get('mem_id')} | scope={rule.get('scope')} | "
+            f"db={rule.get('db')} | operations={ops_text} | table={rule.get('table')} | "
+            f"column={rule.get('column')} | data_type={rule.get('data_type')} | "
+            f"nulls={rule.get('nulls')}\n"
+            f"Rule: {(rule.get('rule') or '').strip()[:500]}"
+        )
+    parts.append(
+        f"[CANDIDATE_RULES]\n{len(rules)} candidates. `db` is the database the rule was "
+        f"mined from; rules mined from {db or 'this database'} as database-specific are "
+        f"listed first.\n\n" + "\n\n".join(lines))
+
+    parts.append(CONTEXT_FILTER_SELECTION_RULES)
+    parts.append(
+        'OUTPUT FORMAT:\nReturn one JSON object and nothing else:\n'
+        '{\n    "selected_indices": [1, 3, 5],\n'
+        '    "reasoning": "one or two sentences, naming any rule you excluded and which '
+        'condition above it met"\n}\n'
+        'The indices are the bracketed numbers above, counting from 1.')
+    return "\n\n".join(parts)
+
+
+CONTEXT_FILTER_CHUNK_SIZE = 15
+
+
+class FragmentContext(NamedTuple):
+    """What one fragment's FilterKnowledge call is told beyond the fragment itself."""
+
+    user_question: str
+    probe_exchanges: List[Tuple[str, str]]
+    previous_ctes: str
+    downstream: str
+    full_query: bool
+
+
+class _ContextFilterResult(NamedTuple):
+    selected: List[dict]
+    reasoning: List[str]
+
+
+def _llm_filter_with_context(candidates: List[dict], *, tkstore_path: str,
+                             db: Optional[str], context: FragmentContext,
+                             model: str, current_sql: str) -> _ContextFilterResult:
+    """FilterKnowledge with the task context, replacing upstream's fragment-only version.
+
+    Kept at `CONTEXT_FILTER_CHUNK_SIZE` rules per call, as upstream is, so that fragments
+    with many candidates do not also change how the list is presented. The full context
+    goes into every chunk: measured on round H, 198 of 354 fragments carry more than 15
+    candidates, so omitting it from later chunks would leave most fragments filtered the
+    old way.
+
+    Failures keep every candidate of the affected chunk, which is upstream's behaviour --
+    a filter that cannot answer must not silently shrink the rule set -- but the reason is
+    recorded rather than only printed.
+    """
+    if not candidates:
+        return _ContextFilterResult([], [])
+
+    ordered = _rules_for_context_filter(candidates, tkstore_path=tkstore_path, db=db)
+    selected: List[dict] = []
+    reasoning: List[str] = []
+
+    for start in range(0, len(ordered), CONTEXT_FILTER_CHUNK_SIZE):
+        chunk = ordered[start:start + CONTEXT_FILTER_CHUNK_SIZE]
+        prompt = _context_filter_prompt(
+            rules=chunk,
+            user_question=context.user_question,
+            db=db,
+            probe_exchanges=context.probe_exchanges,
+            previous_ctes=context.previous_ctes,
+            current_sql=current_sql,
+            downstream=context.downstream,
+            full_query=context.full_query,
+        )
+        try:
+            resp = litellm.completion(model=_resolve_model(model), messages=[
+                {"role": "system", "content": "You are an expert SQL validation assistant "
+                                              "that selects relevant validation rules."},
+                {"role": "user", "content": prompt},
+            ])
+            content = (resp["choices"][0]["message"].get("content") or "").strip()
+            match = re.search(r"\{[\s\S]*\}", content)
+            if not match:
+                reasoning.append("no JSON object in the response; kept every candidate")
+                selected.extend(chunk)
+                continue
+            parsed = json.loads(match.group(0))
+            picked = parsed.get("selected_indices") or []
+            selected.extend(chunk[i - 1] for i in picked
+                            if isinstance(i, int) and 1 <= i <= len(chunk))
+            note = str(parsed.get("reasoning") or '').strip()
+            if note:
+                reasoning.append(note)
+        except Exception as e:
+            reasoning.append(f"FilterKnowledge failed, kept every candidate: {e}")
+            selected.extend(chunk)
+
+    return _ContextFilterResult(selected, reasoning)
+
+
 def _retrieve_rules_for(sql_text: str,
                         tkstore_path: str,
                         db: Optional[str],
                         use_llm_filtering: bool,
-                        filter_model: str) -> Tuple[List[dict], List[dict]]:
+                        filter_model: str,
+                        cross_db_generic: str = 'always',
+                        context: Optional[FragmentContext] = None) -> Tuple[List[dict], List[dict]]:
     """Retrieve rules for one SQL fragment, as (candidates, selected).
 
     `MemoryRetriever.retrieve` collapses the two stages into one return value; they
@@ -92,6 +410,10 @@ def _retrieve_rules_for(sql_text: str,
         generic_only=False,
         db=db,
     )
+    # Before FilterKnowledge, so the model is not asked about rules that are about to be
+    # discarded and the report's candidate list matches what was actually considered.
+    candidates = _filter_cross_db_generic(
+        candidates, tkstore_path=tkstore_path, db=db, mode=cross_db_generic)
     if use_llm_filtering and candidates:
         resolved = _resolve_model(filter_model)
         if _is_openai_provider() and resolved.startswith('azure/'):
@@ -99,6 +421,12 @@ def _retrieve_rules_for(sql_text: str,
                 f"filter_model {filter_model!r} has no OpenAI equivalent in "
                 f"AZURE_TO_OPENAI_MODEL; it would disable FilterKnowledge silently"
             )
+        if context is not None:
+            # Stage 9's own implementation. With no context the upstream function runs
+            # untouched, which is what makes round H reproducible by construction.
+            return candidates, _llm_filter_with_context(
+                candidates, tkstore_path=tkstore_path, db=db, context=context,
+                model=resolved, current_sql=sql_text).selected
         selected = _llm_filter_relevant_rules(sql_text, candidates, db=db, model=resolved)
         return candidates, selected
     return candidates, candidates
@@ -645,6 +973,8 @@ def perform_refinement_and_revision(inst: Instance,
                                     tkstore_path: Optional[str] = None,
                                     use_llm_filtering: bool = True,
                                     filter_model: str = 'gpt-4.1',
+                                    cross_db_generic: str = 'always',
+                                    context_filter: bool = False,
                                     refiner_turns: int = DEFAULT_REFINER_TURNS,
                                     refiner_min_probes: Optional[int] = None,
                                     adopt_refiner_sql: bool = False,
@@ -661,22 +991,41 @@ def perform_refinement_and_revision(inst: Instance,
     refiner_model = 'azure/gpt-4.1'
     retrievals: List[dict] = []
 
-    def retrieve_for(stage: str, name: str, sql_text: str) -> List[dict]:
+    # Read once per instance: the agent's probing history does not change during refinement.
+    probe_exchanges = _agent_probe_exchanges(out_dir) if context_filter else []
+
+    def retrieve_for(stage: str, name: str, sql_text: str,
+                     previous_ctes: str = '', downstream: str = '',
+                     full_query: bool = False) -> List[dict]:
         if not tkstore_path:
             return []
+        context = None
+        if context_filter:
+            context = FragmentContext(
+                user_question=inst.question,
+                probe_exchanges=probe_exchanges,
+                previous_ctes=previous_ctes,
+                downstream=downstream,
+                full_query=full_query,
+            )
         candidates, selected = _retrieve_rules_for(
             sql_text=sql_text,
             tkstore_path=tkstore_path,
             db=inst.db,
             use_llm_filtering=use_llm_filtering,
             filter_model=filter_model,
+            cross_db_generic=cross_db_generic,
+            context=context,
         )
+        chosen = {str(r.get('mem_id')) for r in selected}
         retrievals.append({
             'stage': stage,
             'name': name,
             'sql_sha1': hashlib.sha1(sql_text.encode('utf-8')).hexdigest(),
             'candidates': [str(r.get('mem_id')) for r in candidates],
             'selected': [str(r.get('mem_id')) for r in selected],
+            'excluded': [str(r.get('mem_id')) for r in candidates
+                         if str(r.get('mem_id')) not in chosen],
         })
         return selected
 
@@ -700,12 +1049,18 @@ def perform_refinement_and_revision(inst: Instance,
         # Only the runner can reassemble the query: `previous_ctes` is a display format
         # carrying one `WITH` per block. So the refiner is shown what reads its output and
         # handed a closure that judges a fix by the reassembled query.
-        downstream_text = None
-        validate_fix = None
-        if validate_fix_in_context:
+        # Two flags need this text and they are different experiments: stage 6 shows it to
+        # the refiner, stage 9 shows it to FilterKnowledge. Computed once, handed to the
+        # refiner only when stage 6's flag asks for it.
+        downstream_sql = ''
+        if validate_fix_in_context or context_filter:
             tail = [f"-- CTE: {x.get('name')}\nWITH {x.get('name')} AS (\n{x.get('body')}\n)"
                     for x in ctes[idx_cte + 1:]]
-            downstream_text = "\n\n".join(tail + [remainder_sql.strip()]).strip()
+            downstream_sql = "\n\n".join(tail + [remainder_sql.strip()]).strip()
+
+        downstream_text = downstream_sql if validate_fix_in_context else None
+        validate_fix = None
+        if validate_fix_in_context:
 
             def validate_fix(suggested: str, _idx=idx_cte, _body=cte_body) -> Optional[str]:
                 fixed, _ = parse_ctes_from_sql(suggested or '')
@@ -732,7 +1087,9 @@ def perform_refinement_and_revision(inst: Instance,
             db_id=inst.db,
             user_query=inst.question,
             cte_text=with_sql,
-            cte_goal=_goal_with_knowledge(goal, retrieve_for('cte', cte_name, with_sql)),
+            cte_goal=_goal_with_knowledge(goal, retrieve_for(
+                'cte', cte_name, with_sql,
+                previous_ctes=previous_ctes_text, downstream=downstream_sql)),
             previous_ctes=previous_ctes_text,
             predicted_ctes=predicted_cte_hint or None,
             model=refiner_model,
@@ -829,7 +1186,8 @@ def perform_refinement_and_revision(inst: Instance,
             cte_text=complete_query,
             cte_goal=_goal_with_knowledge(
                 f"Final SELECT using {len(ctes)} CTE(s)",
-                retrieve_for('final_select', '_final_select', complete_query),
+                retrieve_for('final_select', '_final_select', complete_query,
+                             previous_ctes=previous_ctes_text, full_query=True),
             ),
             previous_ctes=previous_ctes_text,
             predicted_ctes=predicted_cte_hint or None,
@@ -887,6 +1245,8 @@ def perform_refinement_and_revision(inst: Instance,
                 'n_ctes': len(ctes),
                 'filter_model': filter_model,
                 'use_llm_filtering': bool(use_llm_filtering),
+                'cross_db_generic': cross_db_generic,
+                'context_filter': bool(context_filter),
                 'adopt_refiner_sql': bool(adopt_refiner_sql),
                 'include_candidate_sql': bool(include_candidate_sql),
                 'validate_fix_in_context': bool(validate_fix_in_context),
@@ -1183,6 +1543,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tkstore", type=str, default=None, help="TK-Store CSV to retrieve rules from; requires --refine-cte or --refine-output")
     p.add_argument("--no-llm-filtering", action="store_true", help="Skip the FilterKnowledge LLM step of retrieval (ablation only)")
     p.add_argument("--filter-model", type=str, default="gpt-4.1", help="Model used for the FilterKnowledge step")
+    p.add_argument("--context-filter", action="store_true",
+                   help="Give FilterKnowledge the user question, the agent's probing "
+                        "evidence and the fragment's neighbours, instead of the fragment "
+                        "alone. Requires --tkstore")
+    p.add_argument("--cross-db-generic", choices=CROSS_DB_GENERIC_MODES, default="never",
+                   help="Whether a generic rule may be injected into a database it was not "
+                        "mined from. 'never' confines every rule to its own database; "
+                        "'always' is round H; 'known-db' allows the crossing only into a "
+                        "database the store already has db-scoped rules for. "
+                        "Requires --tkstore")
     p.add_argument("--out-base", default="outputs_cleaned", help="Base output directory")
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
     # TEMP EXPERIMENT: Add train context file
@@ -1401,6 +1771,11 @@ def _refiner_options(args) -> Dict[str, object]:
 
 def _knowledge_options(args) -> Dict[str, object]:
     """Knowledge kwargs for `perform_refinement_and_revision`, or {} when disabled."""
+    if args.context_filter and not args.tkstore:
+        raise ValueError(
+            "--context-filter requires --tkstore: FilterKnowledge only runs when there are "
+            "rules to filter, so without a store the flag would be a silent no-op"
+        )
     if not args.tkstore:
         return {}
     if not (args.refine_cte or args.refine_output):
@@ -1414,6 +1789,8 @@ def _knowledge_options(args) -> Dict[str, object]:
         'tkstore_path': args.tkstore,
         'use_llm_filtering': not args.no_llm_filtering,
         'filter_model': args.filter_model,
+        'cross_db_generic': args.cross_db_generic,
+        'context_filter': bool(args.context_filter),
     }
 
 
