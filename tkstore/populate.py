@@ -122,6 +122,8 @@ def populate_from_output_dir(
     engine = engine or infer_engine(instance_id)
     record = _load_instance_record(jsonl_path, instance_id)
     db_name = db_name or record.get("db")
+    if not db_path_or_cred:
+        db_path_or_cred = resolve_sqlite_db_path(instance_id, db_name)
 
     result: Dict[str, Any] = {
         "instance_id": instance_id,
@@ -298,7 +300,6 @@ def populate_split(
                 gold_sql_dir=gold_sql_dir,
                 gold_dir=gold_dir,
                 store=str(store_path),
-                db_path_or_cred=resolve_sqlite_db_path(instance_id),
                 model=model,
                 verbose=verbose,
             )

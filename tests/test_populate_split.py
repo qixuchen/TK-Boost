@@ -107,6 +107,29 @@ def test_rebuilds_the_store_before_populating(tmp_path, stub_single):
     assert stub_single[0]["output_dir"].endswith("local900_20260911_120000")
 
 
+def test_populate_split_does_not_pre_resolve_the_sqlite_path(tmp_path, stub_single, monkeypatch):
+    """Path resolution belongs in populate_from_output_dir, which has the db name."""
+    outputs = tmp_path / "outputs" / "train"
+    _write_output(outputs, "minidev0000")
+    split = _write_split(tmp_path / "train.txt", ["minidev0000"])
+    store = tmp_path / "artifacts" / "tkstore_bird.csv"
+    monkeypatch.setattr(
+        "tkstore.populate.resolve_sqlite_db_path",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("populate_split must not resolve the db path")
+        ),
+    )
+
+    populate_split(
+        outputs_base=str(outputs),
+        split_file=str(split),
+        jsonl_path=str(tmp_path / "unused.jsonl"),
+        store=str(store),
+    )
+
+    assert stub_single[0].get("db_path_or_cred") is None
+
+
 def test_records_train_ids_that_have_no_output_yet(tmp_path, stub_single):
     outputs = tmp_path / "outputs" / "train"
     _write_output(outputs, "local900")

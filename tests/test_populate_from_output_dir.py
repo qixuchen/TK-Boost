@@ -323,3 +323,61 @@ def test_failed_agent_sql_reports_the_real_database_error(tmp_path, gold_dir, js
     agent_result = llm_calls["diff"][0]["agent_result_csv_text"]
     assert agent_result.startswith("SQL_ERROR:")
     assert "missing_col" in agent_result
+
+
+def test_omitted_db_path_is_resolved_with_the_record_db(tmp_path, llm_calls, monkeypatch):
+    """BIRD minidev paths need db_id; populate_split used to call resolve with id only."""
+    iid = "minidev0000"
+    gold = tmp_path / "gold"
+    (gold / "exec_result").mkdir(parents=True)
+    (gold / "sql").mkdir()
+    pd.DataFrame(GOLD_ROWS).to_csv(gold / "exec_result" / f"{iid}.csv", index=False)
+    (gold / "sql" / f"{iid}.sql").write_text("SELECT 1;", encoding="utf-8")
+    (gold / "spider2lite_eval.jsonl").write_text(
+        json.dumps({"instance_id": iid, "condition_cols": [], "ignore_order": True})
+        + "\n",
+        encoding="utf-8",
+    )
+    jsonl = tmp_path / "bird_minidev.jsonl"
+    jsonl.write_text(
+        json.dumps(
+            {
+                "instance_id": iid,
+                "db": "financial",
+                "question": "how many?",
+                "external_knowledge": "Count rows.",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "outputs" / f"{iid}_20260924_103622"
+    out.mkdir(parents=True)
+    (out / "execution_query.sql").write_text("SELECT 2;", encoding="utf-8")
+    pd.DataFrame({"name": ["a", "b"], "n": [1, 99]}).to_csv(
+        out / "execution_result.csv", index=False
+    )
+    pd.DataFrame(GOLD_ROWS).to_csv(out / "gt_result.csv", index=False)
+    (out / "processed_trace.txt").write_text("TRACE", encoding="utf-8")
+    (out / "messages.json").write_text("[]", encoding="utf-8")
+
+    seen = []
+
+    def fake_resolve(instance_id, db_id=None):
+        seen.append((instance_id, db_id))
+        return "/tmp/financial.sqlite"
+
+    monkeypatch.setattr("tkstore.populate.resolve_sqlite_db_path", fake_resolve)
+
+    result = populate_from_output_dir(
+        output_dir=str(out),
+        jsonl_path=str(jsonl),
+        gold_dir=str(gold),
+        gold_sql_dir=str(gold / "sql"),
+        store=str(tmp_path / "artifacts" / "tkstore_bird.csv"),
+        verbose=False,
+    )
+
+    assert seen == [(iid, "financial")]
+    assert result["db"] == "financial"
+    assert result["skipped"] is None
