@@ -40,6 +40,7 @@ from src.agents.cte_refiner import run_refiner as refiner_run, DEFAULT_MIN_PROBE
 # uses 5. Both are reproducible via --refiner-turns, so the default must not drift.
 DEFAULT_REFINER_TURNS = 25
 from src.agents.prompts import BASE_PROMPT, SNOWFLAKE_PROMPT
+from src.utils.bird import load_minidev_records
 from src.utils.db_paths import resolve_sqlite_db_path
 from src.utils.splits import load_split
 from src.utils.auth import configure_llm_env, USE_OPENAI
@@ -732,7 +733,10 @@ def generate_processed_trace(messages: List[dict]) -> str:
 
 
 # ----------------- Ground Truth Loading -----------------
-def load_ground_truth(instance_id: str) -> Tuple[Optional[str], Optional[List[Tuple]], Optional[List[List[str]]]]:
+def load_ground_truth(
+    instance_id: str,
+    gold_dir: Path = Path("evaluation/gold"),
+) -> Tuple[Optional[str], Optional[List[Tuple]], Optional[List[List[str]]]]:
     """Load ground truth SQL query, result, and column names for the given instance_id.
     
     Returns:
@@ -742,14 +746,15 @@ def load_ground_truth(instance_id: str) -> Tuple[Optional[str], Optional[List[Tu
     """
     # Try to load SQL query
     gt_query = None
-    sql_file_path = Path(f"evaluation/gold/sql/{instance_id}.sql")
+    gold_dir = Path(gold_dir)
+    sql_file_path = gold_dir / "sql" / f"{instance_id}.sql"
     if sql_file_path.exists():
         gt_query = sql_file_path.read_text().strip()
     
     # Try to load result from CSV - check all possible variants
     gt_result = None
     all_col_names = []
-    base_csv_path = Path(f"evaluation/gold/exec_result/{instance_id}.csv")
+    base_csv_path = gold_dir / "exec_result" / f"{instance_id}.csv"
     
     # Try base path first, then _a, _b, _c, etc. suffixes
     gt_csv_candidates = [base_csv_path]
@@ -769,6 +774,27 @@ def load_ground_truth(instance_id: str) -> Tuple[Optional[str], Optional[List[Tu
                 print(f"⚠️  Warning: Could not load GT result from {csv_path}: {e}")
     
     return gt_query, gt_result, all_col_names
+
+
+def expected_output_format_for_instance(
+    instance_id: str, all_col_names: Optional[List[List[str]]]
+) -> Optional[str]:
+    """Build Spider2's column hint; BIRD intentionally receives no gold columns."""
+    if instance_id.lower().startswith("minidev") or not all_col_names:
+        return None
+    if len(all_col_names) == 1:
+        return (
+            f"Expected Output Format: columns={all_col_names[0]} "
+            "(use this exact order)."
+        )
+    variants_str = "\n".join(
+        f"  Option {i + 1}: {cols}" for i, cols in enumerate(all_col_names)
+    )
+    return (
+        "Expected Output Format (multiple valid options):\n"
+        f"{variants_str}\n"
+        "(Choose one option and use that exact column order)."
+    )
 
 
 # Predicted loader functions, formatting helpers etc. moved to src/utils/agent_utils
@@ -1279,6 +1305,67 @@ def load_instances_from_jsonl(jsonl_path: str) -> List[Instance]:
     return instances
 
 
+def load_instances_from_bird_json(json_path: str) -> List[Instance]:
+    """Load BIRD's JSON array using the same deduplication and ids as its splits."""
+    configure_llm_env()
+    return [
+        Instance(
+            instance_id=record["instance_id"],
+            db=record["db_id"],
+            question=record["question"],
+            external_knowledge=(record.get("evidence") or "").strip() or None,
+        )
+        for record in load_minidev_records(Path(json_path))
+    ]
+
+
+def load_instances(args) -> List[Instance]:
+    """Load the selected benchmark while preserving Spider2's default source."""
+    if args.bird_json:
+        return load_instances_from_bird_json(args.bird_json)
+    return load_instances_from_jsonl(args.jsonl_path)
+
+
+def _gold_dir_for_args(args) -> Path:
+    if args.gold_dir:
+        return Path(args.gold_dir)
+    if args.bird_json:
+        return Path("evaluation/gold_bird")
+    return Path("evaluation/gold")
+
+
+def _dry_run_instances(args, instances: List[Instance]) -> int:
+    """Validate local inputs without creating outputs or calling an LLM."""
+    gold_dir = _gold_dir_for_args(args)
+    failed = 0
+    for inst in instances:
+        evidence = load_external_knowledge(inst.instance_id, inst.external_knowledge)
+        engine = infer_engine(inst.instance_id)
+        db_path = (
+            resolve_sqlite_db_path(inst.instance_id, inst.db)
+            if engine == "sqlite"
+            else None
+        )
+        gt_query, _gt_result, all_col_names = load_ground_truth(
+            inst.instance_id, gold_dir=gold_dir
+        )
+        gold_csv_ok = bool(all_col_names)
+        db_ok = engine != "sqlite" or bool(db_path)
+        hint = expected_output_format_for_instance(
+            inst.instance_id, all_col_names
+        )
+        print(
+            f"{inst.instance_id} db={inst.db} engine={engine} "
+            f"evidence_chars={len(evidence or '')} db_path={db_path} "
+            f"gold_sql_ok={bool(gt_query)} gold_csv_ok={gold_csv_ok} "
+            f"expected_output_format={hint!r}"
+        )
+        if not db_ok or not gt_query or not gold_csv_ok:
+            failed += 1
+    print(f"dry-run: checked={len(instances)} failed={failed}")
+    return failed
+
+
 def run_refinement_on_existing_outputs(args) -> int:
     """Run refinement on existing output directories, loading execution_query.sql instead of regenerating.
 
@@ -1327,8 +1414,8 @@ def run_refinement_on_existing_outputs(args) -> int:
     print(f"🔍 Running refinement with refiner_turns={args.refiner_turns}, "
           f"verdict_attempts={args.verdict_attempts}")
     
-    # Load instances from JSONL to get metadata
-    all_instances_list = load_instances_from_jsonl(args.jsonl_path)
+    # Load instances from the same benchmark source used for the agent run.
+    all_instances_list = load_instances(args)
     instances_by_id = {inst.instance_id: inst for inst in all_instances_list}
     
     # Load predicted hints
@@ -1389,7 +1476,7 @@ def run_refinement_on_existing_outputs(args) -> int:
         print(f"📝 Loaded existing SQL ({len(existing_sql)} chars)")
         
         # Copy GT SQL if it exists
-        gt_sql_path = Path(f"evaluation/gold/sql/{instance_id}.sql")
+        gt_sql_path = _gold_dir_for_args(args) / "sql" / f"{instance_id}.sql"
         if gt_sql_path.exists() and not (inst_dir / f"{instance_id}.sql").exists():
             shutil.copy(gt_sql_path, inst_dir / f"{instance_id}.sql")
             print(f"📄 Copied GT SQL")
@@ -1531,7 +1618,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--split", type=str, default=None, help="Split file listing the instance IDs to run")
     p.add_argument("--split-offset", type=int, default=0, help="Skip this many IDs of --split, for batching")
     p.add_argument("--split-limit", type=int, default=None, help="Run at most this many IDs of --split, for batching")
-    p.add_argument("--jsonl-path", default="data/spider2-lite.jsonl", help="JSONL path with instances")
+    source = p.add_mutually_exclusive_group()
+    source.add_argument(
+        "--jsonl-path",
+        default="data/spider2-lite.jsonl",
+        help="Spider2 JSONL path with instances",
+    )
+    source.add_argument(
+        "--bird-json",
+        default=None,
+        help="BIRD mini-dev JSON-array path; uses inline evidence",
+    )
+    p.add_argument(
+        "--gold-dir",
+        default=None,
+        help="Gold root containing sql/ and exec_result/ (benchmark-specific default)",
+    )
     # Engine and credential inference from instance_id; no explicit args required
     p.add_argument("--model", default="azure/gpt-4.1", help="LLM model")
     p.add_argument("-c", "--predicted-cte-briefs-csv", default=None, help="CSV path for predicted CTE briefs")
@@ -1554,6 +1656,11 @@ def _build_parser() -> argparse.ArgumentParser:
                         "database the store already has db-scoped rules for. "
                         "Requires --tkstore")
     p.add_argument("--out-base", default="outputs_cleaned", help="Base output directory")
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate selected instances, evidence, DB paths, and gold without an LLM",
+    )
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
     # TEMP EXPERIMENT: Add train context file
     p.add_argument("--train-context-file", type=str, default=None, help="[TEMP EXPERIMENT] Path to file with train SQL examples to prepend to system prompt")
@@ -1814,7 +1921,7 @@ def main():
     except (ValueError, FileNotFoundError) as e:
         p.error(str(e))
 
-    all_instances = load_instances_from_jsonl(args.jsonl_path)
+    all_instances = load_instances(args)
     instances: List[Instance] = []
     if requested_ids is None:
         instances = all_instances
@@ -1824,6 +1931,11 @@ def main():
         missing = [i for i in requested_ids if i not in by_id]
         if missing:
             print(f"⚠️  Missing instances in JSONL: {missing}")
+
+    if args.dry_run:
+        if _dry_run_instances(args, instances):
+            sys.exit(1)
+        return
 
     # Load predicted hints
     cte_map = load_predicted_cte_briefs(args.predicted_cte_briefs_csv) if args.predicted_cte_briefs_csv else {}
@@ -1877,7 +1989,10 @@ def main():
             if schema_context:
                 print(f"📋 Schema context loaded for {inst.db}")
         if external_knowledge:
-            print(f"📄 External knowledge loaded from {inst.external_knowledge}")
+            if inst.instance_id.lower().startswith("minidev"):
+                print(f"📄 Inline evidence loaded ({len(external_knowledge)} chars)")
+            else:
+                print(f"📄 External knowledge loaded from {inst.external_knowledge}")
 
         # Infer engine and resolve DB path for SQLite
         engine = infer_engine(inst.instance_id)
@@ -1889,20 +2004,18 @@ def main():
                 continue
 
         # Load ground truth
-        gt_query, gt_result, all_col_names = load_ground_truth(inst.instance_id)
+        gold_dir = _gold_dir_for_args(args)
+        gt_query, gt_result, all_col_names = load_ground_truth(
+            inst.instance_id, gold_dir=gold_dir
+        )
         
         # Derive expected output format from GT CSV column names
         # If multiple variants exist (_a, _b, etc.), provide all as options
-        expected_output_format = None
-        if all_col_names:
-            if len(all_col_names) == 1:
-                expected_output_format = f"Expected Output Format: columns={all_col_names[0]} (use this exact order)."
-            else:
-                # Multiple valid output formats
-                variants_str = "\n".join([f"  Option {i+1}: {cols}" for i, cols in enumerate(all_col_names)])
-                expected_output_format = f"Expected Output Format (multiple valid options):\n{variants_str}\n(Choose one option and use that exact column order)."
-            if args.verbose:
-                print(f"\n🧾 {expected_output_format}")
+        expected_output_format = expected_output_format_for_instance(
+            inst.instance_id, all_col_names
+        )
+        if expected_output_format and args.verbose:
+            print(f"\n🧾 {expected_output_format}")
         
         # Run agent
         final_sql, headers, rows, messages, executor = run_agent(
@@ -1934,7 +2047,7 @@ def main():
             (out_dir / "gt_query.sql").write_text(gt_query, encoding="utf-8")
         
         # Also copy GT SQL from evaluation/gold/sql if it exists
-        gt_sql_path = Path(f"evaluation/gold/sql/{inst.instance_id}.sql")
+        gt_sql_path = gold_dir / "sql" / f"{inst.instance_id}.sql"
         if gt_sql_path.exists():
             shutil.copy(gt_sql_path, out_dir / f"{inst.instance_id}.sql")
         

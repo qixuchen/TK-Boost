@@ -429,7 +429,9 @@ class TestExitCode:
         monkeypatch.setattr(runner, "get_system_prompt", lambda *_a, **_k: "sys")
         monkeypatch.setattr(runner, "build_user_message", lambda *_a, **_k: "user")
         monkeypatch.setattr(runner, "load_external_knowledge", lambda *_a, **_k: None)
-        monkeypatch.setattr(runner, "load_ground_truth", lambda _i: (None, None, None))
+        monkeypatch.setattr(
+            runner, "load_ground_truth", lambda _i, **_kwargs: (None, None, None)
+        )
         monkeypatch.setattr(runner, "generate_processed_trace", lambda _m: "")
         monkeypatch.setattr(runner, "write_csv", lambda *_a, **_k: None)
 

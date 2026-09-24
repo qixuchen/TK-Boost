@@ -85,7 +85,11 @@ def load_external_knowledge(instance_id: str, external_knowledge_file: Optional[
     ext_file = external_knowledge_file.strip()
     if not ext_file:
         return None
-    
+
+    # BIRD stores evidence text inline in its JSON. Spider2 stores only a filename.
+    if instance_id.lower().startswith("minidev"):
+        return ext_file
+
     # External knowledge files are in data/spider2/{instance_id}/{filename}
     ext_path = Path("data/spider2") / instance_id / ext_file
     if ext_path.exists():
