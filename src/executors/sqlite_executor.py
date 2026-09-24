@@ -6,8 +6,9 @@ from .base import Executor
 
 
 class SQLiteExecutor(Executor):
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, timeout_seconds: float = 120.0):
         self.db_path = db_path
+        self.timeout_seconds = timeout_seconds
 
     def execute(self, sql: str) -> Tuple[Optional[List[str]], List[Tuple]]:
         conn = sqlite3.connect(self.db_path)
@@ -17,7 +18,7 @@ class SQLiteExecutor(Executor):
             timeout_occurred.set()
             conn.interrupt()
         
-        timer = threading.Timer(120.0, timeout_handler)
+        timer = threading.Timer(self.timeout_seconds, timeout_handler)
         timer.start()
         
         try:
@@ -28,13 +29,17 @@ class SQLiteExecutor(Executor):
             timer.cancel()
             
             if timeout_occurred.is_set():
-                raise TimeoutError("SQL query execution exceeded 120 seconds")
-            
+                raise TimeoutError(
+                    f"SQL query execution exceeded {self.timeout_seconds} seconds"
+                )
+
             return headers, rows
         except sqlite3.OperationalError as e:
             timer.cancel()
             if timeout_occurred.is_set():
-                raise TimeoutError("SQL query execution exceeded 120 seconds") from e
+                raise TimeoutError(
+                    f"SQL query execution exceeded {self.timeout_seconds} seconds"
+                ) from e
             raise
         finally:
             timer.cancel()
