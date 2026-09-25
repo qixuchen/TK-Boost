@@ -347,12 +347,12 @@ ul.rules.dbscope .scope { color: var(--amber); }
         <th style="text-align:center">&Delta; knowledge</th><th style="text-align:center">Fixed</th><th style="text-align:center">Harmed</th>
       </tr>
       <tr>
-        <td><b>Agent provided by paper repo</b><br/><span style="color:var(--slate)">adopts the refiner's SQL directly</span></td>
+        <td><b>Agent provided by paper repo</b><br/></td>
         <td class="num-cell">34/86</td><td class="num-cell">37/86</td>
         <td class="delta pos">+3</td><td class="num-cell">4</td><td class="num-cell">1</td>
       </tr>
       <tr>
-        <td><b>A stronger agent from me</b><br/><span style="color:var(--slate)">by providing context to the refiner</span></td>
+        <td><b>A stronger agent from me</b><br/></td>
         <td class="num-cell">36/86</td><td class="num-cell">35/86</td>
         <td class="delta neg">&minus;1</td><td class="num-cell">3</td><td class="num-cell">4</td>
       </tr>
@@ -409,47 +409,62 @@ ul.rules.dbscope .scope { color: var(--amber); }
   <div class="hdr"><span class="tag">Results</span><span class="num">8 / 10</span></div>
   <h2>MAGIC on BIRD Mini-Dev: does the guideline help?</h2>
   <div class="body">
-    <p class="lead">MAGIC generate a guideline from failed training sql repairment. The guideline is used to correct test sqls.</p>
-    <div class="grid3" style="flex:0 0 auto">
-      <div class="card">
-        <div class="ctitle"><span class="dot slate"></span>Initial SQL (CodeS)</div>
-        <p style="font-size:52px; font-weight:700; color:var(--navy); line-height:1.1;">147<span style="font-size:30px; color:var(--slate); font-weight:600;"> / 270</span></p>
-        <p style="color:var(--slate);">54.4%</p>
-      </div>
-      <div class="card">
-        <div class="ctitle"><span class="dot emerald"></span>Correction w. guideline (GPT-5)</div>
-        <p style="font-size:52px; font-weight:700; color:var(--emerald); line-height:1.1;">230<span style="font-size:30px; color:var(--slate); font-weight:600;"> / 270</span></p>
-        <p style="color:var(--slate);">85.2%</p>
-      </div>
-      <div class="card">
-        <div class="ctitle"><span class="dot"></span>Correction w/o. guideline (GPT-5)</div>
-        <p style="font-size:52px; font-weight:700; color:var(--navy); line-height:1.1;">227<span style="font-size:30px; color:var(--slate); font-weight:600;"> / 270</span></p>
-        <p style="color:var(--slate);">84.1%</p>
-      </div>
-    </div>
+    <p class="lead">MAGIC generate a guideline from failed training sql repairment. The guideline is used to correct test sqls. Both correctors start from the same initial SQL (CodeS): <b>147 / 270 &middot; 54.4%</b>.</p>
     <table class="cmp">
       <tr>
-        <th>What changes</th>
+        <th>Corrector</th>
+        <th>Setting</th>
+        <th style="text-align:center">EX</th>
         <th style="text-align:center">Net EX</th>
         <th style="text-align:center">Fixed</th>
         <th style="text-align:center">Harmed</th>
-        <th>Reading</th>
       </tr>
       <tr>
-        <td><b>Initial → correct + guideline</b></td>
+        <td rowspan="3"><b>Qwen3.7-Plus</b></td>
+        <td>Correction w. guideline</td>
+        <td class="num-cell">211 / 270 &middot; 78.1%</td>
+        <td class="delta pos">+64</td>
+        <td class="num-cell">67</td>
+        <td class="num-cell">3</td>
+      </tr>
+      <tr>
+        <td>Correction w/o. guideline</td>
+        <td class="num-cell">203 / 270 &middot; 75.2%</td>
+        <td class="delta pos">+56</td>
+        <td class="num-cell">58</td>
+        <td class="num-cell">2</td>
+      </tr>
+      <tr>
+        <td>Guideline only (w/o. &rarr; w.)</td>
+        <td class="num-cell">&mdash;</td>
+        <td class="delta pos">+8</td>
+        <td class="num-cell">18</td>
+        <td class="num-cell">10</td>
+      </tr>
+      <tr>
+        <td rowspan="3" style="border-top:3px solid var(--border)"><b>GPT-5</b></td>
+        <td>Correction w. guideline</td>
+        <td class="num-cell">230 / 270 &middot; 85.2%</td>
         <td class="delta pos">+83</td>
         <td class="num-cell">92</td>
         <td class="num-cell">9</td>
-        <td>Correction with guideline improves SQL EX a lot, but...</td>
       </tr>
       <tr>
-        <td><b>No guideline → with guideline</b></td>
+        <td style="border-top:3px solid var(--border)">Correction w/o. guideline</td>
+        <td class="num-cell" style="border-top:3px solid var(--border)">227 / 270 &middot; 84.1%</td>
+        <td class="delta pos" style="border-top:3px solid var(--border)">+80</td>
+        <td class="num-cell" style="border-top:3px solid var(--border)">86</td>
+        <td class="num-cell" style="border-top:3px solid var(--border)">6</td>
+      </tr>
+      <tr>
+        <td>Guideline only (w/o. &rarr; w.)</td>
+        <td class="num-cell">&mdash;</td>
         <td class="delta pos">+3</td>
         <td class="num-cell">13</td>
         <td class="num-cell">10</td>
-        <td>The major gain comes from the correction itself.</td>
       </tr>
     </table>
+    <p class="lead">Most of the jump comes from running a corrector at all. The guideline adds <b>+8</b> on the weaker corrector and only <b>+3</b> on GPT-5, where it harms almost as many queries as it fixes.</p>
   </div>
   <div class="footer"><span>8 / 10</span><span class="cite">BIRD Mini-Dev · 270 scored of 271 · numbers from SynQo run-correct</span></div>
 </section></div></div>
