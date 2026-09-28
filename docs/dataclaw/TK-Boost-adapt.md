@@ -4,8 +4,9 @@
 DataClaw 的具体方案。它细化 [`dataclaw.md`](./dataclaw.md) 的 5.3、5.4 节；DataClaw 的环境、
 runner、评测设计、与 `~/baseline` 的关系仍以 `dataclaw.md` 为准。
 
-状态：**设计阶段，未实现。** 开发集已拷贝到 `data/dataclaw_dev/`（第 9.2 节）。三份 prompt 的
-最终文本尚未定稿，文中的 prompt 是草稿，需要逐条确认（见第 10 节）。开发顺序见第 9 节。
+状态：**阶段 A 实现中**（代码在 `tkstore/dataclaw/`）。开发集已拷贝到 `data/dataclaw_dev/`
+（第 9.2 节）。三份 prompt 的最终文本尚未定稿，文中的 prompt 是草稿，需要逐条确认（见第 10 节）。
+开发顺序见第 9 节。
 
 ---
 
@@ -188,8 +189,13 @@ KIND: data | non_data | gold_suspect
      （`NUMERIC_REL_TOL = 0.01`），与 process 评分口径一致；
    - 列表：规整后按集合比较；
    - 字典：逐 key 比较，例如 `task_054` 的「行业 → 企业数」映射。
+   - 字符串：规整空白与大小写后相等即一致；否则交给反思 agent 做**语义判断**。gold 字符串是英文
+     （`Guangdong Province`），数据是中文（`广东省`），中英对照 JSON 只覆盖公司名与政策名（开发集
+     36 个字符串 milestone 只查到 4 个），逐字比较不可行。反思 prompt 写明：字符串不要求逐字一致，
+     但语义须几乎完全一致，并要求写出判断。harness 仍校验所引原值确实出现在所引 probe 的输出里。
 
-   只有 harness 判定一致，该 divergence 才算已验证；agent 的自述不算数。
+   数值、列表中的数值元素、字典中的数值由 harness 判定，agent 的自述不算数；只有字符串部分采纳反思
+   agent 的语义判断。
 4. **按类型过滤。** `KIND: non_data`（算术失误、输出格式、提前放弃等）与 `KIND: gold_suspect`（gold
    本身可疑，例如 `task_054` 题面要求答 yes/no、gold 却是 `416`）不进第二阶段，只写日志。`KIND` 由
    反思 agent 自标，但标为 `data` 的必须同时通过闸门 1–3，把非数据错误冒充为数据错误过不了关。
@@ -274,6 +280,9 @@ EXAMPLE_USAGE: 例如净利润额的单位是十万元、总资产金额是元�
 
 1. **正文不含单元格值。** 从数据里取所有列的取值集合，检查 `ENSURE`、`WHEN_TO_CHECK`、`CONTEXT`
    是否出现其中任一取值；只匹配长度至少 3 个字符的值，避免「中国」「元」这类短值在正常叙述里误报。
+   **纯数字也算取值**（例如年份 `2022`），正文出现即打回，年份、阈值只能写在 `EXAMPLE_USAGE`。
+   与文件名、列名相同的取值不算违规。取值集合只收 3–40 个字符的值：实测 19 个文件共 223 万个
+   不同取值（非纯数字 14.3 万个），全量扫描约 17 秒，建好后缓存。
 2. **文件名与列名真实存在。**
 3. 不合规的规则打回重写，最多两次；仍不合规则丢弃。
 
@@ -503,13 +512,15 @@ data/dataclaw_dev/
 | 17 | 开发顺序 | 先在历史轨迹开发集上开发阶段 A–D，产物合理后再定 split、跑全量 train 与全量 populate |
 | 18 | 开发集 | 归档中 33 个判错的裸 glm-5.2 run（27 道题），拷贝到 `data/dataclaw_dev/runs/`（git 忽略），`manifest.csv` 提交 |
 | 19 | 开发集与 split | 互不约束；正式实验重新跑 train 并重新 populate，开发期规则不进入最终 store |
+| 20 | 字符串 milestone | 规整后相等即一致，否则由反思 agent 做语义判断（prompt 提示「不要求逐字一致，但语义须几乎完全一致」）；数值部分仍由 harness 判定 |
+| 21 | 正文取值检查 | 纯数字也算单元格取值；与文件名、列名相同的取值除外 |
+| 22 | 代码位置 | `tkstore/dataclaw/` 子包，测试为 `tests/test_dataclaw_*.py` |
 
 ### 待定
 
 - 三份 prompt（反思、规则生成、合并）的最终文本（第 5.3、6.2 节为草稿；合并 prompt 尚未起草），
   **必须逐条确认**；
 - train 占 492 道题的比例；
-- populate 代码在 TK-Boost 仓库中的位置（例如新建 `tkstore/dataclaw/` 子包）；
 - 反思 agent 的轮数预算与每次 probe 输出的截断长度；
 - 反思 agent、规则生成、合并三处使用的模型；
 - 轨迹压缩的具体方式（保留哪些工具输出、截断到多长）；
