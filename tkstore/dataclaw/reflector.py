@@ -7,6 +7,7 @@ gates can be tested with a scripted model; ``litellm_llm`` is the real one.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from string import Template
@@ -22,6 +23,11 @@ from .trajectory import compress
 LLM = Callable[[list[dict[str, str]]], str]
 PROMPT_PATH = Path(__file__).with_name("prompts") / "reflector.md"
 EXTRA_TURNS = 3
+EMPTY_REPLY_NUDGE = (
+    "EMPTY REPLY: your previous reply was cut off before any text. Do not deliberate at length; "
+    "reply now with one short PLAN and one <probe>, or with your <final>."
+)
+TIME_BUDGET_NOTE = "TIME BUDGET: this reflection has used up its time budget; send your <final> now."
 
 
 @dataclass
@@ -30,6 +36,8 @@ class ReflectorConfig:
     max_finals: int = 3
     max_output_chars: int = 2000
     max_thinking_chars: int = 5000
+    max_consecutive_empty: int = 2
+    run_time_budget_s: float | None = None
 
     @property
     def max_turns(self) -> int:
@@ -47,14 +55,64 @@ class ReflectionResult:
     probes_used: int = 0
     finals: int = 0
     stop_reason: str = ""
+    error: str = ""
+    llm_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
-def litellm_llm(model: str) -> LLM:
+@dataclass
+class LLMReply:
+    text: str
+    finish_reason: str | None = None
+    timed_out: bool = False
+    elapsed_s: float = 0.0
+
+
+def litellm_llm(
+    model: str,
+    *,
+    max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+    disable_thinking: bool = False,
+    call_timeout_s: float | None = None,
+    clock: Callable[[], float] | None = None,
+) -> LLM:
+    """Streaming completion; the gateway drops non-streaming requests idle for ~3 minutes.
+
+    Reasoning controls go through ``extra_body`` so LiteLLM passes them to the
+    OpenAI-compatible gateway unchecked. ``call_timeout_s`` is enforced here
+    because HTTP timeouts only cover the gap between chunks, and a model that
+    keeps reasoning keeps sending chunks.
+    """
     import litellm
 
-    def call(messages: list[dict[str, str]]) -> str:
-        response = litellm.completion(model=model, messages=messages)
-        return response.choices[0].message.content or ""
+    tick = clock or time.monotonic
+    options: dict[str, Any] = {}
+    if max_tokens is not None:
+        options["max_tokens"] = max_tokens
+    extra: dict[str, Any] = {}
+    if reasoning_effort:
+        extra["reasoning_effort"] = reasoning_effort
+    if disable_thinking:
+        extra["thinking"] = {"type": "disabled"}
+    if extra:
+        options["extra_body"] = extra
+
+    def call(messages: list[dict[str, str]]) -> LLMReply:
+        start = tick()
+        stream = litellm.completion(model=model, messages=messages, stream=True, **options)
+        parts: list[str] = []
+        finish = None
+        for chunk in stream:
+            choice = chunk.choices[0]
+            parts.append(choice.delta.content or "")
+            finish = getattr(choice, "finish_reason", None) or finish
+            now = tick()
+            if call_timeout_s is not None and now - start > call_timeout_s:
+                close = getattr(stream, "close", None)
+                if close:
+                    close()
+                return LLMReply("".join(parts), "timeout", True, now - start)
+        return LLMReply("".join(parts), finish, False, tick() - start)
 
     return call
 
@@ -129,6 +187,50 @@ def _identity(result: GateResult) -> tuple:
     return (d.fact.strip(), tuple(d.tables), tuple(d.columns))
 
 
+def _handle_turn(
+    text: str,
+    result: ReflectionResult,
+    *,
+    session: ProbeSession,
+    catalog: Catalog,
+    config: ReflectorConfig,
+    milestones: dict[str, Any],
+    missed: set[str],
+    seen: set[tuple],
+) -> str | None:
+    """Act on one non-empty reply; return the feedback, or None once the run is over."""
+    turn = parse_turn(text)
+    if turn.kind == "invalid":
+        return f"FORMAT ERROR: {turn.error}. Send one <probe> or one <final>."
+    if turn.kind == "probe":
+        if result.probes_used >= config.max_probes:
+            return "The probe budget is used up; send your <final> now."
+        record = session.run(turn.command)
+        result.probes_used += 1
+        return session.llm_view(record)
+
+    result.finals += 1
+    outputs = {r.number: r.output for r in session.records}
+    verdicts = [
+        check_divergence(d, probes=outputs, catalog=catalog, milestones=milestones, missed=missed)
+        for d in turn.divergences
+    ]
+    for v in verdicts:
+        if v.status == ACCEPTED and _identity(v) not in seen:
+            seen.add(_identity(v))
+            result.accepted.append(v)
+        elif v.status == LOGGED:
+            result.logged.append(v)
+    result.rejected = [v for v in verdicts if v.status not in (ACCEPTED, LOGGED)]
+    if not result.rejected:
+        result.stop_reason = "done"
+        return None
+    if result.finals >= config.max_finals:
+        result.stop_reason = "final_budget"
+        return None
+    return _verdict_message(verdicts, config.max_finals - result.finals)
+
+
 def reflect(
     loaded: LoadedRun,
     *,
@@ -136,50 +238,61 @@ def reflect(
     session: ProbeSession,
     catalog: Catalog,
     config: ReflectorConfig,
+    clock: Callable[[], float] | None = None,
 ) -> ReflectionResult:
+    """Run one reflection; errors and interrupts end it but keep what was collected."""
+    tick = clock or time.monotonic
     result = ReflectionResult(messages=build_messages(loaded, catalog, config))
-    milestones = loaded.gold.get("milestone") or {}
-    missed = missed_milestones(loaded.process_score)
-    seen: set[tuple] = set()
+    context = dict(
+        session=session,
+        catalog=catalog,
+        config=config,
+        milestones=loaded.gold.get("milestone") or {},
+        missed=missed_milestones(loaded.process_score),
+        seen=set(),
+    )
+    start = tick()
+    empties = 0
+    warned = False
 
-    for _ in range(config.max_turns):
-        reply = llm(result.messages)
-        result.messages.append({"role": "assistant", "content": reply})
-        turn = parse_turn(reply)
+    try:
+        for _ in range(config.max_turns):
+            raw = llm(result.messages)
+            reply = raw if isinstance(raw, LLMReply) else LLMReply(raw)
+            result.llm_calls.append({
+                "finish_reason": reply.finish_reason,
+                "timed_out": reply.timed_out,
+                "elapsed_s": reply.elapsed_s,
+                "text_chars": len(reply.text),
+            })
+            result.messages.append({"role": "assistant", "content": reply.text})
 
-        if turn.kind == "invalid":
-            feedback = f"FORMAT ERROR: {turn.error}. Send one <probe> or one <final>."
-        elif turn.kind == "probe":
-            if result.probes_used >= config.max_probes:
-                feedback = "The probe budget is used up; send your <final> now."
+            if not reply.text.strip():
+                empties += 1
+                if empties >= config.max_consecutive_empty:
+                    result.stop_reason = "empty_reply"
+                    break
+                feedback = EMPTY_REPLY_NUDGE
             else:
-                record = session.run(turn.command)
-                result.probes_used += 1
-                feedback = session.llm_view(record)
+                empties = 0
+                feedback = _handle_turn(reply.text, result, **context)
+                if feedback is None:
+                    break
+
+            if config.run_time_budget_s is not None and tick() - start > config.run_time_budget_s:
+                if warned:
+                    result.stop_reason = "time_budget"
+                    break
+                warned = True
+                feedback = f"{feedback}\n\n{TIME_BUDGET_NOTE}"
+            result.messages.append({"role": "user", "content": feedback})
         else:
-            result.finals += 1
-            outputs = {r.number: r.output for r in session.records}
-            verdicts = [
-                check_divergence(d, probes=outputs, catalog=catalog, milestones=milestones, missed=missed)
-                for d in turn.divergences
-            ]
-            for v in verdicts:
-                if v.status == ACCEPTED and _identity(v) not in seen:
-                    seen.add(_identity(v))
-                    result.accepted.append(v)
-                elif v.status == LOGGED:
-                    result.logged.append(v)
-            result.rejected = [v for v in verdicts if v.status not in (ACCEPTED, LOGGED)]
-            if not result.rejected:
-                result.stop_reason = "done"
-                break
-            if result.finals >= config.max_finals:
-                result.stop_reason = "final_budget"
-                break
-            feedback = _verdict_message(verdicts, config.max_finals - result.finals)
-        result.messages.append({"role": "user", "content": feedback})
-    else:
-        result.stop_reason = "turn_budget"
+            result.stop_reason = "turn_budget"
+    except KeyboardInterrupt:
+        result.stop_reason = "interrupted"
+    except Exception as exc:
+        result.stop_reason = "error"
+        result.error = f"{type(exc).__name__}: {exc}"
 
     result.probes = list(session.records)
     return result
@@ -193,6 +306,8 @@ def to_record(loaded: LoadedRun, result: ReflectionResult) -> dict[str, Any]:
         "category": run.category,
         "level": run.level,
         "stop_reason": result.stop_reason,
+        "error": result.error,
+        "llm_calls": result.llm_calls,
         "probes_used": result.probes_used,
         "finals": result.finals,
         "accepted": [asdict(r) for r in result.accepted],

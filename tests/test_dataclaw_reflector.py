@@ -7,7 +7,7 @@ import pytest
 from tkstore.dataclaw.catalog import Catalog
 from tkstore.dataclaw.devset import DevRun, LoadedRun
 from tkstore.dataclaw.probe import ExecResult, ProbeSession
-from tkstore.dataclaw.reflector import ReflectorConfig, build_messages, reflect, to_record
+from tkstore.dataclaw.reflector import LLMReply, ReflectorConfig, build_messages, reflect, to_record
 from tkstore.dataclaw.trajectory import Step, ToolCall, Trajectory
 
 OPS = "enterprise/company_operation_status.csv"
@@ -39,7 +39,10 @@ class ScriptedLLM:
 
     def __call__(self, messages):
         self.calls.append([dict(m) for m in messages])
-        return self.replies.pop(0) if self.replies else "PLAN: nothing"
+        reply = self.replies.pop(0) if self.replies else "PLAN: nothing"
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
 
 
 class FakeExecutor:
@@ -89,12 +92,28 @@ def loaded(tmp_path):
     )
 
 
-def _reflect(loaded, replies, **config):
+def _reflect(loaded, replies, clock=None, **config):
     llm = ScriptedLLM(replies)
     executor = FakeExecutor()
     with ProbeSession(executor, timeout=60, max_llm_chars=4000) as session:
-        result = reflect(loaded, llm=llm, session=session, catalog=CATALOG, config=ReflectorConfig(**config))
+        result = reflect(
+            loaded, llm=llm, session=session, catalog=CATALOG, config=ReflectorConfig(**config), clock=clock
+        )
     return result, llm, executor
+
+
+def _clock(*values):
+    ticks = iter(values)
+    last = [values[-1]]
+
+    def now():
+        last[0] = next(ticks, last[0])
+        return last[0]
+
+    return now
+
+
+EMPTY = LLMReply("", "length", False, 800.0)
 
 
 def test_messages_carry_every_input(loaded):
@@ -165,6 +184,78 @@ def test_non_data_divergence_is_logged(loaded):
     result, _, _ = _reflect(loaded, [final])
     assert result.accepted == [] and len(result.logged) == 1
     assert result.stop_reason == "done"
+
+
+def test_llm_replies_are_used_and_their_stats_recorded(loaded):
+    replies = [LLMReply(PROBE_TURN, "stop", False, 12.5), LLMReply(GOOD_FINAL, "stop", False, 30.0)]
+    result, _, _ = _reflect(loaded, replies)
+    assert len(result.accepted) == 1
+    assert [(c["finish_reason"], c["elapsed_s"], c["timed_out"]) for c in result.llm_calls] == [
+        ("stop", 12.5, False),
+        ("stop", 30.0, False),
+    ]
+    assert result.llm_calls[0]["text_chars"] == len(PROBE_TURN)
+
+
+def test_one_empty_reply_gets_a_specific_nudge_and_the_run_recovers(loaded):
+    result, llm, _ = _reflect(loaded, [EMPTY, PROBE_TURN, GOOD_FINAL])
+    nudge = llm.calls[1][-1]["content"]
+    assert "cut off before any text" in nudge and "FORMAT ERROR" not in nudge
+    assert len(result.accepted) == 1 and result.stop_reason == "done"
+
+
+def test_two_consecutive_empty_replies_end_the_run(loaded):
+    result, llm, _ = _reflect(loaded, [PROBE_TURN, EMPTY, EMPTY, GOOD_FINAL])
+    assert result.stop_reason == "empty_reply"
+    assert len(llm.calls) == 3
+    assert result.probes_used == 1
+
+
+def test_empty_replies_separated_by_a_real_one_do_not_end_the_run(loaded):
+    result, _, _ = _reflect(loaded, [EMPTY, PROBE_TURN, EMPTY, GOOD_FINAL])
+    assert result.stop_reason == "done" and len(result.accepted) == 1
+
+
+def test_timed_out_empty_reply_counts_as_empty(loaded):
+    timed_out = LLMReply("", "timeout", True, 300.0)
+    result, _, _ = _reflect(loaded, [timed_out, timed_out])
+    assert result.stop_reason == "empty_reply"
+
+
+def test_run_over_time_budget_is_told_to_finish(loaded):
+    clock = _clock(0, 50, 150)
+    result, llm, _ = _reflect(loaded, [PROBE_TURN, PROBE_TURN, GOOD_FINAL], clock=clock, run_time_budget_s=100)
+    assert "time budget" in llm.calls[2][-1]["content"].lower()
+    assert "time budget" not in llm.calls[1][-1]["content"].lower()
+    assert result.stop_reason == "done" and len(result.accepted) == 1
+
+
+def test_run_still_over_budget_after_the_warning_stops(loaded):
+    clock = _clock(0, 150, 200)
+    result, llm, _ = _reflect(loaded, [PROBE_TURN, PROBE_TURN, GOOD_FINAL], clock=clock, run_time_budget_s=100)
+    assert result.stop_reason == "time_budget"
+    assert len(llm.calls) == 2
+
+
+def test_llm_error_keeps_the_partial_run(loaded):
+    result, _, _ = _reflect(loaded, [PROBE_TURN, RuntimeError("gateway down")])
+    assert result.stop_reason == "error"
+    assert "gateway down" in result.error
+    assert result.probes_used == 1 and len(result.probes) == 1
+    assert any("PROBE_RESULT #1" in m["content"] for m in result.messages)
+
+
+def test_interrupt_keeps_the_partial_run(loaded):
+    result, _, _ = _reflect(loaded, [PROBE_TURN, KeyboardInterrupt()])
+    assert result.stop_reason == "interrupted"
+    assert len(result.probes) == 1
+
+
+def test_record_carries_error_and_call_stats(loaded):
+    result, _, _ = _reflect(loaded, [LLMReply(PROBE_TURN, "stop", False, 1.0), RuntimeError("boom")])
+    record = json.loads(json.dumps(to_record(loaded, result), ensure_ascii=False))
+    assert record["stop_reason"] == "error" and "boom" in record["error"]
+    assert record["llm_calls"][0]["finish_reason"] == "stop"
 
 
 def test_record_is_json_serializable(loaded):

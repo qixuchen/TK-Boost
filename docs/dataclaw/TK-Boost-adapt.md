@@ -602,6 +602,17 @@ data/dataclaw_dev/
   格式无关，`1,004` 与 `1004.0` 都算出现），字符串按空白规整后的子串比对；一条 divergence 里只要有一行
   `REPRODUCED` 不通过，整条打回；`<final>` 通过的 divergence 按「`FACT` + `TABLES` + `COLUMNS`」去重；
   LLM 调用总数上限为 `max_probes + max_finals + 3`，多出的 3 次留给格式错误的回复。
+- 真实试跑暴露的两个问题及处理：
+  - 网关会断开约 3 分钟没有数据返回的非流式请求（`task_011` 第 6 次调用在 185.8 秒断开），LLM 调用改为
+    流式；
+  - GLM 5.2 会把全部输出额度花在推理上，返回空正文（`task_352` 连续 4 次、每次约 800 秒、
+    `finish_reason=length`、正文 0 字符；`task_195` 一次 748.5 秒）。处理：空回复发专门提示，连续两次
+    结束 run（`stop_reason=empty_reply`）；单次调用默认 300 秒墙钟上限（流式下 HTTP 超时只管两个分块之间，
+    管不住持续推理）；单个 run 默认 1500 秒，超时先提示提交 `<final>`，再超结束（`time_budget`）；
+    LLM 或容器出错、Ctrl+C 中断时保留已有消息与 probe 并写盘（`error` / `interrupted`），batch 继续下一个
+    run（中断则停止）；每次调用的 `finish_reason`、耗时、正文长度记入 `llm_calls`。
+  - 推理长度控制（`--max-tokens`、`--reasoning-effort`、`--disable-thinking`，经 `extra_body` 传给网关）
+    做成可选参数，默认不开：网关是否支持未验证，待在 `task_352`、`task_195` 上实测。
 
 **阶段 C：规则生成**
 

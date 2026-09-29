@@ -45,6 +45,15 @@ def main() -> int:
     parser.add_argument("--max-finals", type=int, default=3)
     parser.add_argument("--probe-timeout", type=int, default=60)
     parser.add_argument("--max-probe-chars", type=int, default=4000)
+    parser.add_argument("--max-tokens", type=int, help="output token cap per LLM call (reasoning included)")
+    parser.add_argument("--reasoning-effort", choices=("low", "medium", "high"),
+                        help="sent as extra_body.reasoning_effort; the gateway may ignore it")
+    parser.add_argument("--disable-thinking", action="store_true",
+                        help='sent as extra_body.thinking = {"type": "disabled"}; the gateway may ignore it')
+    parser.add_argument("--call-timeout", type=float, default=300,
+                        help="wall-clock cap in seconds for one LLM call")
+    parser.add_argument("--run-time-budget", type=float, default=1500,
+                        help="seconds per run before the reflector is told to finish")
     args = parser.parse_args()
     if not args.dry_run and not args.model:
         parser.error("--model is required unless --dry-run")
@@ -53,8 +62,19 @@ def main() -> int:
     prefixes = tuple(p.strip() for p in args.tasks.split(",") if p.strip())
     runs = [r for r in load_manifest(args.manifest) if r.task_id.startswith(prefixes)]
     catalog = load_catalog(args.data_dir, _REPO_ROOT / "tmp/dataclaw_cache")
-    config = ReflectorConfig(max_probes=args.max_probes, max_finals=args.max_finals)
+    config = ReflectorConfig(
+        max_probes=args.max_probes,
+        max_finals=args.max_finals,
+        run_time_budget_s=args.run_time_budget,
+    )
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    llm_options = {
+        "max_tokens": args.max_tokens,
+        "reasoning_effort": args.reasoning_effort,
+        "disable_thinking": args.disable_thinking,
+        "call_timeout_s": args.call_timeout,
+    }
+    llm = None if args.dry_run else litellm_llm(args.model, **llm_options)
 
     for run in runs:
         loaded = load_run(run)
@@ -70,16 +90,27 @@ def main() -> int:
             print(f"{stem}: {chars:,} chars -> {path.relative_to(_REPO_ROOT)}")
             continue
 
-        executor = DockerExecutor(args.data_dir)
-        with ProbeSession(executor, timeout=args.probe_timeout, max_llm_chars=args.max_probe_chars) as session:
-            result = reflect(loaded, llm=litellm_llm(args.model), session=session, catalog=catalog, config=config)
+        path = args.out_dir / f"{stem}.json"
+        try:
+            executor = DockerExecutor(args.data_dir)
+            with ProbeSession(executor, timeout=args.probe_timeout, max_llm_chars=args.max_probe_chars) as session:
+                result = reflect(loaded, llm=llm, session=session, catalog=catalog, config=config)
+        except Exception as exc:
+            record = {"task_id": run.task_id, "run_dir": run.run_dir.name, "stop_reason": "error",
+                      "error": f"{type(exc).__name__}: {exc}", "model": args.model}
+            path.write_text(json.dumps(record, ensure_ascii=False, indent=1), encoding="utf-8")
+            print(f"{stem}: error before or outside the reflection: {record['error']}")
+            continue
         record = to_record(loaded, result)
         record["model"] = args.model
-        path = args.out_dir / f"{stem}.json"
+        record["llm_options"] = llm_options
         path.write_text(json.dumps(record, ensure_ascii=False, indent=1), encoding="utf-8")
         print(f"{stem}: {result.stop_reason}, {len(result.accepted)} accepted, "
               f"{len(result.rejected)} rejected, {len(result.logged)} logged, "
               f"{result.probes_used} probes -> {path.relative_to(_REPO_ROOT)}")
+        if result.stop_reason == "interrupted":
+            print("interrupted; the partial record above was saved and the batch stops here")
+            return 130
     return 0
 
 
