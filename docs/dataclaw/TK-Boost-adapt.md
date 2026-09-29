@@ -4,7 +4,8 @@
 DataClaw 的具体方案。它细化 [`dataclaw.md`](./dataclaw.md) 的 5.3、5.4 节；DataClaw 的环境、
 runner、评测设计、与 `~/baseline` 的关系仍以 `dataclaw.md` 为准。
 
-状态：**阶段 A 已完成**（代码在 `tkstore/dataclaw/`，完成情况见 9.3），阶段 B 未开始。开发集已拷贝
+状态：**阶段 A 已完成**（代码在 `tkstore/dataclaw/`，完成情况见 9.3）；阶段 B 的步骤 1–5 已实现并通过
+测试，步骤 6 等待反思 prompt 人工确认与反思模型选定（9.3）。开发集已拷贝
 到 `data/dataclaw_dev/`（第 9.2 节）。三份 prompt 的最终文本尚未定稿，文中的 prompt 是草稿，需要逐条
 确认（见第 10 节）；写 prompt 时对照第 11 节的数据理解问题清单与样例规则。开发顺序见第 9 节。
 
@@ -105,8 +106,11 @@ milestone 值」。
 | 形态 | ReAct agent，不是单次 LLM 调用 |
 | 探查环境 | 与被测 OpenClaw **同一个 `dataclaw:0.1.0` 镜像**里的 shell 执行工具；可用工具与 agent 相同（`head`、`grep`、`awk`、`sort`、`python3` 标准库等），不装 pandas；数据以只读方式挂载 |
 | 重放 | 反思 agent 可原样重放被测 agent 轨迹里的命令，观察失败原因 |
-| 验证终止条件 | 必须从数据复现该 divergence 影响到的 milestone 值；只有验证通过的 divergence 进入第二阶段 |
+| 网络 | 探查容器断网（`--network none`），反思 agent 只能看 `./database/`；重放 agent 的上网命令会直接失败 |
+| 验证终止条件 | 必须从数据复现该 divergence 影响到的 milestone 值；只能用 `process_score.json` 中 `achieved=false` 的 milestone；只有验证通过的 divergence 进入第二阶段 |
 | 非数据类错误 | 跳过，不产规则（算术失误、输出格式、提前放弃、judge 与 gold 分歧等） |
+| 预算 | 每个 run 最多 20 次 probe；最多提交 3 次 `<final>`（即最多打回 2 次）；每次 probe 超时 60 秒；发给 LLM 的 probe 输出截断到 4000 字符、保留头尾，harness 保留完整输出供闸门核对。均为参数，试跑后可调 |
+| 模型 | 待定；要求上下文至少 1M token。压缩后最长的轨迹为 215,865 字符，还要加上多轮 probe 输出 |
 
 **为什么不用宿主机 pandas（修订早先的决定）。** 最初选 pandas 是为了方便处理长文本和中文。但第 3 节
 的统计表明 OpenClaw 从不使用 pandas，而是用 `head`、`grep`、`awk` 和标准库 `csv`。工具不一致对两件事
@@ -169,10 +173,20 @@ MISSING_DATA_UNDERSTANDING:
   TABLES: <file>[, <file> ...]                      # 事实针对整个文件时列在这里；可为空
   COLUMNS: <file>.<column>[, <file>.<column> ...]   # 事实针对具体列时列在这里；可为空
   FACT: <关于数据的事实>
+CATEGORY: <第 11.2 节的类别名，或「其他」>
 EVIDENCE: probe#<n> → <关键输出摘录>
-REPRODUCED: milestone "<key>" = <值>，由 probe#<m> 算出
+REPRODUCED: milestone "<key>" = <JSON 值> FROM probe#<m>     # 可有多行
+SEMANTIC_MATCH: <理由>                                       # 字符串值与 gold 不逐字一致时必填，紧跟对应的 REPRODUCED 行
 KIND: data | non_data | gold_suspect
 ```
+
+`REPRODUCED` 写成机器可读的形式，由 harness 解析：`<key>` 须是 gold milestone 的 key；`<JSON 值>` 照抄
+probe 输出里的写法（数值写数字，字符串写数据里的原值，例如 `"广东省"`）；字典类 milestone 用 gold 的
+key 报告。`CATEGORY` 不参与闸门，只用于统计开发集上各类的分布、方便调 prompt；prompt 里写明类别只是
+提示，归不进去就写「其他」。
+
+每一轮反思 agent 只能二选一：`PLAN` 加一个 `<probe>...</probe>`，或者一个 `<final>`。`<final>` 里放若干
+上述 divergence 块，也可以声明没有数据类 divergence。格式错误本身也作为打回理由发回。
 
 一条 divergence 只写一个数据事实；涉及多个事实时拆成多条。`TABLES` 与 `COLUMNS` 都为空时是
 `generic`。`<file>` 一律写 `database/` 下的完整相对路径，例如 `enterprise/company_profile.csv`，
@@ -189,8 +203,13 @@ KIND: data | non_data | gold_suspect
    推测写成观察结果。
 2. **引用的文件和列必须真实存在。** `TABLES` 中每个文件都要存在；`COLUMNS` 中每个 `file.column`
    都要在 19 个文件的表头里找到。防止不存在的文件名、列名流进规则。
-3. **复现值由 harness 比对。** 先检查 `REPRODUCED` 里的值确实出现在所引 probe 的输出里，再与 gold
-   milestone 比较：
+3. **复现值由 harness 比对。** 依次检查：
+   - `<key>` 是 gold milestone 的 key（空白规整后精确匹配），且该 milestone 在 `process_score.json` 中
+     `achieved=false`。只允许用 agent 没做到的 milestone，防止复现一个 agent 本来就做对的简单 milestone
+     来凑数；
+   - 所写的值出现在所引 probe 的输出里：标量要求其写法在空白规整后是输出的子串；列表要求每个元素都
+     出现；字典要求每个值都出现（key 是 gold 的英文 key，不要求出现）；
+   - 再与 gold milestone 比较：
    - 数值：沿用 DataClaw `dataclaw/utils/process_grading.py` 的 `_numbers_match`，相对误差 1%
      （`NUMERIC_REL_TOL = 0.01`），与 process 评分口径一致；
    - 列表：规整后按集合比较；
@@ -201,7 +220,8 @@ KIND: data | non_data | gold_suspect
      但语义须几乎完全一致，并要求写出判断。harness 仍校验所引原值确实出现在所引 probe 的输出里。
 
    数值、列表中的数值元素、字典中的数值由 harness 判定，agent 的自述不算数；只有字符串部分采纳反思
-   agent 的语义判断。
+   agent 的语义判断，且要求对应的 `REPRODUCED` 行后面跟有 `SEMANTIC_MATCH`。阶段 A 的
+   `milestones.compare` 对这种情况返回 `semantic`。
 4. **按类型过滤。** `KIND: non_data`（算术失误、输出格式、提前放弃等）与 `KIND: gold_suspect`（gold
    本身可疑，例如 `task_054` 题面要求答 yes/no、gold 却是 `416`）不进第二阶段，只写日志。`KIND` 由
    反思 agent 自标，但标为 `data` 的必须同时通过闸门 1–3，把非数据错误冒充为数据错误过不了关。
@@ -511,16 +531,77 @@ data/dataclaw_dev/
 
 **阶段 B：探查工具与反思 agent**
 
-- 先按 TDD 把 `scope.py` 改成 6.2 节的 `TABLES` + `COLUMNS` 写法（含「同一文件既在 `TABLES` 又点了
-  其中的列」这一新允许的组合）；
-- probe 工具：在 `dataclaw:0.1.0` 容器里执行 shell 命令，数据只读挂载，输出截断，记录每次 probe 的
-  编号与完整输出；独立于 LLM，单独测试；
-- 反思循环：prompt、结构化输出解析、5.5 节四道硬闸门与 `SCOPE` 一致性检查、打回消息、轮数预算；
-- 闸门逻辑用「假 LLM」（预设回复）测试，覆盖引用不存在的 probe、摘录与真实输出不符、复现值偏差超过
-  1%、文件或列名不存在、`SCOPE` 与 `TABLES`、`COLUMNS` 推出的范围不一致等情况。
+实现前核实的基础设施事实（读 DataClaw 代码与本机检查得出）：
 
-退出条件：反思 prompt 定稿；在 3–5 个开发 run 上试跑，人工确认 divergence 有真实数据证据、没有只是
-复述参考步骤。若质量不达标，先改 prompt，不进入阶段 C。
+- `dataclaw:0.1.0` 镜像已在本机，`docker` 可用。
+- DataClaw 不挂载数据：`dataclaw/utils/docker_utils.py` 的 `setup_workspace` 用 `docker cp` 把 19 个文件
+  拷进 `/tmp_workspace/database/`，再把 `/root/.openclaw/workspace` 软链接到 `/tmp_workspace`。agent 的
+  命令写作 `./database/...` 或 `cd ./database && ...`，所以探查容器必须复刻这套目录结构，才能原样重放。
+- TK-Boost 现有的 LLM 调用是 `litellm.completion`，读 `TK-Boost/.env` 的 `OPENAI_API_KEY`、
+  `OPENAI_API_BASE`，默认模型 `TKBOOST_MODEL=gpt-4.1`。被测 agent 是 `glm-5.2`，走 DataClaw 的自定义
+  网关；DataClaw 给它配置的上下文是 `OPENCLAW_MODEL_CONTEXT_WINDOW` 默认的 128000（是否为模型本身
+  的上限未核实）。
+
+实现步骤。为避免与评测臂 B0/B1/B2 重名，下面称「B 步骤 1–6」。除真起容器、真调 LLM 的两类测试
+默认跳过外，都按 TDD 做：
+
+1. **`scope.py` 改成 `TABLES` + `COLUMNS`**（决策 23）。新接口 `parse_tables`、不再接受 `.all` 的
+   `parse_columns`、`derive_scope(tables, columns)`、`validate_refs(tables, columns, catalog)`、
+   `check_scope_consistency(declared, tables, columns)`；同一文件既在 `TABLES` 又点了其中的列时判为
+   `file`，不再报错；`check_body` 不变。
+2. **probe 工具 `tkstore/dataclaw/probe.py`。** 每个反思会话起一个短命容器：
+   `docker run -d --rm --network none -v ~/DataClaw/assets/database:/tmp_workspace/database:ro
+   -w /tmp_workspace dataclaw:0.1.0 tail -f /dev/null`，再建软链接 `/root/.openclaw/workspace →
+   /tmp_workspace`，会话结束删除容器。只读挂载代替拷贝 250 MB；agent 在工作目录写临时脚本不受影响。
+   `run(command)` 用 `docker exec bash -c` 执行，合并 stdout 与 stderr，返回编号、完整输出、退出码、
+   是否超时；发给 LLM 的是截断版。执行器可替换：单元测试用假执行器，另有一个真起容器的冒烟测试，
+   默认跳过，设环境变量才跑。
+3. **输出解析 `tkstore/dataclaw/reflector_io.py`。** 解析每轮的 `PLAN` + `<probe>` 或 `<final>`，以及
+   `<final>` 中 5.4 节格式的 divergence 块（含 `TABLES`、`COLUMNS`、`CATEGORY`、多行 `REPRODUCED`、
+   `SEMANTIC_MATCH`）。
+4. **硬闸门 `tkstore/dataclaw/gates.py`。** 纯函数：输入 probe 记录、数据目录、gold 与
+   `process_score.json`，输出每条 divergence 的通过或打回及理由。检查项为 5.5 节的四道闸门与 `SCOPE`
+   一致性；逐条判定，通过的保留，打回的发回修改，轮数用完仍未通过的丢弃。
+5. **反思循环 `tkstore/dataclaw/reflector.py`，prompt 放在 `tkstore/dataclaw/prompts/reflector.md`。**
+   按 5.2 节组装输入：task prompt、压缩轨迹、judge `notes`、`process_score.json` 逐 milestone 的
+   `achieved` 与 `reason`、gold 的 `answer`/`milestone`/`steps`、19 个文件的表头。LLM 调用以函数注入，
+   默认实现 litellm；模型名只是参数，所以步骤 1–5 不依赖模型的选择。闸门与循环用假 LLM（预设回复）
+   测试，覆盖引用不存在的 probe、摘录与真实输出不符、复现值偏差超过 1%、引用 `achieved=true` 的
+   milestone、字符串缺 `SEMANTIC_MATCH`、文件或列名不存在、`SCOPE` 与推出的范围不一致、轮数用完等
+   情况。每个 run 写一个 JSON 记录（通过的 divergence、打回的及理由、完整 probe 记录、轮数与 token
+   用量）到 git 忽略的目录。
+6. **prompt 定稿与试跑。** 先按 5.3 节草稿、11.2 节问题清单、11.3 节 `non_data` 例子写出完整的反思
+   prompt，交人工逐条确认；定下反思模型后，在 5 个开发 run 上真实试跑：
+   - `task_049`：同一指标有多个名字、单位不同、按文本排序；
+   - `task_218`：有汇总表却从明细聚合，另有回答了错误的对象；
+   - `task_195`：实体名称对不上，疑似 `gold_suspect`；
+   - `task_206`：应判为 `non_data`（减法方向错）；
+   - `task_011`：单位差 10 倍，香港的纳入口径。
+
+   这 5 题覆盖了 data、`non_data`、`gold_suspect` 三种结论，用来检查反思 agent 能否分清。
+
+退出条件：反思 prompt 定稿；上述 5 个开发 run 试跑后，人工确认 divergence 有真实数据证据、没有只是
+复述参考步骤、`non_data` 与 `gold_suspect` 分得出。若质量不达标，先改 prompt，不进入阶段 C。
+
+**阶段 B 完成情况（步骤 1–5）**：
+
+- 代码：`scope.py`（改为 `TABLES` + `COLUMNS`）、`probe.py`、`reflector_io.py`、`gates.py`、`reflector.py`，
+  反思 prompt 草稿在 `tkstore/dataclaw/prompts/reflector.md`，试跑脚本 `scripts/dataclaw_reflect.py`
+  （`--dry-run` 只写出反思 agent 收到的消息，不调 LLM、不起容器）。
+- 测试：DataClaw 相关 158 个通过；真起容器的冒烟测试默认跳过，设 `DATACLAW_DOCKER_TESTS=1` 时通过。
+- 实测：镜像内有 `timeout`、`python3`、`awk`；只读挂载下写 `./database/` 报 Read-only；断网后域名解析
+  失败；超时退出码 124。在探查容器里重放 `task_049`、`task_206` 各前 8 条 agent 命令，16 条输出与历史
+  轨迹记录逐字相同。
+- 开发集 184 条 milestone 明细的 key 全部能在 gold 中找到，其中 agent 做到 71 条，可用于复现验证的
+  （`achieved=false`）113 条。
+- 首轮输入长度（system prompt 6,882 字符 + 输入）：33 个 run 最短 14,612、中位数 53,113、最长 230,861
+  字符；20 次 probe 每次最多 4,000 字符，最多再增加约 8 万字符。
+- 反思 prompt 没有照抄 11.2 节的实测数字（例如具体企业数），只保留类别与一般性的 probe 提示，避免开发期
+  测得的事实直接流进反思结论；这一点在定稿时一并确认。
+- 实现中新增的约定：`EVIDENCE` 可写多行；`REPRODUCED` 的数值按数值比对是否出现在 probe 输出里（与书写
+  格式无关，`1,004` 与 `1004.0` 都算出现），字符串按空白规整后的子串比对；一条 divergence 里只要有一行
+  `REPRODUCED` 不通过，整条打回；`<final>` 通过的 divergence 按「`FACT` + `TABLES` + `COLUMNS`」去重；
+  LLM 调用总数上限为 `max_probes + max_finals + 3`，多出的 3 次留给格式错误的回复。
 
 **阶段 C：规则生成**
 
@@ -591,17 +672,21 @@ data/dataclaw_dev/
 | 23 | 表和列分开存 | divergence 与规则输出写 `TABLES` 和 `COLUMNS` 两个字段，存储有 `tables`、`columns`，另存推出的 `files`；取消 `<file>.all` 写法（见 6.2） |
 | 24 | `WHEN_TO_CHECK` 生成 | 规则生成时在 `TRIGGER` 中摘出来源题目的触发原句，再抽象成问法形状；合并时比较同组各来源的问法取共同点（见 6.2、第 7 节） |
 | 25 | 轨迹压缩 | 工具输出截断到 2000 字符、保留头尾；思考保留 5000 字符；命令原样保留 |
+| 26 | 反思预算 | 每个 run 最多 20 次 probe；最多提交 3 次 `<final>`；probe 超时 60 秒；发给 LLM 的 probe 输出截断到 4000 字符、保留头尾（均为参数） |
+| 27 | 探查容器网络 | 断网（`--network none`） |
+| 28 | 复现用的 milestone | 只能用 `process_score.json` 中 `achieved=false` 的 milestone |
+| 29 | `CATEGORY` 字段 | divergence 输出加 `CATEGORY`（11.2 节类别名或「其他」），不参与闸门，只用于统计 |
+| 30 | 试跑 run | `task_049`、`task_218`、`task_195`、`task_206`、`task_011` |
+| 31 | `REPRODUCED` 格式 | `milestone "<key>" = <JSON 值> FROM probe#<m>`，可多行；字符串不逐字一致时跟 `SEMANTIC_MATCH`；值须出现在所引 probe 的输出里 |
+| 32 | 反思模型的约束 | 上下文至少 1M token；具体模型待定 |
 
 ### 待定
 
 - 三份 prompt（反思、规则生成、合并）的最终文本（第 5.3、6.2 节为草稿；合并 prompt 尚未起草），
   **必须逐条确认**；
 - train 占 492 道题的比例；
-- 反思 agent 的轮数预算与每次 probe 输出的截断长度；
-- 反思 agent、规则生成、合并三处使用的模型；
-- `tkstore/dataclaw/scope.py` 按决策 23 改写（阶段 B 开始时，按 TDD）；
-- divergence 输出是否加一个 `CATEGORY` 字段（取第 11.2 节的类别名或「其他」）：不参与闸门，只用于统计
-  开发集上各类的分布、方便调 prompt；
+- 反思 agent 使用的模型（上下文至少 1M token，见决策 32；B 步骤 6 试跑前必须定）；规则生成、合并两处
+  使用的模型；
 - `WHEN_TO_CHECK` 的离线过宽检查（统计每条命中哪些题目），B1、B2 之前再定；
 - 同一 train task 若有多个裸 run，取哪一个（首版每 task 只跑一次，暂不涉及）。
 

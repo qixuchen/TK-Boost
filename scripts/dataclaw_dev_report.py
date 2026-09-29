@@ -38,6 +38,7 @@ def main() -> int:
     parser.add_argument("--max-thinking-chars", type=int, default=5000)
     parser.add_argument("--no-thinking", action="store_true")
     args = parser.parse_args()
+    args.out_dir = args.out_dir.resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     lines: list[str] = []
