@@ -229,9 +229,134 @@ key 报告。`CATEGORY` 不参与闸门，只用于统计开发集上各类的�
 另有一项一致性检查：harness 按 `TABLES` 与 `COLUMNS` 推出范围（规则见 6.2），与反思 agent 写的
 `SCOPE` 不一致时打回。
 
+### 5.6 修订：规则生成并入反思（阶段 C 试跑之后）
+
+**为什么改。** 阶段 C 按第 6 节把规则生成做成独立的单次 LLM 调用，只看已验证的 divergence。在 5 条
+divergence 上试跑（见 9.3 节「阶段 C 完成情况」），5 条都通过了全部检查和通用性判断，但人工检查有 4 条
+不合格。逐条看问题出在哪一步：
+
+- **问题大多在 divergence 里就已存在。** `task_011 #1` 的 `NEEDED` 把 gold 的纳入口径写成了普遍要求
+  （题面只说 enterprise microdata，gold 只算中国交易所的公司）；`task_185`、`task_231` 的 `FACT` 里已经
+  写了公司名、省份和 milestone 值，规则生成只是把它们搬进了例子。原因是反思 prompt 只约束了字段格式，
+  没有约束内容：`NEEDED` 只写 “what it should have done”，没说是这道题该怎么做还是这类题普遍该怎么做、
+  依据是什么；`FACT` 只写 “one fact about the data”，没区分列级性质和本题实体上的现象。
+- **推广这一步没有数据验证。** `task_231` 的规则写「两个文件对同一概念用不同的 targetName」，实测两个
+  文件的 75 个「中位数」类指标名完全相同，名字不同是因为同一指标有多种写法、每行只用其中一种（R5 的
+  事实）。不探库的单次调用无法发现这种过度推广。
+
+看到完整上下文并不能解决这些问题：`task_011 #1` 的错误就出在看得到完整上下文的反思 agent 手里，而完整
+上下文里还有 gold 答案，泄漏只会更多。真正缺的是在推广时能用 probe 检验，所以把规则生成并入反思，由
+反思 agent 在同一会话里写出规则并用 probe 支撑其通用性。
+
+**新的 divergence 块。** 在 5.4 节的格式上修改和增加字段：
+
+```text
+DIVERGENCE: <agent 在哪一步（CALL #n）做了什么；只写 agent 的行为，不写正确的值>
+NEEDED: <这道题本该怎么做>
+BASIS: data | task | gold_only
+BASIS_QUOTE: <题面原句片段；仅 BASIS: task 时必填>
+INSTANCE: <本题实体上观察到的现象，可以含实体名和数值；只用于验证，不进规则>
+MISSING_DATA_UNDERSTANDING:
+  SCOPE / TABLES / COLUMNS: <只列这条事实涉及的文件和列，不列题目问到的其他属性>
+  FACT: <列级的性质：换成同一列的其他取值仍然成立；不写具体实体>
+CATEGORY / EVIDENCE / REPRODUCED / SEMANTIC_MATCH / KIND: <同 5.4 节>
+GENERALITY: probe#<k> → <摘录；说明这条性质不只在本题的实体上成立，例如对其他行业、其他行做的统计>
+ENSURE / WHEN_TO_CHECK / TRIGGER / CONTEXT / EXAMPLE_USAGE: <规则字段，要求同 6.2–6.5 节>
+```
+
+- `GENERALITY` 对 `KIND: data` 必填，可有多行。
+- 规则的文件和列就是这条 divergence 的 `TABLES`、`COLUMNS`，不再单独写，也不再需要「规则引用只能比
+  divergence 收窄」的检查。
+- 每条 `data` divergence 只产出 1 条 `DATA_RULE`，不产出 `GENERIC_RULE`；规则正文用英文。
+- `non_data`、`gold_suspect` 块仍只需 `DIVERGENCE`、`NEEDED`、`KIND`。`non_data` 的定义暂不修改
+  （阶段 C 试跑中 `task_011 #2` 写反换算系数、错在中间步骤，算不算 `non_data` 边界不好定，待定）。
+
+**`BASIS` 的定义与对规则的约束。** prompt 要写明三项的定义和例子，并在规则字段的要求里说明 `BASIS`
+决定了规则能写成什么样。例子用虚构的实体，不照抄开发集实测到的事实。草稿：
+
+```text
+BASIS says who requires what NEEDED describes. Pick exactly one:
+
+- data: the data forces it, whatever the question says. Without it the correct
+  values cannot be obtained.
+  e.g. The task names "Hua Xin Tech Co., Ltd." but bmCompanyName only holds
+  Chinese names, so the name must first be looked up in the translation file.
+  e.g. Rows of one indicator carry different targetUnit values, so each row must
+  be converted by its own unit before summing.
+
+- task: the wording of the question decides it; a differently worded question
+  would need a different action. Quote the words on a BASIS_QUOTE line, copied
+  verbatim from the task.
+  e.g. The task asks for the figure "in Shanghai", so the provincial file must be
+  used rather than the national one.
+  BASIS_QUOTE: in Shanghai
+
+- gold_only: neither the data nor the question forces it; the reference answer
+  simply made this choice. Another task's reference may choose differently.
+  e.g. The task counts "enterprises in the industry" without restricting listing
+  venue, and the reference counts only companies on domestic exchanges.
+
+If you are unsure between task and gold_only, ask: would a careful analyst who
+reads only the question make the same choice? If not, it is gold_only.
+
+How BASIS shapes the rule:
+
+- data: ENSURE may state a fixed action ("look the English name up in the
+  translation file first").
+- task: ENSURE states the action conditioned on the question ("when the question
+  names a province, ..."), and WHEN_TO_CHECK describes that signal in the
+  question.
+- gold_only: ENSURE must NOT state the reference's choice as a fixed action. It
+  says which dimension has to be decided and that it must be decided from the
+  question ("check the distribution of exchange and restrict the population only
+  as the question states"). The reference's choice may appear only in
+  EXAMPLE_USAGE, explicitly marked as one task's convention.
+```
+
+**闸门，按顺序：**
+
+1. 5.5 节的全部闸门，以及 `SCOPE` 一致性检查；
+2. `KIND: data` 时的必填项：`NEEDED`、`INSTANCE` 和规则字段 `ENSURE`、`WHEN_TO_CHECK`、`CONTEXT`、
+   `EXAMPLE_USAGE`（`TRIGGER` 保留但不校验），以及 6.4 节的正文取值检查，范围仍是 `ENSURE`、
+   `WHEN_TO_CHECK`、`CONTEXT`；`FACT` 不做取值检查；不设「不能出现 gold 值」的检查。`KIND: data` 的全部
+   必填项因此是 `SCOPE`、`FACT`、`EVIDENCE`、`REPRODUCED`、`NEEDED`、`BASIS`、`INSTANCE`、`GENERALITY`、
+   `ENSURE`、`WHEN_TO_CHECK`、`CONTEXT`、`EXAMPLE_USAGE`；`non_data` 块不需要新字段；
+3. `BASIS` 必须是三者之一；`BASIS: task` 时 `BASIS_QUOTE` 须在规整空白后是题面的子串；
+4. `GENERALITY` 至少一行，所引 probe 存在，摘录是其输出的子串（同 `EVIDENCE` 的检查）；
+5. **通用性判断**：以上都通过后，对每条 divergence 调一次 LLM，输入 divergence 的各字段（含 `BASIS`）和
+   规则，判断规则是否只对个别实体成立、`gold_only` 的规则是否把 gold 的选择写成了固定动作。判为不合格时，
+   按闸门打回的方式把理由发回反思 agent，占用一次 `<final>` 额度，由它补充 probe 或改写。
+
+**通用性判断的实现**（`tkstore/dataclaw/reflector.py`，prompt 草稿为
+`tkstore/dataclaw/prompts/reflector_judge.md`）：
+
+- 只判两点：规则是否只对个别实体成立（包括 `GENERALITY` probe 只在本题实体上显示了该性质）；`BASIS` 为
+  `gold_only` 时 `ENSURE` 是否把 gold 的选择写成了固定动作。
+- 输入：divergence 的各字段与规则字段，以及每个 `GENERALITY` probe 的命令和输出（输出截断到 4000 字符、
+  保留头尾）；不给题面、轨迹和 gold。
+- 回复格式为两行 `VERDICT: accept | reject` 与 `REASON: <一句话>`。`reject` 时该 divergence 记为打回，
+  理由以 `GENERALITY JUDGE: <REASON>` 出现在 `HARNESS VERDICT` 里。
+- 回复为空或找不到 `VERDICT` 行时重试一次；仍失败则记为 `judge_error`：不接受、不打回、不计入被打回的
+  divergence，写进输出记录的 `judge_errors`，留待人工查看。
+- 默认用反思 agent 的同一个模型；`scripts/dataclaw_reflect.py --judge-model` 可另指定。每次判断调用都记入
+  `llm_calls`，用 `stage: "judge"` 与反思调用（`stage: "reflect"`）区分；判断调用不占 `max_turns`。
+- 同一 `<final>` 里有多条 divergence 通过确定性闸门时，每条各调一次判断；与已接受的 divergence 重复
+  （`FACT`、`TABLES`、`COLUMNS` 相同）的不再判断。
+
+harness 查不了 `GENERALITY` 的 probe 是否真的证明了通用性、`gold_only` 的规则是否真的写成了「按题目
+确定」，这两点交给第 5 道的通用性判断。例子里泄漏实体事实和 gold 值的问题，目前只靠 prompt 约束
+（`INSTANCE` 与 `FACT` 分开写、6.5 节对例子的要求）；通用性判断目前不检查例子（决策 48），修订后试跑
+若泄漏仍常见再考虑。
+
+**预算不变**：每个 run 最多 20 次 probe、3 次 `<final>`，试跑后再看是否需要调整。
+
 ---
 
 ## 6. 第二阶段：生成规则
+
+> **修订**：阶段 C 试跑之后，规则生成并入反思阶段，不再是独立的 LLM 调用（见 5.6 节）。6.1 节的输入
+> 约定不再适用；6.2–6.5 节对规则字段、粒度、自动检查和例子的要求仍然适用，由反思 agent 在 `<final>`
+> 里写出规则，由反思闸门检查。
 
 ### 6.1 输入
 
@@ -623,6 +748,100 @@ data/dataclaw_dev/
 退出条件：规则生成 prompt 定稿；以阶段 B 的产物为输入试跑，人工确认规则是列级的、例子不陈述具体
 实体事实。
 
+**阶段 C 完成情况**：
+
+- 输入：阶段 B 试跑中被接受的 5 条 divergence 导出到 `data/dataclaw_dev/divergences.jsonl`（提交进 git）。
+  来源是 `task_011` 2 条、`task_185` 2 条、`task_231` 1 条；`task_185` 的两条来自两次试跑、是同一个
+  事实，留给阶段 D 测试合并去重。编号形如 `task_011__b794e1__1`（task 前 8 个字符、run 目录后 6 个
+  字符、divergence 序号），重复的编号加 `~2`。导出脚本是 `scripts/dataclaw_export_divergences.py`，
+  读写在 `tkstore/dataclaw/divergence_store.py`。
+- 代码：`tkstore/dataclaw/rulegen.py`，prompt 在 `tkstore/dataclaw/prompts/rulegen.md`（生成）和
+  `tkstore/dataclaw/prompts/rulegen_generality.md`（通用性判断），脚本是 `scripts/dataclaw_rulegen.py`
+  （`--dry-run` 只写出生成步骤收到的消息）。候选规则写到 git 忽略的 `tmp/dataclaw_dev/rules/candidates.jsonl`。
+- 流程：每条 divergence 调一次 LLM，生成 1 条 `DATA_RULE`（不生成 `GENERIC_RULE`、不探库）；harness 依次
+  检查解析与必填字段、文件和列存在、`SCOPE` 一致、引用不超出来源 divergence、正文不含单元格取值；
+  不通过就把理由发回，最多重写 2 次，仍不通过记为 `dropped`；空回复算一次失败的尝试。通过检查的规则再
+  调一次 LLM，拿 divergence 和规则判断是否只对个别实体成立：判为否记为 `accepted`，判为是记为
+  `not_general`（不重写），判断回复无法解析记为 `judge_error`。生成步骤不接受 `NO_RULE`。
+- 引用范围检查 `check_within_divergence`：规则里的文件必须出现在 divergence 的 `TABLES` 里、或是它
+  `COLUMNS` 里某列所在的文件；规则里的列必须在 divergence 的 `COLUMNS` 里、或所在文件列在 divergence
+  的 `TABLES` 里。
+- prompt 里的正例由第 11 节 R2、R6、R7 译成英文，但 `EXAMPLE_USAGE` 改写成只讲列级现象：原文写了具体
+  公司的中文名与省份、行业的企业数，与「例子不陈述实体属性、不照抄答案」冲突。三条正例在真实 catalog
+  上都通过全部检查。
+- 测试：DataClaw 相关新增 29 个（`test_dataclaw_divergence_store.py`、`test_dataclaw_rulegen_checks.py`、
+  `test_dataclaw_rulegen.py`），全套 698 通过、1 个跳过（docker 冒烟测试）。
+- 试跑（GLM 5.2，5 条，共 414 秒）：5 条都一次通过检查、都被判为通用，结论全部是 `accepted`，没有任何
+  一次尝试被打回（单元格取值检查的打回率为 0/5）。生成调用 27–120 秒，判断调用 7–21 秒，
+  `finish_reason` 都是 `stop`。
+- 人工检查发现的问题，都不在现有检查和判断的覆盖范围内：
+  - **例子泄漏实体事实和 gold 值（3 条）。** `task_185` 的两条在 `EXAMPLE_USAGE` 里写了该公司的中文名，
+    以及「province 为广东省」，而这正是来源题目的答案；`task_231` 的例子写了具体行业的两个中位数，
+    其中 11445832 是 gold milestone 值。
+  - **例子照抄 milestone 值、正文固化了纳入口径（1 条）。** `task_011__b794e1__1` 的例子写了 671 和 644
+    （644 是 milestone 值），`ENSURE` 写成「总是只保留中国交易所」。第 11 节 R8 的结论正相反：
+    `task_383` 与 `task_011` 的 gold 口径相反，规则只能要求「按题目显式筛选」。
+  - **用英文描述汉字来绕过取值检查（1 条）。** `task_011__b794e1__2` 的 `ENSURE` 用
+    「thousand-character」「hundred-character」指代「千」「百」，把单位换算写成字符解析规则，读起来别扭。
+  - 通用性判断只判断规则是否通用，不看例子是否泄漏，所以上面 4 条都判为通用。
+- 用户检视的结论：
+  - rule 1（`task_011 #1`）偏了，变成「只保留中国交易所」；来源 divergence 的 `NEEDED` 本身读起来就
+    让人困惑，把 gold 的口径写成了必须遵守的要求；
+  - rule 2（`task_011 #2`）偏了，在总结中英文单位的对应关系；合理的规则应是「按每行 targetUnit 的
+    正确换算系数换算」这一类，即第 11 节 R6；
+  - rule 3（`task_185 #1`）基本合理；
+  - rule 4（`task_231`）偏离了 divergence，放宽了适用范围。实测（只读 probe）：national 与 regional 两个
+    文件的「中位数」类指标名完全相同（各 75 个），「营业利润总额中位数」和「营业利润金额中位数」在两个
+    文件里都有；租赁和商务服务业在 national 里用前者、在 regional 上海市一行用后者。规则「两个文件对
+    同一概念用不同的 targetName」不成立。「没指定地区就用 national」也只有这一道题的 gold 作依据。
+- **试跑后的决定**：取消独立的规则生成步骤，把规则生成并入反思（设计见 5.6 节）。规则生成的代码、测试、
+  prompt、脚本与旧格式的 `data/dataclaw_dev/divergences.jsonl` 删除；解析规则字段与正文取值检查挪进
+  `reflector_io.py` 与 `gates.py` 复用；导出工具保留。
+
+**阶段 C（修订）：规则生成并入反思**
+
+按 TDD 实现，测试用假 LLM 和构造的 `Catalog`：
+
+1. 删除阶段 C 的独立规则生成：`tkstore/dataclaw/rulegen.py`、`tkstore/dataclaw/prompts/rulegen.md`、
+   `tkstore/dataclaw/prompts/rulegen_generality.md`、`scripts/dataclaw_rulegen.py`、对应的 2 个测试文件
+   （`test_dataclaw_rulegen.py`、`test_dataclaw_rulegen_checks.py`）和旧格式的
+   `data/dataclaw_dev/divergences.jsonl`。导出工具 `divergence_store.py` 与
+   `scripts/dataclaw_export_divergences.py` 保留，第 7 步扩展新字段后继续用。
+2. `reflector_io.py`：解析新字段 `BASIS`、`BASIS_QUOTE`、`INSTANCE`、`GENERALITY`（格式同 `EVIDENCE`，
+   可多行）和 5 个规则字段。
+3. `gates.py`：加 5.6 节闸门的第 2–4 道（规则必填字段与正文取值检查、`BASIS` 与 `BASIS_QUOTE`、
+   `GENERALITY` 的 probe 与摘录）。`BASIS_QUOTE` 的检查需要题面文本，由调用方传入。
+4. `reflector.py`：确定性闸门都通过后调通用性判断（第 5 道）；判为不合格时，理由并入 `HARNESS VERDICT`
+   发回，占用一次 `<final>` 额度；每次判断调用记入 `llm_calls`（区分反思与判断）。
+5. 反思 prompt `tkstore/dataclaw/prompts/reflector.md`：加新字段、`BASIS` 的定义与例子、`BASIS` 对规则的
+   约束（5.6 节草稿），以及 6.2–6.5 节对规则字段的要求和正反例（沿用阶段 C 的 R2、R6、R7 英文改写与两个
+   反例）；通用性判断的 prompt 另写一份。两份 prompt 都要逐条确认。
+6. 用 `--dry-run` 检查输入长度，然后在 `task_011`、`task_185`、`task_231` 上真实试跑，与阶段 B 试跑的
+   divergence、阶段 C 试跑的规则对比。
+7. 扩展 `divergence_store.py` 以带上新字段和规则，导出通过闸门的 divergence 与规则，作为阶段 D 的输入。
+
+完成情况：第 1–4 步已完成，全套测试 699 passed、1 skipped。第 5 步两份 prompt 已写出草稿，待逐条确认：
+反思 prompt 加了新字段及各字段写什么、`BASIS` 一节、「Writing the rule」一节（R2、R6、R7 三条 `data`
+正例，按 R8 写的一条 `gold_only` 正例，三个反例）和 harness 检查说明；四条正例在真实 catalog 上实测
+通过文件列存在、`SCOPE` 一致与正文取值检查。反思 prompt 现为 18,412 字符；`task_011` 首轮输入由
+76,851 增至 88,289 字符，多出的 11,438 字符都来自 prompt。
+
+第 6 步试跑：
+
+- GLM-5.2（默认推理设置）：`task_185` 接受 1 条（约 275 秒）；`task_011`、`task_231` 都在该写 `<final>` 时
+  连续两次单次调用超时（各约 300 秒），以 `empty_reply` 结束。重放 `task_231` 超时前的输入（70,523 字符）：
+  801 秒内只输出 214,823 字符的思考内容、正文为 0，以 `finish_reason=length` 结束。对同一道短题实测
+  网关参数：`reasoning_effort=low` 无效（思考 48,000 token 后 `length`），`max_tokens` 只截断思考、正文仍为空，
+  只有关闭 thinking 生效。
+- 改用 GPT-5.1、`reasoning_effort=low`：`task_011` 113 秒、`task_231` 127 秒，所有调用都是 `stop`，各接受 1 条
+  （`task_011` 另有 1 条 `gold_suspect`）。人工检查质量可接受；`task_011` 那条的 `GENERALITY` 只引用了一个
+  公司计数，证据偏弱。`EXAMPLE_USAGE` 泄漏实体名（`task_185`）暂不处理。
+
+第 7 步未开始。
+
+退出条件：两份 prompt 定稿；在上述 3 道题上试跑，人工确认规则是列级的、`gold_only` 的规则没有把 gold
+的选择写成固定动作、例子不陈述具体实体事实。
+
 **阶段 D：合并与存储**
 
 - 按 `TABLES` 的 `(file, None)` 与 `COLUMNS` 的 `(file, column)` 组成的集合分组、每组一次合并调用、
@@ -690,16 +909,42 @@ data/dataclaw_dev/
 | 30 | 试跑 run | `task_049`、`task_218`、`task_195`、`task_206`、`task_011` |
 | 31 | `REPRODUCED` 格式 | `milestone "<key>" = <JSON 值> FROM probe#<m>`，可多行；字符串不逐字一致时跟 `SEMANTIC_MATCH`；值须出现在所引 probe 的输出里 |
 | 32 | 反思模型的约束 | 上下文至少 1M token；具体模型待定 |
+| 33 | 阶段 C 输入 | 阶段 B 已接受的 divergence 导出为 `data/dataclaw_dev/divergences.jsonl` 并提交；候选规则输出到 git 忽略的 `tmp/dataclaw_dev/rules/`（已被决策 39 取代） |
+| 34 | 规则形态 | 每条 divergence 生成且只生成 1 条英文 `DATA_RULE`，不生成 `GENERIC_RULE`；生成步骤不接受 `NO_RULE`（「单次 LLM 调用、不探库」已被决策 39 取代） |
+| 35 | `TRIGGER` | 保留，不做任何校验 |
+| 36 | 引用范围 | 规则引用的文件和列只能比来源 divergence 收窄（已被决策 39 取代：规则的文件和列就是 divergence 的 `TABLES`、`COLUMNS`） |
+| 37 | 通用性判断 | 调一次 LLM 判断规则是否只对个别实体成立（修订：并入反思闸门，不合格时打回反思 agent，见决策 43） |
+| 38 | 规则生成模型 | 暂用 GLM 5.2 |
+| 39 | 规则生成的位置 | 并入反思：反思 agent 在 `<final>` 的每条 `data` divergence 里同时写出规则字段；取消独立的规则生成步骤（见 5.6 节） |
+| 40 | divergence 字段 | `DIVERGENCE` 只写 agent 的行为；`INSTANCE` 写本题实体上的现象，可含实体和数值；`FACT` 写列级性质；`TABLES`、`COLUMNS` 只列事实涉及的文件和列 |
+| 41 | `BASIS` | `NEEDED` 须标明依据：`data`（数据逼出来的）、`task`（题面决定，附 `BASIS_QUOTE` 原句，harness 检查是题面子串）、`gold_only`（只有 gold 这么选）。prompt 写明三项定义和例子，并说明 `BASIS` 对规则的约束；`task` 与 `gold_only` 的分界：只读题面的细心分析者会不会做同样的选择 |
+| 42 | `gold_only` 的规则 | `ENSURE` 不能把 gold 的选择写成固定动作，只写「这个维度要按题目确定」；gold 的做法可以出现在 `EXAMPLE_USAGE`，但要注明这只是某道题的约定 |
+| 43 | 通用性的验证 | `KIND: data` 必须有 `GENERALITY` probe（harness 检查 probe 与摘录）；确定性闸门通过后调 LLM 做通用性判断，不合格按闸门打回，占用一次 `<final>` 额度 |
+| 44 | 并入后的检查范围 | 沿用现有的正文取值检查（`ENSURE`、`WHEN_TO_CHECK`、`CONTEXT`）；`FACT` 不做取值检查；不设「不能出现 gold 值」的检查 |
+| 45 | `non_data` 定义 | 暂不修改 |
+| 46 | 反思预算 | 并入后暂不修改（20 次 probe、3 次 `<final>`），试跑后再看 |
+| 47 | 修订后的试跑 | `task_011`、`task_185`、`task_231` |
+| 48 | 通用性判断的范围 | 只判两点：规则是否只对个别实体成立；`gold_only` 的规则是否把 gold 的选择写成固定动作。不检查例子 |
+| 49 | 判断回复无法解析 | 为空或没有 `VERDICT` 行时重试一次；仍失败记为 `judge_error`，不接受、不打回，写进 `judge_errors` |
+| 50 | `NEEDED` 与 `INSTANCE` | `KIND: data` 时两者都是必填项，缺失即打回 |
+| 51 | 反思与判断的模型 | 用 `.env` 配置的 GPT-5.1；`scripts/dataclaw_reflect.py` 默认 `--reasoning-effort low`（`omit` 为不发送），`--judge-model` 另指定判断模型时沿用同样的推理设置 |
 
 ### 待定
 
 - 三份 prompt（反思、规则生成、合并）的最终文本（第 5.3、6.2 节为草稿；合并 prompt 尚未起草），
   **必须逐条确认**；
 - train 占 492 道题的比例；
-- 反思 agent 使用的模型（上下文至少 1M token，见决策 32；B 步骤 6 试跑前必须定）；规则生成、合并两处
-  使用的模型；
+- 反思 agent 已改用 GPT-5.1（决策 51），决策 32 的「上下文至少 1M token」是否随之放宽待确认；合并使用的
+  模型；
 - `WHEN_TO_CHECK` 的离线过宽检查（统计每条命中哪些题目），B1、B2 之前再定；
 - 同一 train task 若有多个裸 run，取哪一个（首版每 task 只跑一次，暂不涉及）。
+- 规则 `EXAMPLE_USAGE` 泄漏实体事实和 gold 值（阶段 C 试跑 5 条中 4 条）：目前只靠 prompt 约束
+  （`INSTANCE` 与 `FACT` 分开写），不设确定性检查（决策 44）；修订后试跑若仍常见，再考虑让通用性判断
+  同时检查例子；
+- `non_data` 的边界：计算步骤里写错系数（例如 `task_011 #2` 把千万元与百万元的换算系数写反）算不算
+  `non_data`；
+- 反思 prompt 与通用性判断 prompt 的最终文本（5.6 节为 `BASIS` 部分的草稿），必须逐条确认；
+- 阶段 B 的缺口：divergence 引用的文件应出现在它所引 probe 的命令或输出里，暂未检查。
 
 ---
 
