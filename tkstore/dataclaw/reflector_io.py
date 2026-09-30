@@ -1,7 +1,8 @@
 """Parse the reflector's turns: one ``<probe>`` or one ``<final>``.
 
 A ``<final>`` holds divergence blocks, each starting with ``DIVERGENCE:``, in
-the format of TK-Boost-adapt.md section 5.4. Structural mistakes are collected
+the format of TK-Boost-adapt.md section 5.6 (5.4 plus BASIS, INSTANCE,
+GENERALITY and the rule fields). Structural mistakes are collected
 per block in ``Divergence.errors`` so they can be sent back to the reflector.
 """
 
@@ -18,6 +19,12 @@ KINDS = ("data", "non_data", "gold_suspect")
 _FIELDS = (
     "DIVERGENCE", "NEEDED", "MISSING_DATA_UNDERSTANDING", "SCOPE", "TABLES", "COLUMNS",
     "FACT", "CATEGORY", "EVIDENCE", "REPRODUCED", "SEMANTIC_MATCH", "KIND",
+    "BASIS", "BASIS_QUOTE", "INSTANCE", "GENERALITY",
+    "ENSURE", "WHEN_TO_CHECK", "TRIGGER", "CONTEXT", "EXAMPLE_USAGE",
+)
+_TEXT_FIELDS = (
+    "DIVERGENCE", "NEEDED", "SCOPE", "FACT", "CATEGORY", "BASIS_QUOTE", "INSTANCE",
+    "ENSURE", "WHEN_TO_CHECK", "TRIGGER", "CONTEXT", "EXAMPLE_USAGE",
 )
 _FIELD_LINE = re.compile(rf"^\s*({'|'.join(_FIELDS)}):\s?(.*)$")
 _EVIDENCE = re.compile(r"^probe#(\d+)\s*(?:→|->|:)\s*(.*)$", re.DOTALL)
@@ -53,6 +60,15 @@ class Divergence:
     evidence: list[Evidence] = field(default_factory=list)
     reproduced: list[Reproduction] = field(default_factory=list)
     kind: str = ""
+    basis: str = ""
+    basis_quote: str = ""
+    instance: str = ""
+    generality: list[Evidence] = field(default_factory=list)
+    ensure: str = ""
+    when_to_check: str = ""
+    trigger: str = ""
+    context: str = ""
+    example_usage: str = ""
     errors: list[str] = field(default_factory=list)
 
 
@@ -89,16 +105,16 @@ def _field_entries(block: str) -> list[tuple[str, str]]:
 def _parse_block(index: int, block: str) -> Divergence:
     d = Divergence(index=index)
     for key, value in _field_entries(block):
-        if key == "DIVERGENCE":
-            d.divergence = value
-        elif key == "NEEDED":
-            d.needed = value
-        elif key == "SCOPE":
-            d.scope = value
-        elif key == "FACT":
-            d.fact = value
-        elif key == "CATEGORY":
-            d.category = value
+        if key in _TEXT_FIELDS:
+            setattr(d, key.lower(), value)
+        elif key == "BASIS":
+            d.basis = value.strip().lower()
+        elif key in ("EVIDENCE", "GENERALITY"):
+            match = _EVIDENCE.match(value)
+            if match:
+                getattr(d, key.lower()).append(Evidence(int(match.group(1)), match.group(2).strip()))
+            else:
+                d.errors.append(f"{key} must be written as probe#<n> → <excerpt>, got {value!r}")
         elif key in ("TABLES", "COLUMNS"):
             try:
                 if key == "TABLES":
@@ -107,12 +123,6 @@ def _parse_block(index: int, block: str) -> Divergence:
                     d.columns = parse_columns(value)
             except ValueError as exc:
                 d.errors.append(str(exc))
-        elif key == "EVIDENCE":
-            match = _EVIDENCE.match(value)
-            if match:
-                d.evidence.append(Evidence(int(match.group(1)), match.group(2).strip()))
-            else:
-                d.errors.append(f"EVIDENCE must be written as probe#<n> → <excerpt>, got {value!r}")
         elif key == "REPRODUCED":
             match = _REPRODUCED.match(value)
             if not match:

@@ -25,21 +25,33 @@ CATEGORY: 同一指标有多个名字
 EVIDENCE: probe#1 → Y_EC_5 营收金额 1004
 REPRODUCED: milestone "Number of companies" = 2778 FROM probe#1
 KIND: data
-</final>"""
+NEEDED_BASIS_PLACEHOLDER
+</final>""".replace("NEEDED_BASIS_PLACEHOLDER\n", """BASIS: data
+INSTANCE: the agent kept only the spelling it saw first for the companies in the task
+GENERALITY: probe#1 → Y_EC_5 营业收入金额 2778
+ENSURE: select an indicator by secondTargetNum and keep every targetName under it
+WHEN_TO_CHECK: the question uses a company-level indicator
+TRIGGER: the highest revenue
+CONTEXT: each company uses one targetName spelling per secondTargetNum
+EXAMPLE_USAGE: Y_EC_5 is spelled 营收金额 for some companies
+""")
 
 BAD_FINAL = GOOD_FINAL.replace("Y_EC_5 营收金额 1004", "Y_EC_5 营收金额 9999")
 PROBE_TURN = "PLAN: count spellings\n<probe>\ncut -d, -f3,4 ./database/x.csv | sort | uniq -c\n</probe>"
 PROBE_OUTPUT = "Y_EC_5 营收金额 1004\nY_EC_5 营业收入金额 2778"
+JUDGE_ACCEPT = "VERDICT: accept\nREASON: holds for every indicator code"
+JUDGE_REJECT = "VERDICT: reject\nREASON: only true for one named company"
 
 
 class ScriptedLLM:
-    def __init__(self, replies):
+    def __init__(self, replies, default="PLAN: nothing"):
         self.replies = list(replies)
+        self.default = default
         self.calls = []
 
     def __call__(self, messages):
         self.calls.append([dict(m) for m in messages])
-        reply = self.replies.pop(0) if self.replies else "PLAN: nothing"
+        reply = self.replies.pop(0) if self.replies else self.default
         if isinstance(reply, BaseException):
             raise reply
         return reply
@@ -92,12 +104,14 @@ def loaded(tmp_path):
     )
 
 
-def _reflect(loaded, replies, clock=None, **config):
+def _reflect(loaded, replies, clock=None, judge=None, **config):
     llm = ScriptedLLM(replies)
+    judge = judge if judge is not None else ScriptedLLM([], default=JUDGE_ACCEPT)
     executor = FakeExecutor()
     with ProbeSession(executor, timeout=60, max_llm_chars=4000) as session:
         result = reflect(
-            loaded, llm=llm, session=session, catalog=CATALOG, config=ReflectorConfig(**config), clock=clock
+            loaded, llm=llm, session=session, catalog=CATALOG, config=ReflectorConfig(**config),
+            clock=clock, judge_llm=judge,
         )
     return result, llm, executor
 
@@ -114,6 +128,15 @@ def _clock(*values):
 
 
 EMPTY = LLMReply("", "length", False, 800.0)
+
+
+def test_system_prompt_asks_for_every_field_the_gates_require(loaded):
+    system = build_messages(loaded, CATALOG, ReflectorConfig())[0]["content"]
+    for field in ["BASIS", "BASIS_QUOTE", "INSTANCE", "GENERALITY", "ENSURE", "WHEN_TO_CHECK",
+                  "TRIGGER", "CONTEXT", "EXAMPLE_USAGE"]:
+        assert f"{field}:" in system, field
+    for basis in ["data", "task", "gold_only"]:
+        assert f"- {basis}:" in system, basis
 
 
 def test_messages_carry_every_input(loaded):
@@ -188,13 +211,88 @@ def test_non_data_divergence_is_logged(loaded):
 
 def test_llm_replies_are_used_and_their_stats_recorded(loaded):
     replies = [LLMReply(PROBE_TURN, "stop", False, 12.5), LLMReply(GOOD_FINAL, "stop", False, 30.0)]
-    result, _, _ = _reflect(loaded, replies)
+    judge = ScriptedLLM([LLMReply(JUDGE_ACCEPT, "stop", False, 4.0)])
+    result, _, _ = _reflect(loaded, replies, judge=judge)
     assert len(result.accepted) == 1
-    assert [(c["finish_reason"], c["elapsed_s"], c["timed_out"]) for c in result.llm_calls] == [
-        ("stop", 12.5, False),
-        ("stop", 30.0, False),
+    assert [(c["stage"], c["finish_reason"], c["elapsed_s"], c["timed_out"]) for c in result.llm_calls] == [
+        ("reflect", "stop", 12.5, False),
+        ("reflect", "stop", 30.0, False),
+        ("judge", "stop", 4.0, False),
     ]
     assert result.llm_calls[0]["text_chars"] == len(PROBE_TURN)
+
+
+def test_judge_sees_the_divergence_rule_and_generality_probe(loaded):
+    judge = ScriptedLLM([JUDGE_ACCEPT])
+    result, _, _ = _reflect(loaded, [PROBE_TURN, GOOD_FINAL], judge=judge)
+    assert len(result.accepted) == 1
+    (messages,) = judge.calls
+    assert [m["role"] for m in messages] == ["system", "user"]
+    assert "VERDICT" in messages[0]["content"]
+    user = messages[1]["content"]
+    for fragment in (
+        "FACT: one secondTargetNum has several targetName spellings",
+        "BASIS: data",
+        "INSTANCE: the agent kept only the spelling",
+        "ENSURE: select an indicator by secondTargetNum",
+        "EXAMPLE_USAGE: Y_EC_5 is spelled 营收金额",
+        "cut -d, -f3,4 ./database/x.csv | sort | uniq -c",
+        PROBE_OUTPUT,
+    ):
+        assert fragment in user, fragment
+    assert "Beijing" not in user
+
+
+def test_judge_rejection_is_sent_back_and_fix_is_accepted(loaded):
+    judge = ScriptedLLM([JUDGE_REJECT, JUDGE_ACCEPT])
+    result, llm, _ = _reflect(loaded, [PROBE_TURN, GOOD_FINAL, GOOD_FINAL], judge=judge)
+    feedback = llm.calls[2][-1]["content"]
+    assert "REJECTED" in feedback and "GENERALITY JUDGE: only true for one named company" in feedback
+    assert len(result.accepted) == 1 and result.finals == 2 and result.rejected == []
+
+
+def test_judge_rejection_uses_up_the_final_budget(loaded):
+    judge = ScriptedLLM([], default=JUDGE_REJECT)
+    result, _, _ = _reflect(loaded, [PROBE_TURN, GOOD_FINAL], judge=judge, max_finals=1)
+    assert result.stop_reason == "final_budget"
+    assert result.accepted == []
+    assert result.rejected[0].reasons == ["GENERALITY JUDGE: only true for one named company"]
+
+
+def test_unparseable_judge_reply_is_retried_once(loaded):
+    judge = ScriptedLLM(["", JUDGE_ACCEPT])
+    result, _, _ = _reflect(loaded, [PROBE_TURN, GOOD_FINAL], judge=judge)
+    assert len(result.accepted) == 1 and len(judge.calls) == 2
+
+
+def test_judge_failing_twice_is_a_judge_error_not_sent_back(loaded):
+    judge = ScriptedLLM(["", "I think it is fine"])
+    result, llm, _ = _reflect(loaded, [PROBE_TURN, GOOD_FINAL], judge=judge)
+    assert result.accepted == [] and result.rejected == []
+    assert len(result.judge_errors) == 1
+    assert result.judge_errors[0].divergence.fact == "one secondTargetNum has several targetName spellings"
+    assert result.stop_reason == "done" and len(llm.calls) == 2
+
+
+def test_divergence_failing_the_gates_is_not_judged(loaded):
+    judge = ScriptedLLM([], default=JUDGE_ACCEPT)
+    result, _, _ = _reflect(loaded, [PROBE_TURN, BAD_FINAL, GOOD_FINAL], judge=judge)
+    assert len(judge.calls) == 1 and len(result.accepted) == 1
+
+
+def test_judge_defaults_to_the_reflector_llm(loaded):
+    llm = ScriptedLLM([PROBE_TURN, GOOD_FINAL, JUDGE_ACCEPT])
+    with ProbeSession(FakeExecutor(), timeout=60, max_llm_chars=4000) as session:
+        result = reflect(loaded, llm=llm, session=session, catalog=CATALOG, config=ReflectorConfig())
+    assert len(result.accepted) == 1
+    assert "VERDICT" in llm.calls[2][0]["content"]
+
+
+def test_basis_quote_is_checked_against_the_task(loaded):
+    task_final = GOOD_FINAL.replace("BASIS: data", "BASIS: task\nBASIS_QUOTE: the lowest revenue")
+    result, llm, _ = _reflect(loaded, [PROBE_TURN, task_final, GOOD_FINAL])
+    assert "BASIS_QUOTE 'the lowest revenue' does not appear in the task" in llm.calls[2][-1]["content"]
+    assert len(result.accepted) == 1
 
 
 def test_one_empty_reply_gets_a_specific_nudge_and_the_run_recovers(loaded):
@@ -265,3 +363,5 @@ def test_record_is_json_serializable(loaded):
     assert record["accepted"][0]["divergence"]["columns"][0] == [OPS, "secondTargetNum"]
     assert record["probes"][0]["output"] == PROBE_OUTPUT
     assert record["stop_reason"] == "done"
+    assert record["judge_errors"] == []
+    assert record["accepted"][0]["divergence"]["generality"][0]["probe"] == 1

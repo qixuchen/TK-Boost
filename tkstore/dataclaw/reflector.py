@@ -1,12 +1,15 @@
-"""The reflector loop: probe the data, then submit gated divergences.
+"""The reflector loop: probe the data, then submit gated divergences with their rules.
 
-The LLM is injected as a callable (messages -> reply text), so the loop and the
-gates can be tested with a scripted model; ``litellm_llm`` is the real one.
+A data divergence that passes the deterministic gates goes to one LLM call, the
+generality judge; a rejection is sent back like a gate rejection.
+The LLMs are injected as callables (messages -> reply text or ``LLMReply``), so
+the loop can be tested with scripted models; ``litellm_llm`` is the real one.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -15,14 +18,20 @@ from typing import Any, Callable
 
 from .catalog import Catalog
 from .devset import LoadedRun
-from .gates import ACCEPTED, LOGGED, GateResult, check_divergence, missed_milestones
+from .gates import ACCEPTED, LOGGED, REJECTED, GateResult, check_divergence, missed_milestones
 from .probe import ProbeRecord, ProbeSession
-from .reflector_io import parse_turn
-from .trajectory import compress
+from .reflector_io import Divergence, parse_turn
+from .trajectory import compress, truncate_middle
 
-LLM = Callable[[list[dict[str, str]]], str]
+LLM = Callable[[list[dict[str, str]]], "str | LLMReply"]
 PROMPT_PATH = Path(__file__).with_name("prompts") / "reflector.md"
+JUDGE_PROMPT_PATH = Path(__file__).with_name("prompts") / "reflector_judge.md"
+JUDGE_ERROR = "judge_error"
+JUDGE_ATTEMPTS = 2
+JUDGE_PROBE_CHARS = 4000
 EXTRA_TURNS = 3
+_VERDICT = re.compile(r"^\s*VERDICT:\s*(accept|reject)\b", re.IGNORECASE | re.MULTILINE)
+_REASON = re.compile(r"^\s*REASON:\s*(.*)", re.MULTILINE | re.DOTALL)
 EMPTY_REPLY_NUDGE = (
     "EMPTY REPLY: your previous reply was cut off before any text. Do not deliberate at length; "
     "reply now with one short PLAN and one <probe>, or with your <final>."
@@ -50,6 +59,7 @@ class ReflectionResult:
     accepted: list[GateResult] = field(default_factory=list)
     rejected: list[GateResult] = field(default_factory=list)
     logged: list[GateResult] = field(default_factory=list)
+    judge_errors: list[GateResult] = field(default_factory=list)
     probes: list[ProbeRecord] = field(default_factory=list)
     messages: list[dict[str, str]] = field(default_factory=list)
     probes_used: int = 0
@@ -182,6 +192,85 @@ def _verdict_message(results: list[GateResult], finals_left: int) -> str:
     return "\n".join(lines)
 
 
+def _call(llm: LLM, messages: list[dict[str, str]], stage: str, calls: list[dict[str, Any]]) -> LLMReply:
+    raw = llm(messages)
+    reply = raw if isinstance(raw, LLMReply) else LLMReply(raw)
+    calls.append({
+        "stage": stage,
+        "finish_reason": reply.finish_reason,
+        "timed_out": reply.timed_out,
+        "elapsed_s": reply.elapsed_s,
+        "text_chars": len(reply.text),
+    })
+    return reply
+
+
+def _divergence_text(d: Divergence) -> str:
+    lines = [
+        f"DIVERGENCE: {d.divergence}",
+        f"NEEDED: {d.needed}",
+        f"BASIS: {d.basis}",
+    ]
+    if d.basis_quote:
+        lines.append(f"BASIS_QUOTE: {d.basis_quote}")
+    lines += [
+        f"INSTANCE: {d.instance}",
+        f"SCOPE: {d.scope}",
+        f"TABLES: {', '.join(d.tables)}",
+        f"COLUMNS: {', '.join(f'{c.file}.{c.column}' for c in d.columns)}",
+        f"FACT: {d.fact}",
+        f"CATEGORY: {d.category}",
+    ]
+    lines += [f"EVIDENCE: probe#{e.probe} → {e.excerpt}" for e in d.evidence]
+    lines += [f"GENERALITY: probe#{g.probe} → {g.excerpt}" for g in d.generality]
+    lines += [
+        f"ENSURE: {d.ensure}",
+        f"WHEN_TO_CHECK: {d.when_to_check}",
+        f"TRIGGER: {d.trigger}",
+        f"CONTEXT: {d.context}",
+        f"EXAMPLE_USAGE: {d.example_usage}",
+    ]
+    return "\n".join(lines)
+
+
+def build_judge_messages(d: Divergence, probes: dict[int, ProbeRecord]) -> list[dict[str, str]]:
+    cited = []
+    for number in dict.fromkeys(g.probe for g in d.generality):
+        record = probes.get(number)
+        if record is not None:
+            output = truncate_middle(record.output, JUDGE_PROBE_CHARS) if record.output else "(no output)"
+            cited.append(f"probe#{number}: {record.command}\n{output}")
+    user = "\n\n".join([
+        f"## Divergence and rule\n{_divergence_text(d)}",
+        "## GENERALITY probes (command and output)\n" + "\n\n".join(cited),
+    ])
+    return [
+        {"role": "system", "content": JUDGE_PROMPT_PATH.read_text(encoding="utf-8")},
+        {"role": "user", "content": user},
+    ]
+
+
+def parse_judge(text: str) -> tuple[str | None, str]:
+    """Return ("accept" | "reject" | None, reason); None when the reply has no VERDICT line."""
+    verdict = _VERDICT.search(text or "")
+    reason = _REASON.search(text or "")
+    return (verdict.group(1).lower() if verdict else None, reason.group(1).strip() if reason else "")
+
+
+def _judge(v: GateResult, llm: LLM, session: ProbeSession, result: ReflectionResult) -> GateResult:
+    """Generality judge on a divergence that passed the deterministic gates; retried once."""
+    messages = build_judge_messages(v.divergence, {r.number: r for r in session.records})
+    reply = None
+    for _ in range(JUDGE_ATTEMPTS):
+        reply = _call(llm, messages, "judge", result.llm_calls)
+        verdict, reason = parse_judge(reply.text)
+        if verdict == "accept":
+            return v
+        if verdict == "reject":
+            return GateResult(v.divergence, REJECTED, [f"GENERALITY JUDGE: {reason}"])
+    return GateResult(v.divergence, JUDGE_ERROR, [f"judge reply had no VERDICT line: {reply.text[:200]!r}"])
+
+
 def _identity(result: GateResult) -> tuple:
     d = result.divergence
     return (d.fact.strip(), tuple(d.tables), tuple(d.columns))
@@ -197,6 +286,8 @@ def _handle_turn(
     milestones: dict[str, Any],
     missed: set[str],
     seen: set[tuple],
+    task_prompt: str,
+    judge_llm: LLM,
 ) -> str | None:
     """Act on one non-empty reply; return the feedback, or None once the run is over."""
     turn = parse_turn(text)
@@ -212,16 +303,22 @@ def _handle_turn(
     result.finals += 1
     outputs = {r.number: r.output for r in session.records}
     verdicts = [
-        check_divergence(d, probes=outputs, catalog=catalog, milestones=milestones, missed=missed)
+        check_divergence(
+            d, probes=outputs, catalog=catalog, milestones=milestones, missed=missed, task_prompt=task_prompt
+        )
         for d in turn.divergences
     ]
-    for v in verdicts:
+    for i, v in enumerate(verdicts):
         if v.status == ACCEPTED and _identity(v) not in seen:
-            seen.add(_identity(v))
-            result.accepted.append(v)
+            v = verdicts[i] = _judge(v, judge_llm, session, result)
+            if v.status == ACCEPTED:
+                seen.add(_identity(v))
+                result.accepted.append(v)
+            elif v.status == JUDGE_ERROR:
+                result.judge_errors.append(v)
         elif v.status == LOGGED:
             result.logged.append(v)
-    result.rejected = [v for v in verdicts if v.status not in (ACCEPTED, LOGGED)]
+    result.rejected = [v for v in verdicts if v.status == REJECTED]
     if not result.rejected:
         result.stop_reason = "done"
         return None
@@ -239,6 +336,7 @@ def reflect(
     catalog: Catalog,
     config: ReflectorConfig,
     clock: Callable[[], float] | None = None,
+    judge_llm: LLM | None = None,
 ) -> ReflectionResult:
     """Run one reflection; errors and interrupts end it but keep what was collected."""
     tick = clock or time.monotonic
@@ -250,6 +348,8 @@ def reflect(
         milestones=loaded.gold.get("milestone") or {},
         missed=missed_milestones(loaded.process_score),
         seen=set(),
+        task_prompt=loaded.prompt,
+        judge_llm=judge_llm or llm,
     )
     start = tick()
     empties = 0
@@ -257,14 +357,7 @@ def reflect(
 
     try:
         for _ in range(config.max_turns):
-            raw = llm(result.messages)
-            reply = raw if isinstance(raw, LLMReply) else LLMReply(raw)
-            result.llm_calls.append({
-                "finish_reason": reply.finish_reason,
-                "timed_out": reply.timed_out,
-                "elapsed_s": reply.elapsed_s,
-                "text_chars": len(reply.text),
-            })
+            reply = _call(llm, result.messages, "reflect", result.llm_calls)
             result.messages.append({"role": "assistant", "content": reply.text})
 
             if not reply.text.strip():
@@ -312,6 +405,7 @@ def to_record(loaded: LoadedRun, result: ReflectionResult) -> dict[str, Any]:
         "finals": result.finals,
         "accepted": [asdict(r) for r in result.accepted],
         "rejected": [asdict(r) for r in result.rejected],
+        "judge_errors": [asdict(r) for r in result.judge_errors],
         "logged": [asdict(r) for r in result.logged],
         "probes": [asdict(p) for p in result.probes],
         "messages": result.messages,

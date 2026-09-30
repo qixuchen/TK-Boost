@@ -26,6 +26,21 @@ KIND: data
 """
 
 
+RULE_FIELDS = """BASIS: Task
+BASIS_QUOTE: in Shanghai
+INSTANCE: the company in the task is filed under a Chinese name
+          with province 上海市
+GENERALITY: probe#6 → 49 of 49 secondTargetNum codes have 2+ spellings
+GENERALITY: probe#7 -> spellings per code: min 2 max 6
+ENSURE: filter by secondTargetNum,
+        not by an exact targetName
+WHEN_TO_CHECK: the question uses a company-level indicator
+TRIGGER: total operating revenue
+CONTEXT: each company uses one spelling
+EXAMPLE_USAGE: Y_EC_5 has 营收金额 and 营业收入金额
+"""
+
+
 def test_probe_turn():
     turn = parse_turn("PLAN: check spellings\n<probe>\ncut -d, -f4 ./database/x.csv | sort | uniq -c\n</probe>")
     assert turn.kind == "probe"
@@ -81,6 +96,31 @@ def test_data_divergence_fields():
     assert d.kind == "data"
 
 
+def test_basis_instance_generality_and_rule_fields():
+    (d,) = parse_turn(f"<final>\n{DATA_BLOCK}{RULE_FIELDS}</final>").divergences
+    assert d.errors == []
+    assert d.basis == "task"
+    assert d.basis_quote == "in Shanghai"
+    assert d.instance == "the company in the task is filed under a Chinese name\nwith province 上海市"
+    assert [(g.probe, g.excerpt) for g in d.generality] == [
+        (6, "49 of 49 secondTargetNum codes have 2+ spellings"),
+        (7, "spellings per code: min 2 max 6"),
+    ]
+    assert d.ensure == "filter by secondTargetNum,\nnot by an exact targetName"
+    assert d.when_to_check == "the question uses a company-level indicator"
+    assert d.trigger == "total operating revenue"
+    assert d.context == "each company uses one spelling"
+    assert d.example_usage == "Y_EC_5 has 营收金额 and 营业收入金额"
+    assert len(d.evidence) == 2 and d.kind == "data"
+
+
+def test_block_without_new_fields_leaves_them_empty():
+    (d,) = parse_turn(f"<final>\n{DATA_BLOCK}</final>").divergences
+    assert d.errors == []
+    assert (d.basis, d.basis_quote, d.instance, d.generality) == ("", "", "", [])
+    assert (d.ensure, d.when_to_check, d.trigger, d.context, d.example_usage) == ("", "", "", "", "")
+
+
 def test_multiple_blocks_and_non_data_block():
     text = f"<final>\n{DATA_BLOCK}\nDIVERGENCE: subtracted in the wrong order\nNEEDED: 2022 minus 2021\nKIND: non_data\n</final>"
     first, second = parse_turn(text).divergences
@@ -106,6 +146,7 @@ def test_reproduced_with_list_and_dict_values():
         ("REPRODUCED: k = 3 from probe 1", 'milestone "<key>"'),
         ("SEMANTIC_MATCH: dangling", "SEMANTIC_MATCH"),
         ("EVIDENCE: the output showed it", "probe#"),
+        ("GENERALITY: holds for every code", "GENERALITY must be written as probe#"),
         ("KIND: maybe", "KIND"),
         (f"  COLUMNS: {OPS}", "COLUMNS"),
         (f"  TABLES: {OPS}.value", "TABLES"),

@@ -10,7 +10,9 @@ python3 with the standard library only; no pandas), the same working directory,
 Your goal is to find which DATA UNDERSTANDING the agent lacked: a fact about the
 files, columns or values that, had the agent known it, would have led it to the
 correct intermediate results. Do NOT restate the reference steps. Every claimed
-divergence must state a data fact and prove it with probe output.
+divergence must state a data fact and prove it with probe output. For each data
+divergence you also write one reusable rule for future agents, and prove with
+probes that the fact behind it holds beyond the entities of this task.
 
 ## How to work
 
@@ -38,6 +40,10 @@ $max_finals <final> submissions.
   and grep on a few rows will not reveal them.
 - Parse CSV files as CSV (python3 -c with the csv module) whenever a field may
   contain quotes, commas or newlines.
+- Before you generalise a fact from the entities of this task to a whole column
+  or file, probe it on other rows: other companies, other industries, other
+  indicators, other years. A fact seen only on the task's entities is not yet a
+  column-level fact.
 
 ## What to look for (hints, not a closed list)
 
@@ -85,24 +91,57 @@ contradicts what the data shows. Do not use such a gold milestone as proof.
 
 <final>
 DIVERGENCE: <at which step (CALL #n) the agent did what>
-NEEDED: <what it should have done>
+NEEDED: <what this task needed instead>
+BASIS: data | task | gold_only
+BASIS_QUOTE: <words copied from the task; only when BASIS is task>
+INSTANCE: <what you observed on the entities of this task>
 MISSING_DATA_UNDERSTANDING:
   SCOPE: column | multi_column | file | cross_table | generic
   TABLES: <file>[, <file> ...]
   COLUMNS: <file>.<column>[, <file>.<column> ...]
-  FACT: <one fact about the data>
+  FACT: <one column-level fact about the data>
 CATEGORY: <the number and name of the hint above, or "Other">
 EVIDENCE: probe#<n> → <a line copied verbatim from that probe's output>
 REPRODUCED: milestone "<key>" = <JSON value> FROM probe#<m>
 SEMANTIC_MATCH: <why the value means the same as gold; only when the wording differs>
+GENERALITY: probe#<k> → <a line copied verbatim from that probe's output>
+ENSURE: <what a future agent should do>
+WHEN_TO_CHECK: <the shape of question that needs this rule>
+TRIGGER: <the phrase of this task that called for this knowledge>
+CONTEXT: <why: the data property behind the rule>
+EXAMPLE_USAGE: <right vs wrong handling, with concrete values>
 KIND: data | non_data | gold_suspect
 
 DIVERGENCE: <next one> ...
 </final>
 
+What each field says:
+
+- DIVERGENCE describes only what the agent did, at which CALL. Do not put the
+  correct values here.
+- NEEDED says what this task needed instead, in terms of files, columns and
+  operations. Say it for this task only; whether it applies to other tasks is
+  what BASIS records.
+- BASIS says who requires what NEEDED describes (see "BASIS" below).
+- INSTANCE is what you saw on the entities of this task: company names, the
+  province, the values the agent and the reference got. It is used to check
+  your reasoning and never goes into the rule.
+- FACT is a property of files and columns that still holds when the concrete
+  values are replaced by other values of the same columns. It does not name a
+  specific company, policy or indicator; those belong in INSTANCE.
+- TABLES and COLUMNS list only the files and columns the fact is about, not
+  every attribute the question mentions.
+- GENERALITY cites a probe showing the fact beyond the entities of this task,
+  for example the same distribution over all indicators, over other industries
+  or over all rows of the file. A probe that only looks at the task's entities
+  does not count. You may give several GENERALITY lines.
+- ENSURE, WHEN_TO_CHECK, TRIGGER, CONTEXT and EXAMPLE_USAGE are the rule; see
+  "Writing the rule" below.
+
 Rules for the block:
 
 - One data fact per divergence; split several facts into several divergences.
+  Each data divergence gives exactly one rule.
 - <file> is always the full path under database/, e.g. enterprise/company_profile.csv.
   TABLES lists files the fact is about as a whole; COLUMNS lists the columns it
   is about. Leave both empty only for a generic fact.
@@ -125,9 +164,151 @@ Rules for the block:
   NO_DATA_DIVERGENCE: <reason>, optionally followed by non_data or
   gold_suspect blocks.
 
+## BASIS
+
+BASIS says who requires what NEEDED describes. Pick exactly one:
+
+- data: the data forces it, whatever the question says. Without it the correct
+  values cannot be obtained.
+  e.g. The task names "Hua Xin Tech Co., Ltd." but bmCompanyName only holds
+  Chinese names, so the name must first be looked up in the translation file.
+  e.g. Rows of one indicator carry different targetUnit values, so each row must
+  be converted by its own unit before summing.
+
+- task: the wording of the question decides it; a differently worded question
+  would need a different action. Quote the words on a BASIS_QUOTE line, copied
+  verbatim from the task.
+  e.g. The task asks for the figure "in Shanghai", so the provincial file must be
+  used rather than the national one.
+  BASIS_QUOTE: in Shanghai
+
+- gold_only: neither the data nor the question forces it; the reference answer
+  simply made this choice. Another task's reference may choose differently.
+  e.g. The task counts "enterprises in the industry" without restricting listing
+  venue, and the reference counts only companies on domestic exchanges.
+
+If you are unsure between task and gold_only, ask: would a careful analyst who
+reads only the question make the same choice? If not, it is gold_only.
+
+## Writing the rule
+
+The rule is for a future agent answering a different question on the same
+database. It never sees this task, the trajectory or the reference.
+
+A good rule:
+
+- is anchored on files and columns. Remove the file and column names and it
+  should no longer make sense; "check units before comparing" is too generic.
+- still holds when the concrete value in the example is replaced by another
+  value of the same column. "The revenue unit is 十万元" is too specific: it is
+  true only for some rows and only useful when that one indicator is asked.
+- is reusable across tasks. A fact about one entity ("company X is in the
+  banking industry") is not a rule: it does not generalise and it leaks answers.
+- has a CONTEXT that states a property one probe could verify (a distribution, a
+  format, a coverage gap), not "the data may be unreliable".
+- describes what property of the data to check, not how to check it with a
+  particular library or command. Write "parse the file as CSV with quoted
+  fields", not "use csv.reader".
+
+The files and columns of the rule are the TABLES and COLUMNS of the divergence.
+
+How BASIS shapes the rule:
+
+- data: ENSURE may state a fixed action ("look the English name up in the
+  translation file first").
+- task: ENSURE states the action conditioned on the question ("when the question
+  names a province, ..."), and WHEN_TO_CHECK describes that signal in the
+  question.
+- gold_only: ENSURE must NOT state the reference's choice as a fixed action. It
+  says which dimension has to be decided and that it must be decided from the
+  question ("check the distribution of exchange and restrict the population only
+  as the question states"). The reference's choice may appear only in
+  EXAMPLE_USAGE, explicitly marked as one task's convention.
+
+Field requirements:
+
+- Write the rule in English. Keep file names, column names and cell values
+  exactly as they appear in the data (they are often Chinese).
+- ENSURE, WHEN_TO_CHECK and CONTEXT may name files and columns and use general
+  words only. Any concrete cell value belongs in EXAMPLE_USAGE. Indicator names,
+  industry names, units, exchange names, province names, years and other numbers
+  are all cell values, even when they read like ordinary words. Do not
+  paraphrase a cell value to avoid naming it (for example by describing the
+  characters of a unit); state the rule at the level of the column instead.
+- TRIGGER quotes the fragment of this task that made the knowledge necessary. It
+  may contain entity names; it is kept for review only.
+- WHEN_TO_CHECK abstracts TRIGGER into the shape of the question: drop the
+  specific entities and values and keep what kind of question it is (for
+  example, from "how many enterprises are in the health and social work
+  industry" to "the question is about an industry or a province rather than a
+  specific company").
+- EXAMPLE_USAGE illustrates the column-level rule. Do not state an attribute or
+  a value of a specific company or policy (which industry it belongs to, what
+  its revenue is), and do not copy the answer or a milestone value of this task.
+
+Examples of acceptable rules (only the BASIS, file and rule fields are shown):
+
+BASIS: data
+TABLES: industry/national_industry_status.csv, industry/regional_industry_status.csv
+COLUMNS: enterprise/company_profile.csv.industry
+ENSURE: When the question asks for an aggregate of an industry, or of an industry in a province (number of enterprises, total, maximum, median), first look for the matching targetName in the two summary files and take its value directly; aggregate the company-level rows only when the summary files lack the indicator.
+WHEN_TO_CHECK: The question is about an industry or a province rather than a specific company.
+TRIGGER: the number of enterprises in Health and Social Work in the industry of …
+CONTEXT: The summary files' values differ from counts over company_profile.csv rows, and no filter on the company rows reproduces them.
+EXAMPLE_USAGE: For one industry the summary file reports an enterprise count that matches neither the count of all its company_profile.csv rows nor the count of the rows whose country is 中国; counting the company rows gives a wrong answer.
+
+BASIS: data
+TABLES:
+COLUMNS: enterprise/company_operation_status.csv.targetUnit, enterprise/company_operation_status.csv.value, enterprise/company_operation_status.csv.secondTargetNum
+ENSURE: Before summing, comparing or dividing value, convert each row to one unit using its own targetUnit; convert again to the unit the question asks for before answering.
+WHEN_TO_CHECK: The question combines the same indicator across several companies, or asks for the answer in a given unit.
+TRIGGER: what is the difference in total liabilities
+CONTEXT: Even for the same indicator, targetUnit differs from company to company, ranging from 元 up to much larger units.
+EXAMPLE_USAGE: In 2022 the rows of 营收金额 use five units (元, 万元, 十万元, 百万元, 千万元), about 200 rows each; adding value directly mixes numbers that differ by orders of magnitude.
+
+BASIS: data
+TABLES: bilingual_translation_english_chinese.json
+COLUMNS: enterprise/company_profile.csv.bmCompanyName
+ENSURE: Look an English company name up in the translation file first; if it is not there, treat it as the pinyin of the Chinese name, list every bmCompanyName whose reading matches, and check character by character until exactly one candidate remains.
+WHEN_TO_CHECK: The question names a specific company by its English name.
+TRIGGER: Run Hui Shu Zhi Xi Tong Co., Ltd.
+CONTEXT: The translation file covers only part of the companies, and many bmCompanyName values share their first two characters, so the first approximate match is often a different company.
+EXAMPLE_USAGE: At least ten bmCompanyName values start with the same two characters as the target; searching a homophone of the second word returns nothing, and taking the nearest spelling picks a company in another province.
+
+BASIS: gold_only
+TABLES:
+COLUMNS: enterprise/company_profile.csv.country, enterprise/company_profile.csv.exchange
+ENSURE: Before fixing the set of companies to count, check the distribution of country and exchange, and restrict the population only as the question states; when the question sets no restriction, do not silently drop a group of companies.
+WHEN_TO_CHECK: The question counts or ranks companies of an industry, a province or an ownership type.
+TRIGGER: enterprises in the industry
+CONTEXT: The company file holds companies listed on domestic, Hong Kong and overseas exchanges, and different questions draw the population differently.
+EXAMPLE_USAGE: Rows whose country is 中国 are the large majority and those whose country is 中国香港 a few hundred; one task's reference counted only the former. This is that task's convention, not a general rule.
+
+Examples that are not acceptable:
+
+- ENSURE: The unit of 营收金额 is 十万元.
+  Rejected: a cell value in ENSURE, and it holds only for some rows of one
+  indicator.
+- ENSURE: Company X belongs to the 银行 industry.
+  Rejected: an entity fact; it cannot be reused and it may leak answers.
+- BASIS: gold_only / ENSURE: Always keep only companies on domestic exchanges.
+  Rejected: the reference's choice is stated as a fixed action.
+
+## What the harness checks
+
 The harness, not you, decides whether a divergence is verified. It checks that
-every cited probe exists, that each EVIDENCE excerpt and REPRODUCED value appear
-in the cited output, that the files and columns exist, that SCOPE agrees with
-TABLES and COLUMNS, and it compares numbers with gold at 1% relative tolerance.
-It replies with a verdict for each divergence. Accepted divergences are kept;
-resubmit a <final> containing only the rejected ones you have fixed.
+every cited probe exists, that each EVIDENCE and GENERALITY excerpt and each
+REPRODUCED value appear in the cited output, that the files and columns exist,
+that SCOPE agrees with TABLES and COLUMNS, and it compares numbers with gold at
+1% relative tolerance. For a data divergence it also checks that NEEDED, BASIS,
+INSTANCE, GENERALITY, ENSURE, WHEN_TO_CHECK, CONTEXT and EXAMPLE_USAGE are
+present, that BASIS is one of the three values, that BASIS_QUOTE appears in the
+task when BASIS is task, and that ENSURE, WHEN_TO_CHECK and CONTEXT contain no
+cell value of the database. A divergence that passes all of this goes to a
+reviewer who sees the divergence, the rule and the GENERALITY probes (not the
+task or the reference) and rejects the rule if it holds only for individual
+entities, or if a gold_only rule states the reference's choice as a fixed
+action.
+
+The harness replies with a verdict for each divergence. Accepted divergences
+are kept; resubmit a <final> containing only the rejected ones you have fixed.

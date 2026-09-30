@@ -1,8 +1,9 @@
-"""Deterministic gates on the reflector's divergences (TK-Boost-adapt.md 5.5).
+"""Deterministic gates on the reflector's divergences (TK-Boost-adapt.md 5.5, 5.6).
 
 Only ``KIND: data`` divergences are gated; ``non_data`` and ``gold_suspect`` are
-logged and never reach rule generation. A data divergence is accepted only if
-every check passes; its reasons are sent back to the reflector otherwise.
+logged and produce no rule. A data divergence carries its rule fields and is
+accepted only if every check passes; its reasons are sent back to the reflector
+otherwise.
 """
 
 from __future__ import annotations
@@ -14,12 +15,13 @@ from typing import Any, Iterator, Mapping
 
 from .catalog import Catalog
 from .milestones import MATCH, MISMATCH, SEMANTIC, UNVERIFIABLE, compare, find_milestone
-from .reflector_io import Divergence, Reproduction
-from .scope import check_scope_consistency, validate_refs
+from .reflector_io import Divergence, Evidence, Reproduction
+from .scope import check_body, check_scope_consistency, validate_refs
 
 ACCEPTED = "accepted"
 REJECTED = "rejected"
 LOGGED = "logged"
+BASES = ("data", "task", "gold_only")
 
 _NUMBER = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?(?:[eE][+-]?\d+)?")
 
@@ -128,6 +130,7 @@ def check_divergence(
     catalog: Catalog,
     milestones: dict[str, Any],
     missed: set[str],
+    task_prompt: str,
 ) -> GateResult:
     if d.kind in ("non_data", "gold_suspect"):
         return GateResult(d, LOGGED, list(d.errors))
@@ -140,15 +143,7 @@ def check_divergence(
     if not d.reproduced:
         reasons.append("REPRODUCED is missing; reproduce at least one missed milestone")
 
-    for evidence in d.evidence:
-        output = probes.get(evidence.probe)
-        if output is None:
-            reasons.append(f"EVIDENCE cites probe#{evidence.probe}, which was never run")
-        elif not evidence.excerpt.strip() or _squash(evidence.excerpt) not in _squash(output):
-            reasons.append(
-                f"EVIDENCE excerpt {evidence.excerpt!r} not found in the output of "
-                f"probe#{evidence.probe}; quote the output verbatim"
-            )
+    reasons.extend(_check_excerpts("EVIDENCE", d.evidence, probes))
 
     reasons.extend(validate_refs(d.tables, d.columns, catalog))
     if d.scope.strip():
@@ -159,4 +154,62 @@ def check_divergence(
     for r in d.reproduced:
         reasons.extend(_check_reproduction(r, probes, milestones, missed))
 
+    reasons.extend(_check_rule_fields(d, catalog))
+    reasons.extend(_check_basis(d, task_prompt))
+    if not d.generality:
+        reasons.append(
+            "GENERALITY is missing; cite a probe showing the fact holds beyond the entities of this task"
+        )
+    reasons.extend(_check_excerpts("GENERALITY", d.generality, probes))
+
     return GateResult(d, REJECTED if reasons else ACCEPTED, reasons)
+
+
+def _check_excerpts(name: str, excerpts: list[Evidence], probes: Mapping[int, str]) -> list[str]:
+    reasons = []
+    for e in excerpts:
+        output = probes.get(e.probe)
+        if output is None:
+            reasons.append(f"{name} cites probe#{e.probe}, which was never run")
+        elif not e.excerpt.strip() or _squash(e.excerpt) not in _squash(output):
+            reasons.append(
+                f"{name} excerpt {e.excerpt!r} not found in the output of "
+                f"probe#{e.probe}; quote the output verbatim"
+            )
+    return reasons
+
+
+def _check_rule_fields(d: Divergence, catalog: Catalog) -> list[str]:
+    reasons = [
+        f"{name} is missing"
+        for name, value in (
+            ("NEEDED", d.needed),
+            ("INSTANCE", d.instance),
+            ("ENSURE", d.ensure),
+            ("WHEN_TO_CHECK", d.when_to_check),
+            ("CONTEXT", d.context),
+            ("EXAMPLE_USAGE", d.example_usage),
+        )
+        if not value.strip()
+    ]
+    reasons.extend(check_body(
+        {"ensure": d.ensure, "when_to_check": d.when_to_check, "context": d.context}, catalog
+    ))
+    return reasons
+
+
+def _check_basis(d: Divergence, task_prompt: str) -> list[str]:
+    if not d.basis:
+        return [f"BASIS is missing; use one of {', '.join(BASES)}"]
+    if d.basis not in BASES:
+        return [f"BASIS {d.basis!r} is not one of {', '.join(BASES)}"]
+    if d.basis != "task":
+        return []
+    if not d.basis_quote.strip():
+        return ["BASIS_QUOTE is missing; BASIS: task needs the words of the task that decide it"]
+    if _squash(d.basis_quote).lower() not in _squash(task_prompt).lower():
+        return [
+            f"BASIS_QUOTE {d.basis_quote!r} does not appear in the task; "
+            "copy the words verbatim from the task"
+        ]
+    return []

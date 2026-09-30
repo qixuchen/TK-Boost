@@ -12,8 +12,9 @@ PROFILE = "enterprise/company_profile.csv"
 
 CATALOG = Catalog(
     headers={OPS: ["bmCode", "secondTargetNum", "targetName", "value"], PROFILE: ["bmCode", "province"]},
-    values=frozenset(),
+    values=frozenset({"营收金额"}),
 )
+TASK_PROMPT = "Which province had the highest total   operating revenue in Shanghai's peer group?"
 MILESTONES = {
     "Top province by revenue": "Beijing",
     "Number of companies": 1004,
@@ -42,13 +43,23 @@ def _divergence(**overrides):
         evidence=[Evidence(1, "Y_EC_5 营收金额 1,004")],
         reproduced=[Reproduction("Number of companies", 1004, 1)],
         kind="data",
+        basis="data",
+        instance="the agent kept only the rows of one spelling for the companies in the task",
+        generality=[Evidence(1, "Y_EC_5 营业收入金额 2778")],
+        ensure="Select an indicator by secondTargetNum and keep every targetName under it.",
+        when_to_check="The question uses a company-level indicator.",
+        trigger="highest total operating revenue",
+        context="Each company uses one targetName spelling for a given secondTargetNum.",
+        example_usage="Y_EC_5 is spelled 营收金额 for some companies.",
     )
     base.update(overrides)
     return Divergence(**base)
 
 
-def _check(d):
-    return check_divergence(d, probes=PROBES, catalog=CATALOG, milestones=MILESTONES, missed=MISSED)
+def _check(d, probes=PROBES):
+    return check_divergence(
+        d, probes=probes, catalog=CATALOG, milestones=MILESTONES, missed=MISSED, task_prompt=TASK_PROMPT
+    )
 
 
 def test_well_formed_divergence_is_accepted():
@@ -76,6 +87,14 @@ def test_parse_errors_reject():
         ({"reproduced": []}, "REPRODUCED"),
         ({"fact": ""}, "FACT"),
         ({"scope": ""}, "SCOPE"),
+        ({"needed": ""}, "NEEDED"),
+        ({"instance": ""}, "INSTANCE"),
+        ({"basis": ""}, "BASIS"),
+        ({"generality": []}, "GENERALITY"),
+        ({"ensure": ""}, "ENSURE"),
+        ({"when_to_check": ""}, "WHEN_TO_CHECK"),
+        ({"context": ""}, "CONTEXT"),
+        ({"example_usage": ""}, "EXAMPLE_USAGE"),
     ],
 )
 def test_data_divergence_needs_every_field(overrides, fragment):
@@ -129,7 +148,7 @@ def test_numbers_are_found_regardless_of_formatting():
 def test_value_off_by_more_than_one_percent_is_rejected():
     probes = {**PROBES, 4: "count 1020"}
     d = _divergence(reproduced=[Reproduction("Number of companies", 1020, 4)])
-    result = check_divergence(d, probes=probes, catalog=CATALOG, milestones=MILESTONES, missed=MISSED)
+    result = _check(d, probes=probes)
     assert any("does not match gold" in r and "1004" in r for r in result.reasons)
 
 
@@ -164,6 +183,63 @@ def test_unverifiable_gold_is_rejected():
 def test_one_bad_reproduction_rejects_the_whole_divergence():
     reproduced = [Reproduction("Number of companies", 1004, 1), Reproduction("Already done", 13, 1)]
     assert _check(_divergence(reproduced=reproduced)).status == REJECTED
+
+
+def test_unknown_basis_is_rejected():
+    result = _check(_divergence(basis="reference"))
+    assert any("BASIS 'reference'" in r and "gold_only" in r for r in result.reasons), result.reasons
+
+
+@pytest.mark.parametrize("basis", ["data", "gold_only"])
+def test_basis_other_than_task_needs_no_quote(basis):
+    assert _check(_divergence(basis=basis, basis_quote="not in the task")).status == ACCEPTED
+
+
+def test_task_basis_needs_a_quote():
+    result = _check(_divergence(basis="task"))
+    assert any("BASIS_QUOTE" in r and "missing" in r for r in result.reasons), result.reasons
+
+
+def test_task_quote_matches_the_task_ignoring_case_and_whitespace():
+    ok = _divergence(basis="task", basis_quote="Highest Total operating\n revenue in shanghai's")
+    assert _check(ok).status == ACCEPTED, _check(ok).reasons
+
+
+def test_task_quote_not_in_the_task_is_rejected():
+    result = _check(_divergence(basis="task", basis_quote="in Beijing"))
+    assert any("BASIS_QUOTE 'in Beijing'" in r and "task" in r for r in result.reasons), result.reasons
+
+
+def test_generality_must_cite_an_existing_probe():
+    result = _check(_divergence(generality=[Evidence(9, "anything")]))
+    assert any("GENERALITY cites probe#9" in r for r in result.reasons), result.reasons
+
+
+def test_generality_excerpt_must_be_in_the_output():
+    result = _check(_divergence(generality=[Evidence(1, "Y_EC_5 营业收入金额 9999")]))
+    assert any("GENERALITY excerpt" in r and "probe#1" in r for r in result.reasons), result.reasons
+
+
+def test_cell_values_in_rule_body_are_rejected():
+    result = _check(_divergence(ensure="Select 营收金额 and every other spelling."))
+    assert result.status == REJECTED
+    assert any(r.startswith("ENSURE") and "营收金额" in r for r in result.reasons), result.reasons
+
+
+def test_cell_values_in_trigger_example_fact_and_instance_are_allowed():
+    d = _divergence(
+        trigger="营收金额 of Beijing",
+        example_usage="营收金额 vs 营业收入金额",
+        fact="营收金额 is one of several spellings",
+        instance="the agent kept only 营收金额",
+    )
+    assert _check(d).status == ACCEPTED, _check(d).reasons
+
+
+def test_non_data_needs_none_of_the_new_fields():
+    d = Divergence(index=1, divergence="flipped the subtraction", needed="2022 minus 2021", kind="non_data")
+    result = _check(d)
+    assert result.status == LOGGED and result.reasons == []
 
 
 def test_missed_milestones_from_process_score():
