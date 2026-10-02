@@ -14,8 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, NamedTuple
 
-from .trajectory import truncate_middle
-
 WORKSPACE = "/tmp_workspace"
 TIMEOUT_EXIT_CODE = 124
 HOST_TIMEOUT_GRACE = 10
@@ -34,6 +32,61 @@ class ProbeRecord:
     output: str
     exit_code: int | None
     timed_out: bool
+
+
+@dataclass(frozen=True)
+class ProbeLines:
+    """A probe's output lines and the 1-based numbers of the lines the reflector was shown."""
+
+    lines: tuple[str, ...]
+    visible: frozenset[int]
+
+    @classmethod
+    def full(cls, output: str) -> "ProbeLines":
+        lines = tuple(output.splitlines())
+        return cls(lines, frozenset(range(1, len(lines) + 1)))
+
+
+def _cut(text: str, cap: int) -> str:
+    if len(text) <= cap:
+        return text
+    keep = max(cap - 25, 1)
+    return f"{text[:keep]}...[{len(text) - keep} chars cut]"
+
+
+def numbered_view(output: str, limit: int) -> tuple[str, frozenset[int]]:
+    """Number the lines ``L<k>| ``; past ``limit`` chars keep whole head and tail lines.
+
+    A line longer than half the limit is cut but stays citable; lines dropped
+    from the middle are not, so they are left out of the returned visible set.
+    """
+    lines = output.splitlines()
+    cap = max(limit // 2, 1)
+    rendered = [_cut(f"L{i}| {line}", cap) for i, line in enumerate(lines, 1)]
+    everything = frozenset(range(1, len(lines) + 1))
+    if sum(len(r) + 1 for r in rendered) <= limit + 1:
+        return "\n".join(rendered), everything
+
+    head: list[int] = []
+    used = 0
+    for i, text in enumerate(rendered):
+        if head and used + len(text) + 1 > cap:
+            break
+        head.append(i)
+        used += len(text) + 1
+    tail: list[int] = []
+    used = 0
+    for i in range(len(rendered) - 1, head[-1], -1):
+        if tail and used + len(rendered[i]) + 1 > limit - cap:
+            break
+        tail.append(i)
+        used += len(rendered[i]) + 1
+    tail.reverse()
+    if not tail or tail[0] == head[-1] + 1:
+        return "\n".join(rendered), everything
+    marker = f"[L{head[-1] + 2}-L{tail[0]} omitted]"
+    shown = [rendered[i] for i in head] + [marker] + [rendered[i] for i in tail]
+    return "\n".join(shown), frozenset(i + 1 for i in head + tail)
 
 
 Runner = Callable[[list[str], float], subprocess.CompletedProcess]
@@ -95,7 +148,7 @@ class DockerExecutor:
 
 
 class ProbeSession:
-    """Numbered probes; the full output is kept, the LLM sees a truncated view."""
+    """Probes P1, P2, ...; the full output is kept, the LLM sees a line-numbered, truncated view."""
 
     def __init__(self, executor, *, timeout: int = 60, max_llm_chars: int = 4000):
         self.executor = executor
@@ -121,7 +174,11 @@ class ProbeSession:
     def get(self, number: int) -> ProbeRecord | None:
         return self.records[number - 1] if 1 <= number <= len(self.records) else None
 
+    def lines(self, record: ProbeRecord) -> ProbeLines:
+        _, visible = numbered_view(record.output, self.max_llm_chars)
+        return ProbeLines(tuple(record.output.splitlines()), visible)
+
     def llm_view(self, record: ProbeRecord) -> str:
         status = f"timed out after {self.timeout}s" if record.timed_out else f"exit {record.exit_code}"
-        body = truncate_middle(record.output, self.max_llm_chars) if record.output else "(no output)"
-        return f"PROBE_RESULT #{record.number} ({status}):\n{body}"
+        body = numbered_view(record.output, self.max_llm_chars)[0] if record.output else "(no output)"
+        return f"PROBE_RESULT P{record.number} ({status}):\n{body}"

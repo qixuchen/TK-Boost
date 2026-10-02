@@ -1,9 +1,12 @@
-"""Deterministic gates on the reflector's divergences (TK-Boost-adapt.md 5.5, 5.6).
+"""Deterministic gates on the reflector's divergences (TK-Boost-adapt.md 5.5–5.7).
 
 Only ``KIND: data`` divergences are gated; ``non_data`` and ``gold_suspect`` are
-logged and produce no rule. A data divergence carries its rule fields and is
-accepted only if every check passes; its reasons are sent back to the reflector
-otherwise.
+logged and produce no rule. The structural check comes first: parse errors,
+missing fields, pointers that do not resolve to lines the reflector was shown,
+unknown files, columns or milestone keys. Resolved pointers get the cited lines
+filled in. A divergence that is structurally sound then goes through the
+substantive check against gold. Only substantive rejections use up a
+``<final>`` submission, so ``GateResult.structural`` tells the two apart.
 """
 
 from __future__ import annotations
@@ -14,7 +17,8 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Mapping
 
 from .catalog import Catalog
-from .milestones import MATCH, MISMATCH, SEMANTIC, UNVERIFIABLE, compare, find_milestone
+from .milestones import MISMATCH, SEMANTIC, UNVERIFIABLE, compare, find_milestone
+from .probe import ProbeLines
 from .reflector_io import Divergence, Evidence, Reproduction
 from .scope import check_body, check_scope_consistency, validate_refs
 
@@ -31,6 +35,7 @@ class GateResult:
     divergence: Divergence
     status: str
     reasons: list[str] = field(default_factory=list)
+    structural: bool = False
 
 
 def missed_milestones(process_score: dict[str, Any] | None) -> set[str]:
@@ -81,35 +86,66 @@ def _missing_from_output(value: Any, output: str) -> list[str]:
     return missing
 
 
-def _check_reproduction(
-    r: Reproduction,
-    probes: Mapping[int, str],
-    milestones: dict[str, Any],
-    missed: set[str],
-) -> list[str]:
-    reasons: list[str] = []
+def _span(start: int, end: int) -> str:
+    return f"L{start}" if start == end else f"L{start}-L{end}"
+
+
+def _resolve(name: str, pointer: Evidence | Reproduction, probes: Mapping[int, ProbeLines]) -> str | None:
+    """Fill ``pointer.excerpt`` with the cited lines; return the reason when they cannot be cited."""
+    cited = f"P{pointer.probe}:{_span(pointer.start, pointer.end)}"
+    view = probes.get(pointer.probe)
+    if view is None:
+        ran = f"probes run so far: {', '.join(f'P{n}' for n in sorted(probes))}" if probes else (
+            "no probe has been run yet"
+        )
+        return (
+            f"{name} cites P{pointer.probe}, which was never run; {ran}. P<n> numbers your own "
+            "<probe> runs, not the agent's CALL #n; run a probe before citing its output"
+        )
+    if pointer.end > len(view.lines):
+        return f"{name} {cited} is outside the output of P{pointer.probe}, which has {len(view.lines)} line(s)"
+    if any(n not in view.visible for n in range(pointer.start, pointer.end + 1)):
+        return (
+            f"{name} {cited} points at lines omitted from the output you were shown; cite lines you "
+            "can see, or print the ones you need with a narrower probe"
+        )
+    pointer.excerpt = "\n".join(view.lines[pointer.start - 1 : pointer.end])
+    return None
+
+
+def _resolve_all(name: str, pointers: list, probes: Mapping[int, ProbeLines]) -> list[str]:
+    return [reason for p in pointers if (reason := _resolve(name, p, probes))]
+
+
+def _reproduction_form(r: Reproduction, probes: Mapping[int, ProbeLines], milestones: dict[str, Any],
+                       missed: set[str]) -> list[str]:
     found = find_milestone(milestones, r.key)
     if found is None:
-        reasons.append(
+        return [
             f'milestone "{r.key}" is not a gold milestone key; '
             f"use one of the missed milestones: {', '.join(sorted(missed))}"
+        ]
+    key, _ = found
+    reason = _resolve("REPRODUCED", r, probes)
+    if reason:
+        return [reason]
+    reasons = []
+    missing = _missing_from_output(r.value, r.excerpt)
+    if missing:
+        reasons.append(
+            f'REPRODUCED "{key}": {", ".join(missing)} does not appear in '
+            f"P{r.probe}:{_span(r.start, r.end)}; point at the line that prints the value"
         )
-        return reasons
-    key, expected = found
+    return reasons
+
+
+def _reproduction_substance(r: Reproduction, milestones: dict[str, Any], missed: set[str]) -> list[str]:
+    key, expected = find_milestone(milestones, r.key)
+    reasons = []
     if key not in missed:
         reasons.append(
             f'milestone "{key}" was already achieved by the agent; reproduce a milestone it missed'
         )
-    output = probes.get(r.probe)
-    if output is None:
-        reasons.append(f'REPRODUCED "{key}" cites probe#{r.probe}, which was never run')
-    else:
-        missing = _missing_from_output(r.value, output)
-        if missing:
-            reasons.append(
-                f'REPRODUCED "{key}": {", ".join(missing)} does not appear in the output of '
-                f"probe#{r.probe}; copy the value exactly as the probe printed it"
-            )
     verdict = compare(expected, r.value)
     if verdict == MISMATCH:
         reasons.append(f'REPRODUCED "{key}" = {r.value!r} does not match gold {expected!r}')
@@ -123,17 +159,16 @@ def _check_reproduction(
     return reasons
 
 
-def check_divergence(
+def check_structure(
     d: Divergence,
     *,
-    probes: Mapping[int, str],
+    probes: Mapping[int, ProbeLines],
     catalog: Catalog,
     milestones: dict[str, Any],
     missed: set[str],
     task_prompt: str,
-) -> GateResult:
-    if d.kind in ("non_data", "gold_suspect"):
-        return GateResult(d, LOGGED, list(d.errors))
+) -> list[str]:
+    """Reasons a data divergence is malformed; resolved pointers get their lines filled in."""
     reasons = list(d.errors)
     for name, value in (("SCOPE", d.scope), ("FACT", d.fact)):
         if not value.strip():
@@ -142,41 +177,47 @@ def check_divergence(
         reasons.append("EVIDENCE is missing; cite a probe whose output shows the fact")
     if not d.reproduced:
         reasons.append("REPRODUCED is missing; reproduce at least one missed milestone")
-
-    reasons.extend(_check_excerpts("EVIDENCE", d.evidence, probes))
-
+    reasons.extend(_resolve_all("EVIDENCE", d.evidence, probes))
     reasons.extend(validate_refs(d.tables, d.columns, catalog))
     if d.scope.strip():
         scope_error = check_scope_consistency(d.scope, d.tables, d.columns)
         if scope_error:
             reasons.append(scope_error)
-
     for r in d.reproduced:
-        reasons.extend(_check_reproduction(r, probes, milestones, missed))
-
+        reasons.extend(_reproduction_form(r, probes, milestones, missed))
     reasons.extend(_check_rule_fields(d, catalog))
     reasons.extend(_check_basis(d, task_prompt))
     if not d.generality:
         reasons.append(
             "GENERALITY is missing; cite a probe showing the fact holds beyond the entities of this task"
         )
-    reasons.extend(_check_excerpts("GENERALITY", d.generality, probes))
-
-    return GateResult(d, REJECTED if reasons else ACCEPTED, reasons)
-
-
-def _check_excerpts(name: str, excerpts: list[Evidence], probes: Mapping[int, str]) -> list[str]:
-    reasons = []
-    for e in excerpts:
-        output = probes.get(e.probe)
-        if output is None:
-            reasons.append(f"{name} cites probe#{e.probe}, which was never run")
-        elif not e.excerpt.strip() or _squash(e.excerpt) not in _squash(output):
-            reasons.append(
-                f"{name} excerpt {e.excerpt!r} not found in the output of "
-                f"probe#{e.probe}; quote the output verbatim"
-            )
+    reasons.extend(_resolve_all("GENERALITY", d.generality, probes))
     return reasons
+
+
+def check_substance(d: Divergence, *, milestones: dict[str, Any], missed: set[str]) -> list[str]:
+    """Reasons a structurally sound divergence does not reproduce what the agent missed."""
+    return [reason for r in d.reproduced for reason in _reproduction_substance(r, milestones, missed)]
+
+
+def check_divergence(
+    d: Divergence,
+    *,
+    probes: Mapping[int, ProbeLines],
+    catalog: Catalog,
+    milestones: dict[str, Any],
+    missed: set[str],
+    task_prompt: str,
+) -> GateResult:
+    if d.kind in ("non_data", "gold_suspect"):
+        return GateResult(d, LOGGED, list(d.errors))
+    reasons = check_structure(
+        d, probes=probes, catalog=catalog, milestones=milestones, missed=missed, task_prompt=task_prompt
+    )
+    if reasons:
+        return GateResult(d, REJECTED, reasons, structural=True)
+    reasons = check_substance(d, milestones=milestones, missed=missed)
+    return GateResult(d, REJECTED if reasons else ACCEPTED, reasons)
 
 
 def _check_rule_fields(d: Divergence, catalog: Catalog) -> list[str]:

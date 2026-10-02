@@ -28,9 +28,21 @@ Each turn, send exactly one of:
 (b) your conclusions: a <final> ... </final> block (see "Output").
 
 The harness runs the probe from /tmp_workspace (so paths are ./database/<file>)
-and replies with PROBE_RESULT #<n>. Long outputs are cut to their head and tail,
-so print aggregates rather than raw rows. Budget: at most $max_probes probes and
-$max_finals <final> submissions.
+and replies with PROBE_RESULT P<n>, every output line prefixed with its number:
+
+    PROBE_RESULT P2 (exit 0):
+    L1| industry,rows
+    L2| 制造业,812
+
+Your probes are numbered P1, P2, ... in the order you run them. This is not the
+agent's numbering: CALL #n and OUTPUT #n in the trajectory are the agent's
+commands, and you cannot cite them; replay a command as a probe to cite what it
+prints. Long outputs keep their first and last lines and replace the middle with
+[L<a>-L<b> omitted], so print aggregates rather than raw rows. Budget: at most
+$max_probes probes and $max_finals <final> submissions that are rejected on
+substance; a <final> rejected only for format errors (an unparseable line, a
+missing field, a pointer to a line that does not exist) does not count against
+them, but you have at most $max_format_retries such format retries.
 
 - You may replay any agent command (CALL #<n> in the trajectory) verbatim to see
   exactly what it produced and why it went wrong.
@@ -101,10 +113,10 @@ MISSING_DATA_UNDERSTANDING:
   COLUMNS: <file>.<column>[, <file>.<column> ...]
   FACT: <one column-level fact about the data>
 CATEGORY: <the number and name of the hint above, or "Other">
-EVIDENCE: probe#<n> → <a line copied verbatim from that probe's output>
-REPRODUCED: milestone "<key>" = <JSON value> FROM probe#<m>
+EVIDENCE: P<n>:L<a>   or   P<n>:L<a>-L<b>
+REPRODUCED: milestone "<key>" = <JSON value> FROM P<n>:L<a>
 SEMANTIC_MATCH: <why the value means the same as gold; only when the wording differs>
-GENERALITY: probe#<k> → <a line copied verbatim from that probe's output>
+GENERALITY: P<n>:L<a>   or   P<n>:L<a>-L<b>
 ENSURE: <what a future agent should do>
 WHEN_TO_CHECK: <the shape of question that needs this rule>
 TRIGGER: <the phrase of this task that called for this knowledge>
@@ -148,14 +160,16 @@ Rules for the block:
 - SCOPE must agree with TABLES and COLUMNS: two or more files is cross_table;
   one file listed under TABLES is file; otherwise two or more columns of one
   file is multi_column and a single column is column; nothing listed is generic.
-- EVIDENCE quotes the probe output verbatim (whitespace may differ). You may
-  give several EVIDENCE lines.
+- EVIDENCE and GENERALITY point at output lines by number; do not copy the
+  text, the harness copies the cited lines itself. Cite only lines you were
+  shown, not lines inside an [omitted] range. You may give several lines of
+  each.
 - REPRODUCED proves the fact is sufficient: from the data, compute a milestone
-  the agent MISSED (listed in the input) and cite the probe that printed it.
-  Copy the value exactly as the probe printed it, as JSON: numbers as numbers,
-  strings in double quotes using the data's own wording (e.g. "广东省"). For a
-  dict milestone, report it under the gold keys. You may give several
-  REPRODUCED lines.
+  the agent MISSED (listed in the input) and point at the output line that
+  prints it; the value must appear on that line. Write the value as JSON:
+  numbers as numbers, strings in double quotes using the data's own wording
+  (e.g. "广东省"). For a dict milestone, report it under the gold keys. You
+  may give several REPRODUCED lines.
 - Strings need not match gold verbatim, but must mean almost exactly the same
   thing (广东省 and Guangdong Province do). When the wording differs, add a
   SEMANTIC_MATCH line right after that REPRODUCED line.
@@ -297,9 +311,9 @@ Examples that are not acceptable:
 ## What the harness checks
 
 The harness, not you, decides whether a divergence is verified. It checks that
-every cited probe exists, that each EVIDENCE and GENERALITY excerpt and each
-REPRODUCED value appear in the cited output, that the files and columns exist,
-that SCOPE agrees with TABLES and COLUMNS, and it compares numbers with gold at
+every cited probe and line exists and was shown to you, that each REPRODUCED
+value appears on its cited line, that the files and columns exist, that SCOPE
+agrees with TABLES and COLUMNS, and it compares numbers with gold at
 1% relative tolerance. For a data divergence it also checks that NEEDED, BASIS,
 INSTANCE, GENERALITY, ENSURE, WHEN_TO_CHECK, CONTEXT and EXAMPLE_USAGE are
 present, that BASIS is one of the three values, that BASIS_QUOTE appears in the
@@ -311,4 +325,5 @@ entities, or if a gold_only rule states the reference's choice as a fixed
 action.
 
 The harness replies with a verdict for each divergence. Accepted divergences
-are kept; resubmit a <final> containing only the rejected ones you have fixed.
+are kept. If a rejection needs new evidence, run more probes first; then
+resubmit a <final> containing only the rejected divergences you have fixed.

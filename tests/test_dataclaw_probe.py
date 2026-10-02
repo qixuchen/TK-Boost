@@ -37,14 +37,37 @@ def test_probes_are_numbered_and_keep_full_output():
     assert executor.commands[0] == ("head -3 ./database/internal_metrics.csv", 60)
 
 
-def test_llm_view_truncates_but_record_does_not():
-    executor = FakeExecutor([ExecResult("H" * 10 + "M" * 80 + "T" * 10, 0, False)])
-    with ProbeSession(executor, timeout=60, max_llm_chars=20) as session:
+def test_llm_view_numbers_every_line():
+    executor = FakeExecutor([ExecResult("a,b\n1,2\n", 0, False)])
+    with ProbeSession(executor, timeout=60, max_llm_chars=4000) as session:
+        record = session.run("cat small")
+        lines = session.lines(record)
+    assert session.llm_view(record) == "PROBE_RESULT P1 (exit 0):\nL1| a,b\nL2| 1,2"
+    assert lines.lines == ("a,b", "1,2")
+    assert lines.visible == frozenset({1, 2})
+
+
+def test_long_output_keeps_whole_head_and_tail_lines_but_record_does_not():
+    output = "\n".join(f"row {i}" for i in range(1, 101))
+    with ProbeSession(FakeExecutor([ExecResult(output, 0, False)]), timeout=60, max_llm_chars=60) as session:
         record = session.run("cat big")
-    view = session.llm_view(record)
-    assert view.startswith("PROBE_RESULT #1 (exit 0)")
-    assert "H" * 10 in view and "T" * 10 in view and "80 chars omitted" in view
-    assert record.output.count("M") == 80
+        view = session.llm_view(record)
+        lines = session.lines(record)
+    assert "L1| row 1\n" in view and view.endswith("L100| row 100")
+    first_hidden, last_hidden = min(set(range(1, 101)) - lines.visible), max(set(range(1, 101)) - lines.visible)
+    assert f"[L{first_hidden}-L{last_hidden} omitted]" in view
+    assert f"L{first_hidden}|" not in view
+    assert 1 in lines.visible and 100 in lines.visible and 50 not in lines.visible
+    assert record.output == output and len(lines.lines) == 100
+
+
+def test_overlong_line_is_cut_but_still_citable():
+    with ProbeSession(FakeExecutor([ExecResult("x" * 500, 0, False)]), timeout=60, max_llm_chars=100) as session:
+        record = session.run("cat wide")
+        view = session.llm_view(record)
+        lines = session.lines(record)
+    assert len(view) < 200 and "chars cut" in view
+    assert lines.visible == frozenset({1}) and lines.lines == ("x" * 500,)
 
 
 def test_timeout_is_reported():

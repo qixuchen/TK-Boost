@@ -10,18 +10,17 @@ OPS = "enterprise/company_operation_status.csv"
 DATA_BLOCK = f"""DIVERGENCE: step 4 filtered targetName == 营收金额 only
 NEEDED: filter by secondTargetNum and keep every targetName spelling
 MISSING_DATA_UNDERSTANDING:
-  SCOPE: multi_column
   TABLES:
   COLUMNS: {OPS}.secondTargetNum,
            {OPS}.targetName
   FACT: one secondTargetNum has several targetName spellings,
         each company uses one of them
 CATEGORY: 同一指标有多个名字
-EVIDENCE: probe#2 → Y_EC_5 营收金额 1004
-EVIDENCE: probe#3 -> Y_EC_5 营业收入金额 2778
-REPRODUCED: milestone "Top province by revenue" = "北京市" FROM probe#5
+EVIDENCE: P2:L4
+EVIDENCE: P3:L1-L2
+REPRODUCED: milestone "Top province by revenue" = "北京市" FROM P5:L7
 SEMANTIC_MATCH: 北京市 is the Chinese name of Beijing
-REPRODUCED: milestone "Beijing total revenue" = 1.2e12 FROM probe#5
+REPRODUCED: milestone "Beijing total revenue" = 1.2e12 FROM P5:L8-L9
 KIND: data
 """
 
@@ -30,8 +29,8 @@ RULE_FIELDS = """BASIS: Task
 BASIS_QUOTE: in Shanghai
 INSTANCE: the company in the task is filed under a Chinese name
           with province 上海市
-GENERALITY: probe#6 → 49 of 49 secondTargetNum codes have 2+ spellings
-GENERALITY: probe#7 -> spellings per code: min 2 max 6
+GENERALITY: P6:L2
+GENERALITY: P7:L1-L3
 ENSURE: filter by secondTargetNum,
         not by an exact targetName
 WHEN_TO_CHECK: the question uses a company-level indicator
@@ -80,19 +79,17 @@ def test_data_divergence_fields():
     (d,) = turn.divergences
     assert d.errors == []
     assert d.divergence == "step 4 filtered targetName == 营收金额 only"
-    assert d.scope == "multi_column"
     assert d.tables == []
     assert d.columns == [ColumnRef(OPS, "secondTargetNum"), ColumnRef(OPS, "targetName")]
     assert d.fact == "one secondTargetNum has several targetName spellings,\neach company uses one of them"
     assert d.category == "同一指标有多个名字"
-    assert [(e.probe, e.excerpt) for e in d.evidence] == [
-        (2, "Y_EC_5 营收金额 1004"),
-        (3, "Y_EC_5 营业收入金额 2778"),
-    ]
+    assert [(e.probe, e.start, e.end, e.excerpt) for e in d.evidence] == [(2, 4, 4, ""), (3, 1, 2, "")]
     first, second = d.reproduced
-    assert (first.key, first.value, first.probe) == ("Top province by revenue", "北京市", 5)
+    assert (first.key, first.value, first.probe, first.start, first.end) == ("Top province by revenue", "北京市", 5, 7, 7)
     assert first.semantic_match == "北京市 is the Chinese name of Beijing"
-    assert (second.key, second.value, second.semantic_match) == ("Beijing total revenue", 1.2e12, None)
+    assert (second.key, second.value, second.start, second.end, second.semantic_match) == (
+        "Beijing total revenue", 1.2e12, 8, 9, None,
+    )
     assert d.kind == "data"
 
 
@@ -102,10 +99,7 @@ def test_basis_instance_generality_and_rule_fields():
     assert d.basis == "task"
     assert d.basis_quote == "in Shanghai"
     assert d.instance == "the company in the task is filed under a Chinese name\nwith province 上海市"
-    assert [(g.probe, g.excerpt) for g in d.generality] == [
-        (6, "49 of 49 secondTargetNum codes have 2+ spellings"),
-        (7, "spellings per code: min 2 max 6"),
-    ]
+    assert [(g.probe, g.start, g.end) for g in d.generality] == [(6, 2, 2), (7, 1, 3)]
     assert d.ensure == "filter by secondTargetNum,\nnot by an exact targetName"
     assert d.when_to_check == "the question uses a company-level indicator"
     assert d.trigger == "total operating revenue"
@@ -131,8 +125,8 @@ def test_multiple_blocks_and_non_data_block():
 def test_reproduced_with_list_and_dict_values():
     block = (
         "DIVERGENCE: d\nNEEDED: n\n"
-        'REPRODUCED: milestone "Provinces" = ["北京市", "上海市"] FROM probe#1\n'
-        'REPRODUCED: milestone "Counts" = {"Real Estate": 416} FROM probe#2\nKIND: data\n'
+        'REPRODUCED: milestone "Provinces" = ["北京市", "上海市"] FROM P1:L2\n'
+        'REPRODUCED: milestone "Counts" = {"Real Estate": 416} FROM P2:L1\nKIND: data\n'
     )
     first, second = parse_turn(f"<final>{block}</final>").divergences[0].reproduced
     assert first.value == ["北京市", "上海市"]
@@ -142,11 +136,15 @@ def test_reproduced_with_list_and_dict_values():
 @pytest.mark.parametrize(
     "line, fragment",
     [
-        ('REPRODUCED: milestone "k" = 北京市 FROM probe#1', "JSON"),
+        ('REPRODUCED: milestone "k" = 北京市 FROM P1:L1', "JSON"),
         ("REPRODUCED: k = 3 from probe 1", 'milestone "<key>"'),
+        ('REPRODUCED: milestone "k" = 3 FROM probe#1', "FROM P<n>:L<a>"),
         ("SEMANTIC_MATCH: dangling", "SEMANTIC_MATCH"),
-        ("EVIDENCE: the output showed it", "probe#"),
-        ("GENERALITY: holds for every code", "GENERALITY must be written as probe#"),
+        ("EVIDENCE: the output showed it", "EVIDENCE must be written as P<n>:L<a>"),
+        ("EVIDENCE: probe#2 → Y_EC_5 营收金额 1004", "EVIDENCE must be written as P<n>:L<a>"),
+        ("GENERALITY: holds for every code", "GENERALITY must be written as P<n>:L<a>"),
+        ("EVIDENCE: P2:L5-L3", "L5-L3"),
+        ("EVIDENCE: P2:L0", "L0"),
         ("KIND: maybe", "KIND"),
         (f"  COLUMNS: {OPS}", "COLUMNS"),
         (f"  TABLES: {OPS}.value", "TABLES"),
@@ -158,6 +156,12 @@ def test_malformed_lines_become_block_errors(line, fragment):
         block += "KIND: data\n"
     (d,) = parse_turn(f"<final>{block}</final>").divergences
     assert any(fragment in e for e in d.errors), d.errors
+
+
+def test_old_pointer_style_is_explained():
+    (d,) = parse_turn("<final>DIVERGENCE: d\nNEEDED: n\nEVIDENCE: probe#2 → x\nKIND: data\n</final>").divergences
+    (error,) = d.errors
+    assert "CALL #n" in error
 
 
 def test_block_without_kind_is_an_error():

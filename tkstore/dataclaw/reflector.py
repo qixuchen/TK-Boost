@@ -42,7 +42,8 @@ TIME_BUDGET_NOTE = "TIME BUDGET: this reflection has used up its time budget; se
 @dataclass
 class ReflectorConfig:
     max_probes: int = 20
-    max_finals: int = 3
+    max_finals: int = 5
+    max_format_retries: int = 3
     max_output_chars: int = 2000
     max_thinking_chars: int = 5000
     max_consecutive_empty: int = 2
@@ -51,7 +52,7 @@ class ReflectorConfig:
     @property
     def max_turns(self) -> int:
         """Hard cap on LLM calls, leaving a few turns for invalid replies."""
-        return self.max_probes + self.max_finals + EXTRA_TURNS
+        return self.max_probes + self.max_finals + self.max_format_retries + EXTRA_TURNS
 
 
 @dataclass
@@ -64,6 +65,8 @@ class ReflectionResult:
     messages: list[dict[str, str]] = field(default_factory=list)
     probes_used: int = 0
     finals: int = 0
+    format_retries: int = 0
+    ever_rejected: bool = False
     stop_reason: str = ""
     error: str = ""
     llm_calls: list[dict[str, Any]] = field(default_factory=list)
@@ -172,7 +175,7 @@ def _user_message(loaded: LoadedRun, catalog: Catalog, config: ReflectorConfig) 
 
 def build_messages(loaded: LoadedRun, catalog: Catalog, config: ReflectorConfig) -> list[dict[str, str]]:
     system = Template(PROMPT_PATH.read_text(encoding="utf-8")).substitute(
-        max_probes=config.max_probes, max_finals=config.max_finals
+        max_probes=config.max_probes, max_finals=config.max_finals, max_format_retries=config.max_format_retries
     )
     return [
         {"role": "system", "content": system},
@@ -180,14 +183,16 @@ def build_messages(loaded: LoadedRun, catalog: Catalog, config: ReflectorConfig)
     ]
 
 
-def _verdict_message(results: list[GateResult], finals_left: int) -> str:
+def _verdict_message(results: list[GateResult], *, probes_left: int, finals_left: int, format_left: int) -> str:
     lines = ["HARNESS VERDICT:"]
     for r in results:
         lines.append(f"divergence {r.divergence.index}: {r.status.upper()}")
         lines.extend(f"  - {reason}" for reason in r.reasons)
     lines.append(
-        "Accepted divergences are kept. Resubmit a <final> containing only the rejected "
-        f"divergences you have fixed; you have {finals_left} <final> submission(s) left."
+        "Accepted divergences are kept. You may run more probes before resubmitting "
+        f"({probes_left} probe(s) left), then resubmit a <final> containing only the rejected "
+        f"divergences you have fixed. You have {finals_left} <final> submission(s) left; a <final> "
+        f"rejected only for format errors does not use one ({format_left} format retries left)."
     )
     return "\n".join(lines)
 
@@ -221,8 +226,11 @@ def _divergence_text(d: Divergence) -> str:
         f"FACT: {d.fact}",
         f"CATEGORY: {d.category}",
     ]
-    lines += [f"EVIDENCE: probe#{e.probe} → {e.excerpt}" for e in d.evidence]
-    lines += [f"GENERALITY: probe#{g.probe} → {g.excerpt}" for g in d.generality]
+    def _pointer(p):
+        span = f"L{p.start}" if p.start == p.end else f"L{p.start}-L{p.end}"
+        return f"P{p.probe}:{span} → {p.excerpt}"
+    lines += [f"EVIDENCE: {_pointer(e)}" for e in d.evidence]
+    lines += [f"GENERALITY: {_pointer(g)}" for g in d.generality]
     lines += [
         f"ENSURE: {d.ensure}",
         f"WHEN_TO_CHECK: {d.when_to_check}",
@@ -300,8 +308,7 @@ def _handle_turn(
         result.probes_used += 1
         return session.llm_view(record)
 
-    result.finals += 1
-    outputs = {r.number: r.output for r in session.records}
+    outputs = {r.number: session.lines(r) for r in session.records}
     verdicts = [
         check_divergence(
             d, probes=outputs, catalog=catalog, milestones=milestones, missed=missed, task_prompt=task_prompt
@@ -319,13 +326,27 @@ def _handle_turn(
         elif v.status == LOGGED:
             result.logged.append(v)
     result.rejected = [v for v in verdicts if v.status == REJECTED]
+    if result.rejected and all(v.structural for v in result.rejected):
+        result.format_retries += 1
+    else:
+        result.finals += 1
     if not result.rejected:
-        result.stop_reason = "done"
+        gave_up = result.ever_rejected and not any(d.kind == "data" for d in turn.divergences)
+        result.stop_reason = "abandoned_after_reject" if gave_up else "done"
         return None
+    result.ever_rejected = True
     if result.finals >= config.max_finals:
         result.stop_reason = "final_budget"
         return None
-    return _verdict_message(verdicts, config.max_finals - result.finals)
+    if result.format_retries >= config.max_format_retries:
+        result.stop_reason = "format_budget"
+        return None
+    return _verdict_message(
+        verdicts,
+        probes_left=config.max_probes - result.probes_used,
+        finals_left=config.max_finals - result.finals,
+        format_left=config.max_format_retries - result.format_retries,
+    )
 
 
 def reflect(
@@ -403,6 +424,7 @@ def to_record(loaded: LoadedRun, result: ReflectionResult) -> dict[str, Any]:
         "llm_calls": result.llm_calls,
         "probes_used": result.probes_used,
         "finals": result.finals,
+        "format_retries": result.format_retries,
         "accepted": [asdict(r) for r in result.accepted],
         "rejected": [asdict(r) for r in result.rejected],
         "judge_errors": [asdict(r) for r in result.judge_errors],

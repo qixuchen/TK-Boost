@@ -65,9 +65,10 @@ def _divergence(data: dict) -> Divergence:
         columns=[ColumnRef(*c) for c in data.get("columns") or []],
         fact=data.get("fact", ""),
         category=data.get("category", ""),
-        evidence=[Evidence(e["probe"], e["excerpt"]) for e in data.get("evidence") or []],
+        evidence=[Evidence(e["probe"], e["start"], e["end"], e["excerpt"]) for e in data.get("evidence") or []],
         reproduced=[
-            Reproduction(r["key"], r["value"], r["probe"], r.get("semantic_match"))
+            Reproduction(r["key"], r["value"], r["probe"], r["start"], r["end"], r.get("semantic_match"),
+                         r.get("excerpt", ""))
             for r in data.get("reproduced") or []
         ],
         kind=data.get("kind", ""),

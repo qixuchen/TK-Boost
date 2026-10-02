@@ -47,6 +47,17 @@ def test_judge_model_gets_the_same_reasoning_options(script):
     assert calls[1] == ("j", calls[0][1])
 
 
+def test_budget_defaults_to_five_finals_and_three_format_retries(script):
+    config = script.make_config(script.build_parser().parse_args(["--model", "m"]))
+    assert (config.max_probes, config.max_finals, config.max_format_retries) == (20, 5, 3)
+
+
+def test_budget_flags_reach_the_config(script):
+    args = script.build_parser().parse_args(["--model", "m", "--max-finals", "2", "--max-format-retries", "1"])
+    config = script.make_config(args)
+    assert (config.max_finals, config.max_format_retries) == (2, 1)
+
+
 def test_judge_defaults_to_the_reflector_llm(script):
     calls = _llms(script, "--model", "m")
     assert [model for model, _ in calls] == ["m"]

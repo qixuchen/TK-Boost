@@ -43,7 +43,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--judge-model", help="litellm model id of the generality judge (default: --model)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-probes", type=int, default=20)
-    parser.add_argument("--max-finals", type=int, default=3)
+    parser.add_argument("--max-finals", type=int, default=5,
+                        help="<final> submissions that may be rejected for substantive reasons")
+    parser.add_argument("--max-format-retries", type=int, default=3,
+                        help="<final> submissions that may be rejected only for format errors")
     parser.add_argument("--probe-timeout", type=int, default=60)
     parser.add_argument("--max-probe-chars", type=int, default=4000)
     parser.add_argument("--max-tokens", type=int, help="output token cap per LLM call (reasoning included)")
@@ -68,6 +71,15 @@ def _llm_options(args: argparse.Namespace) -> dict:
     }
 
 
+def make_config(args: argparse.Namespace) -> ReflectorConfig:
+    return ReflectorConfig(
+        max_probes=args.max_probes,
+        max_finals=args.max_finals,
+        max_format_retries=args.max_format_retries,
+        run_time_budget_s=args.run_time_budget,
+    )
+
+
 def make_llms(args: argparse.Namespace, factory=litellm_llm):
     """The reflector LLM and the judge LLM (None: the judge uses the reflector's)."""
     if args.dry_run:
@@ -87,11 +99,7 @@ def main() -> int:
     prefixes = tuple(p.strip() for p in args.tasks.split(",") if p.strip())
     runs = [r for r in load_manifest(args.manifest) if r.task_id.startswith(prefixes)]
     catalog = load_catalog(args.data_dir, _REPO_ROOT / "tmp/dataclaw_cache")
-    config = ReflectorConfig(
-        max_probes=args.max_probes,
-        max_finals=args.max_finals,
-        run_time_budget_s=args.run_time_budget,
-    )
+    config = make_config(args)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     llm_options = _llm_options(args)
     llm, judge_llm = make_llms(args)
@@ -130,7 +138,8 @@ def main() -> int:
         print(f"{stem}: {result.stop_reason}, {len(result.accepted)} accepted, "
               f"{len(result.rejected)} rejected, {len(result.logged)} logged, "
               f"{len(result.judge_errors)} judge errors, "
-              f"{result.probes_used} probes -> {path.relative_to(_REPO_ROOT)}")
+              f"{result.probes_used} probes, {result.finals} finals, {result.format_retries} format retries "
+              f"-> {path.relative_to(_REPO_ROOT)}")
         if result.stop_reason == "interrupted":
             print("interrupted; the partial record above was saved and the batch stops here")
             return 130

@@ -1,9 +1,10 @@
 """Parse the reflector's turns: one ``<probe>`` or one ``<final>``.
 
 A ``<final>`` holds divergence blocks, each starting with ``DIVERGENCE:``, in
-the format of TK-Boost-adapt.md section 5.6 (5.4 plus BASIS, INSTANCE,
-GENERALITY and the rule fields). Structural mistakes are collected
-per block in ``Divergence.errors`` so they can be sent back to the reflector.
+the format of TK-Boost-adapt.md sections 5.6 and 5.7. EVIDENCE, GENERALITY
+and REPRODUCED point at probe lines (``P<n>:L<a>`` or ``P<n>:L<a>-L<b>``); the
+gates fill in the cited text. Structural mistakes are
+collected per block in ``Divergence.errors`` so they can be sent back.
 """
 
 from __future__ import annotations
@@ -27,8 +28,14 @@ _TEXT_FIELDS = (
     "ENSURE", "WHEN_TO_CHECK", "TRIGGER", "CONTEXT", "EXAMPLE_USAGE",
 )
 _FIELD_LINE = re.compile(rf"^\s*({'|'.join(_FIELDS)}):\s?(.*)$")
-_EVIDENCE = re.compile(r"^probe#(\d+)\s*(?:→|->|:)\s*(.*)$", re.DOTALL)
-_REPRODUCED = re.compile(r'^milestone\s+"(.*)"\s*=\s*(.*?)\s+FROM\s+probe#(\d+)\s*$', re.DOTALL)
+_POINTER = r"P(\d+):L(\d+)(?:-L(\d+))?"
+_ONE_POINTER = re.compile(rf"^{_POINTER}$")
+_REPRODUCED = re.compile(rf'^milestone\s+"(.*)"\s*=\s*(.*?)\s+FROM\s+{_POINTER}\s*$', re.DOTALL)
+_OLD_REPRODUCED = re.compile(r'^milestone\s+".*"\s*=.*\sFROM\s+probe#', re.DOTALL)
+_OLD_POINTER_HINT = (
+    "; P<n> numbers your own probes (PROBE_RESULT P<n>), not the agent's CALL #n, "
+    "and the harness copies the cited lines itself"
+)
 _PROBE = re.compile(r"<probe>(.*?)</probe>", re.DOTALL)
 _FINAL = re.compile(r"<final>(.*?)(?:</final>|$)", re.DOTALL)
 
@@ -36,7 +43,9 @@ _FINAL = re.compile(r"<final>(.*?)(?:</final>|$)", re.DOTALL)
 @dataclass
 class Evidence:
     probe: int
-    excerpt: str
+    start: int
+    end: int
+    excerpt: str = ""
 
 
 @dataclass
@@ -44,7 +53,10 @@ class Reproduction:
     key: str
     value: Any
     probe: int
+    start: int
+    end: int
     semantic_match: str | None = None
+    excerpt: str = ""
 
 
 @dataclass
@@ -102,6 +114,28 @@ def _field_entries(block: str) -> list[tuple[str, str]]:
     return [(key, value) for key, value in entries]
 
 
+def _span(key: str, match: re.Match, offset: int, errors: list[str]) -> tuple[int, int, int] | None:
+    """(probe, first line, last line) from the three pointer groups starting at ``offset``."""
+    probe, start, end = (match.group(offset + i) for i in range(3))
+    first, last = int(start), int(end) if end else int(start)
+    if first < 1 or last < first:
+        span = f"L{first}-L{last}" if end else f"L{first}"
+        errors.append(f"{key} line range {span} is not valid; lines start at L1 and L<a>-L<b> needs a <= b")
+        return None
+    return int(probe), first, last
+
+
+def _pointer_list(key: str, value: str, errors: list[str]) -> list[Evidence]:
+    """One pointer; a range is lines of that probe."""
+    match = _ONE_POINTER.match(value.strip())
+    if not match:
+        hint = _OLD_POINTER_HINT if value.lstrip().startswith("probe#") else ""
+        errors.append(f"{key} must be written as P<n>:L<a> or P<n>:L<a>-L<b>, got {value!r}{hint}")
+        return []
+    span = _span(key, match, 1, errors)
+    return [Evidence(*span)] if span else []
+
+
 def _parse_block(index: int, block: str) -> Divergence:
     d = Divergence(index=index)
     for key, value in _field_entries(block):
@@ -110,11 +144,7 @@ def _parse_block(index: int, block: str) -> Divergence:
         elif key == "BASIS":
             d.basis = value.strip().lower()
         elif key in ("EVIDENCE", "GENERALITY"):
-            match = _EVIDENCE.match(value)
-            if match:
-                getattr(d, key.lower()).append(Evidence(int(match.group(1)), match.group(2).strip()))
-            else:
-                d.errors.append(f"{key} must be written as probe#<n> → <excerpt>, got {value!r}")
+            getattr(d, key.lower()).extend(_pointer_list(key, value, d.errors))
         elif key in ("TABLES", "COLUMNS"):
             try:
                 if key == "TABLES":
@@ -126,10 +156,14 @@ def _parse_block(index: int, block: str) -> Divergence:
         elif key == "REPRODUCED":
             match = _REPRODUCED.match(value)
             if not match:
+                hint = _OLD_POINTER_HINT if _OLD_REPRODUCED.match(value) else ""
                 d.errors.append(
-                    'REPRODUCED must be written as milestone "<key>" = <JSON value> FROM probe#<m>, '
-                    f"got {value!r}"
+                    'REPRODUCED must be written as milestone "<key>" = <JSON value> FROM P<n>:L<a>, '
+                    f"got {value!r}{hint}"
                 )
+                continue
+            span = _span("REPRODUCED", match, 3, d.errors)
+            if not span:
                 continue
             try:
                 parsed = json.loads(match.group(2))
@@ -138,7 +172,7 @@ def _parse_block(index: int, block: str) -> Divergence:
                     f"REPRODUCED value {match.group(2)!r} is not valid JSON; quote strings, e.g. \"广东省\""
                 )
                 continue
-            d.reproduced.append(Reproduction(match.group(1).strip(), parsed, int(match.group(3))))
+            d.reproduced.append(Reproduction(match.group(1).strip(), parsed, *span))
         elif key == "SEMANTIC_MATCH":
             if d.reproduced:
                 d.reproduced[-1].semantic_match = value

@@ -19,8 +19,10 @@ def _divergence(index, fact):
         "columns": [[OPS, "targetUnit"], [OPS, "value"]],
         "fact": fact,
         "category": "6. Units that vary per row",
-        "evidence": [{"probe": 2, "excerpt": "千万元 -> 0.1"}],
-        "reproduced": [{"key": "k", "value": 63.7, "probe": 3, "semantic_match": None}],
+        "evidence": [{"probe": 2, "start": 4, "end": 5, "excerpt": "千万元 -> 0.1"}],
+        "reproduced": [
+            {"key": "k", "value": 63.7, "probe": 3, "start": 7, "end": 7, "semantic_match": None, "excerpt": "63.7"}
+        ],
         "kind": "data",
         "errors": [],
     }
@@ -70,6 +72,6 @@ def test_round_trip_restores_divergence_objects(tmp_path):
     d = item.divergence
     assert isinstance(d, Divergence)
     assert d.columns == [ColumnRef(OPS, "targetUnit"), ColumnRef(OPS, "value")]
-    assert d.evidence == [Evidence(2, "千万元 -> 0.1")]
-    assert d.reproduced == [Reproduction("k", 63.7, 3, None)]
+    assert d.evidence == [Evidence(2, 4, 5, "千万元 -> 0.1")]
+    assert d.reproduced == [Reproduction("k", 63.7, 3, 7, 7, None, "63.7")]
     assert "千万元" in out.read_text(encoding="utf-8")

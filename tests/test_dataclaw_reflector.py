@@ -22,13 +22,13 @@ MISSING_DATA_UNDERSTANDING:
   COLUMNS: {OPS}.secondTargetNum, {OPS}.targetName
   FACT: one secondTargetNum has several targetName spellings
 CATEGORY: 同一指标有多个名字
-EVIDENCE: probe#1 → Y_EC_5 营收金额 1004
-REPRODUCED: milestone "Number of companies" = 2778 FROM probe#1
+EVIDENCE: P1:L1
+REPRODUCED: milestone "Number of companies" = 2778 FROM P1:L2
 KIND: data
 NEEDED_BASIS_PLACEHOLDER
 </final>""".replace("NEEDED_BASIS_PLACEHOLDER\n", """BASIS: data
 INSTANCE: the agent kept only the spelling it saw first for the companies in the task
-GENERALITY: probe#1 → Y_EC_5 营业收入金额 2778
+GENERALITY: P1:L2
 ENSURE: select an indicator by secondTargetNum and keep every targetName under it
 WHEN_TO_CHECK: the question uses a company-level indicator
 TRIGGER: the highest revenue
@@ -36,7 +36,8 @@ CONTEXT: each company uses one targetName spelling per secondTargetNum
 EXAMPLE_USAGE: Y_EC_5 is spelled 营收金额 for some companies
 """)
 
-BAD_FINAL = GOOD_FINAL.replace("Y_EC_5 营收金额 1004", "Y_EC_5 营收金额 9999")
+BAD_FINAL = GOOD_FINAL.replace("= 2778 FROM P1:L2", "= 1004 FROM P1:L1")
+FORMAT_BAD_FINAL = GOOD_FINAL.replace("EVIDENCE: P1:L1", "EVIDENCE: P1:L9")
 PROBE_TURN = "PLAN: count spellings\n<probe>\ncut -d, -f3,4 ./database/x.csv | sort | uniq -c\n</probe>"
 PROBE_OUTPUT = "Y_EC_5 营收金额 1004\nY_EC_5 营业收入金额 2778"
 JUDGE_ACCEPT = "VERDICT: accept\nREASON: holds for every indicator code"
@@ -160,10 +161,61 @@ def test_messages_carry_every_input(loaded):
     assert "Top province" not in missed_section.split("\n\n", 1)[0]
 
 
+
+def test_system_prompt_describes_line_pointers(loaded):
+    system = build_messages(loaded, CATALOG, ReflectorConfig())[0]["content"]
+    assert "EVIDENCE: P<n>:L<a>" in system and "FROM P<n>:L<a>" in system
+    assert "PROBE_RESULT P<n>" in system and "format retries" in system
+    assert "SCOPE:" in system and "cell value" in system
+
+
+def test_default_budget_is_five_finals_and_three_format_retries():
+    config = ReflectorConfig()
+    assert (config.max_finals, config.max_format_retries) == (5, 3)
+
+
+def test_format_rejection_does_not_use_a_final(loaded):
+    result, llm, _ = _reflect(loaded, [PROBE_TURN, FORMAT_BAD_FINAL, GOOD_FINAL])
+    feedback = llm.calls[2][-1]["content"]
+    assert "P1:L9 is outside the output of P1" in feedback
+    assert len(result.accepted) == 1 and result.finals == 1 and result.format_retries == 1
+
+
+def test_final_before_any_probe_is_a_format_error(loaded):
+    result, llm, _ = _reflect(loaded, [GOOD_FINAL, PROBE_TURN, GOOD_FINAL])
+    assert "no probe has been run yet" in llm.calls[1][-1]["content"]
+    assert len(result.accepted) == 1 and result.finals == 1 and result.format_retries == 1
+
+
+def test_giving_up_after_a_rejection_is_recorded(loaded):
+    no_div = "<final>\nNO_DATA_DIVERGENCE: cannot fix it without another probe\n</final>"
+    result, _, _ = _reflect(loaded, [PROBE_TURN, BAD_FINAL, no_div])
+    assert result.stop_reason == "abandoned_after_reject"
+    assert result.accepted == []
+
+
+def test_no_divergence_without_a_rejection_is_done(loaded):
+    no_div = "<final>\nNO_DATA_DIVERGENCE: cannot fix it without another probe\n</final>"
+    result, _, _ = _reflect(loaded, [PROBE_TURN, no_div])
+    assert result.stop_reason == "done"
+
+
+def test_format_budget_exhausted(loaded):
+    result, _, _ = _reflect(loaded, [PROBE_TURN, FORMAT_BAD_FINAL, FORMAT_BAD_FINAL, FORMAT_BAD_FINAL], max_format_retries=3)
+    assert result.stop_reason == "format_budget"
+    assert result.finals == 0 and result.format_retries == 3
+
+
+def test_verdict_tells_how_many_probes_and_finals_are_left(loaded):
+    _, llm, _ = _reflect(loaded, [PROBE_TURN, BAD_FINAL, GOOD_FINAL])
+    feedback = llm.calls[2][-1]["content"]
+    assert "19 probe(s) left" in feedback and "4 <final> submission(s) left" in feedback
+    assert "run more probes" in feedback
+
 def test_probe_then_accepted_final(loaded):
     result, llm, executor = _reflect(loaded, [PROBE_TURN, GOOD_FINAL])
     assert executor.commands == ["cut -d, -f3,4 ./database/x.csv | sort | uniq -c"]
-    assert "PROBE_RESULT #1 (exit 0)" in llm.calls[1][-1]["content"]
+    assert "PROBE_RESULT P1 (exit 0)" in llm.calls[1][-1]["content"]
     assert [g.divergence.fact for g in result.accepted] == ["one secondTargetNum has several targetName spellings"]
     assert result.stop_reason == "done"
     assert result.finals == 1 and result.probes_used == 1
@@ -172,8 +224,8 @@ def test_probe_then_accepted_final(loaded):
 def test_rejection_is_sent_back_and_fix_is_accepted(loaded):
     result, llm, _ = _reflect(loaded, [PROBE_TURN, BAD_FINAL, GOOD_FINAL])
     feedback = llm.calls[2][-1]["content"]
-    assert "REJECTED" in feedback and "not found in the output of probe#1" in feedback
-    assert len(result.accepted) == 1 and result.finals == 2
+    assert "REJECTED" in feedback and "does not match gold" in feedback
+    assert len(result.accepted) == 1 and result.finals == 2 and result.format_retries == 0
     assert result.rejected == []
 
 
@@ -340,7 +392,7 @@ def test_llm_error_keeps_the_partial_run(loaded):
     assert result.stop_reason == "error"
     assert "gateway down" in result.error
     assert result.probes_used == 1 and len(result.probes) == 1
-    assert any("PROBE_RESULT #1" in m["content"] for m in result.messages)
+    assert any("PROBE_RESULT P1" in m["content"] for m in result.messages)
 
 
 def test_interrupt_keeps_the_partial_run(loaded):
