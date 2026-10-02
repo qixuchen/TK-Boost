@@ -108,7 +108,6 @@ BASIS: data | task | gold_only
 BASIS_QUOTE: <words copied from the task; only when BASIS is task>
 INSTANCE: <what you observed on the entities of this task>
 MISSING_DATA_UNDERSTANDING:
-  SCOPE: column | multi_column | file | cross_table | generic
   TABLES: <file>[, <file> ...]
   COLUMNS: <file>.<column>[, <file>.<column> ...]
   FACT: <one column-level fact about the data>
@@ -156,10 +155,8 @@ Rules for the block:
   Each data divergence gives exactly one rule.
 - <file> is always the full path under database/, e.g. enterprise/company_profile.csv.
   TABLES lists files the fact is about as a whole; COLUMNS lists the columns it
-  is about. Leave both empty only for a generic fact.
-- SCOPE must agree with TABLES and COLUMNS: two or more files is cross_table;
-  one file listed under TABLES is file; otherwise two or more columns of one
-  file is multi_column and a single column is column; nothing listed is generic.
+  is about. Leave both empty only for a generic fact. The harness derives the
+  scope of the fact from them.
 - EVIDENCE and GENERALITY point at output lines by number; do not copy the
   text, the harness copies the cited lines itself. Cite only lines you were
   shown, not lines inside an [omitted] range. You may give several lines of
@@ -243,12 +240,10 @@ Field requirements:
 
 - Write the rule in English. Keep file names, column names and cell values
   exactly as they appear in the data (they are often Chinese).
-- ENSURE, WHEN_TO_CHECK and CONTEXT may name files and columns and use general
-  words only. Any concrete cell value belongs in EXAMPLE_USAGE. Indicator names,
-  industry names, units, exchange names, province names, years and other numbers
-  are all cell values, even when they read like ordinary words. Do not
-  paraphrase a cell value to avoid naming it (for example by describing the
-  characters of a unit); state the rule at the level of the column instead.
+- ENSURE, WHEN_TO_CHECK and CONTEXT may name the indicator, unit or other cell
+  value the rule is about when that makes it clearer. Naming a value does not
+  make a rule acceptable or unacceptable; what matters is that the rule still
+  holds for the other values of the same column (see "A good rule" above).
 - TRIGGER quotes the fragment of this task that made the knowledge necessary. It
   may contain entity names; it is kept for review only.
 - WHEN_TO_CHECK abstracts TRIGGER into the shape of the question: drop the
@@ -301,8 +296,8 @@ EXAMPLE_USAGE: Rows whose country is 中国 are the large majority and those who
 Examples that are not acceptable:
 
 - ENSURE: The unit of 营收金额 is 十万元.
-  Rejected: a cell value in ENSURE, and it holds only for some rows of one
-  indicator.
+  Rejected: it holds only for some rows of one indicator, and replacing 营收金额
+  by another indicator makes it false.
 - ENSURE: Company X belongs to the 银行 industry.
   Rejected: an entity fact; it cannot be reused and it may leak answers.
 - BASIS: gold_only / ENSURE: Always keep only companies on domestic exchanges.
@@ -312,13 +307,11 @@ Examples that are not acceptable:
 
 The harness, not you, decides whether a divergence is verified. It checks that
 every cited probe and line exists and was shown to you, that each REPRODUCED
-value appears on its cited line, that the files and columns exist, that SCOPE
-agrees with TABLES and COLUMNS, and it compares numbers with gold at
+value appears on its cited line, that the files and columns exist, and it compares numbers with gold at
 1% relative tolerance. For a data divergence it also checks that NEEDED, BASIS,
 INSTANCE, GENERALITY, ENSURE, WHEN_TO_CHECK, CONTEXT and EXAMPLE_USAGE are
-present, that BASIS is one of the three values, that BASIS_QUOTE appears in the
-task when BASIS is task, and that ENSURE, WHEN_TO_CHECK and CONTEXT contain no
-cell value of the database. A divergence that passes all of this goes to a
+present, that BASIS is one of the three values, and that BASIS_QUOTE appears in
+the task when BASIS is task. A divergence that passes all of this goes to a
 reviewer who sees the divergence, the rule and the GENERALITY probes (not the
 task or the reference) and rejects the rule if it holds only for individual
 entities, or if a gold_only rule states the reference's choice as a fixed

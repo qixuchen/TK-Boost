@@ -11,13 +11,12 @@ from tkstore.dataclaw.reflector import LLMReply, ReflectorConfig, build_messages
 from tkstore.dataclaw.trajectory import Step, ToolCall, Trajectory
 
 OPS = "enterprise/company_operation_status.csv"
-CATALOG = Catalog(headers={OPS: ["bmCode", "secondTargetNum", "targetName", "value"]}, values=frozenset())
+CATALOG = Catalog(headers={OPS: ["bmCode", "secondTargetNum", "targetName", "value"]})
 
 GOOD_FINAL = f"""<final>
 DIVERGENCE: CALL #1 kept only one targetName spelling
 NEEDED: filter by secondTargetNum
 MISSING_DATA_UNDERSTANDING:
-  SCOPE: multi_column
   TABLES:
   COLUMNS: {OPS}.secondTargetNum, {OPS}.targetName
   FACT: one secondTargetNum has several targetName spellings
@@ -166,7 +165,7 @@ def test_system_prompt_describes_line_pointers(loaded):
     system = build_messages(loaded, CATALOG, ReflectorConfig())[0]["content"]
     assert "EVIDENCE: P<n>:L<a>" in system and "FROM P<n>:L<a>" in system
     assert "PROBE_RESULT P<n>" in system and "format retries" in system
-    assert "SCOPE:" in system and "cell value" in system
+    assert "SCOPE:" not in system and "may name the indicator" in system
 
 
 def test_default_budget_is_five_finals_and_three_format_retries():

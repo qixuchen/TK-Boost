@@ -3,7 +3,8 @@
 A ``<final>`` holds divergence blocks, each starting with ``DIVERGENCE:``, in
 the format of TK-Boost-adapt.md sections 5.6 and 5.7. EVIDENCE, GENERALITY
 and REPRODUCED point at probe lines (``P<n>:L<a>`` or ``P<n>:L<a>-L<b>``); the
-gates fill in the cited text. Structural mistakes are
+gates fill in the cited text. SCOPE is derived from TABLES and COLUMNS, and a
+SCOPE line the reflector still writes is ignored. Structural mistakes are
 collected per block in ``Divergence.errors`` so they can be sent back.
 """
 
@@ -14,7 +15,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from .scope import ColumnRef, parse_columns, parse_tables
+from .scope import ColumnRef, derive_scope, parse_columns, parse_tables
 
 KINDS = ("data", "non_data", "gold_suspect")
 _FIELDS = (
@@ -24,7 +25,7 @@ _FIELDS = (
     "ENSURE", "WHEN_TO_CHECK", "TRIGGER", "CONTEXT", "EXAMPLE_USAGE",
 )
 _TEXT_FIELDS = (
-    "DIVERGENCE", "NEEDED", "SCOPE", "FACT", "CATEGORY", "BASIS_QUOTE", "INSTANCE",
+    "DIVERGENCE", "NEEDED", "FACT", "CATEGORY", "BASIS_QUOTE", "INSTANCE",
     "ENSURE", "WHEN_TO_CHECK", "TRIGGER", "CONTEXT", "EXAMPLE_USAGE",
 )
 _FIELD_LINE = re.compile(rf"^\s*({'|'.join(_FIELDS)}):\s?(.*)$")
@@ -180,6 +181,7 @@ def _parse_block(index: int, block: str) -> Divergence:
                 d.errors.append("SEMANTIC_MATCH must follow the REPRODUCED line it justifies")
         elif key == "KIND":
             d.kind = value.strip().lower()
+    d.scope = derive_scope(d.tables, d.columns)
     if not d.kind:
         d.errors.append(f"KIND is missing; use one of {', '.join(KINDS)}")
     elif d.kind not in KINDS:

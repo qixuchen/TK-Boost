@@ -1,4 +1,4 @@
-"""Header catalog and cell-value set built from a DataClaw database directory."""
+"""Header catalog built from a DataClaw database directory."""
 
 import json
 import os
@@ -50,58 +50,26 @@ def test_file_and_column_existence(data_dir):
     assert not catalog.has_file("enterprise/company_profile.csv")
 
 
-def test_value_set_keeps_3_to_40_characters_including_numbers(data_dir):
-    values = build_catalog(data_dir).values
-    assert "2022" in values
-    assert "12.5" in values
-    assert "BM0001" in values
-    assert "净利润额" in values
-    assert "营业收入, 合计" in values  # quoted CSV field with a comma stays whole
-    assert "十万元" in values
-    assert "元" not in values  # shorter than 3
-    assert "7" not in values
-    assert "ab" not in values
-    assert "x" * 41 not in values  # longer than 40
-
-
-def test_value_set_includes_json_strings(data_dir):
-    values = build_catalog(data_dir).values
-    assert "海山昌工设备公司" in values
-    assert "Haishan Chang Company" in values
-
-
-def test_values_equal_to_schema_names_are_excluded(data_dir):
-    values = build_catalog(data_dir).values
-    assert "value" not in values  # a cell equal to a column name
-    assert "company_items" not in values  # top-level JSON keys are structure, not values
-
-
-def test_find_cell_values_in_text(data_dir):
-    catalog = build_catalog(data_dir)
-    text = "比较 targetName 为净利润额的 value 前，先看 2022年 的 targetUnit"
-    assert set(catalog.find_cell_values(text)) == {"净利润额", "2022"}
-
-
-def test_find_cell_values_ignores_schema_names_and_clean_text(data_dir):
-    catalog = build_catalog(data_dir)
-    text = "跨不同 targetName 比较 value 前，按每行的 targetUnit 换算到同一单位"
-    assert catalog.find_cell_values(text) == []
-
-
 def test_load_catalog_caches_and_rebuilds_when_data_changes(data_dir, tmp_path):
     cache_dir = tmp_path / "cache"
     first = load_catalog(data_dir, cache_dir)
-    assert "BM0009" not in first.values
     assert len(list(cache_dir.iterdir())) == 1
 
     again = load_catalog(data_dir, cache_dir)
-    assert again.values == first.values and again.headers == first.headers
+    assert again.headers == first.headers
 
-    csv_path = data_dir / "enterprise" / "company_operation_status.csv"
-    with csv_path.open("a", encoding="utf-8") as fh:
-        fh.write("4,2023,BM0009,净利润额,十万元,1\n")
-    stat = csv_path.stat()
-    os.utime(csv_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    metrics = data_dir / "internal_metrics.csv"
+    metrics.write_text("name,definition,source\nconcentration,top-4 share,report\n", encoding="utf-8")
+    stat = metrics.stat()
+    os.utime(metrics, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
 
     rebuilt = load_catalog(data_dir, cache_dir)
-    assert "BM0009" in rebuilt.values
+    assert rebuilt.headers["internal_metrics.csv"] == ["name", "definition", "source"]
+    assert len(list(cache_dir.iterdir())) == 1
+
+
+def test_cache_holds_only_headers(data_dir, tmp_path):
+    cache_dir = tmp_path / "cache"
+    load_catalog(data_dir, cache_dir)
+    (cached,) = cache_dir.iterdir()
+    assert set(json.loads(cached.read_text(encoding="utf-8"))) == {"headers"}

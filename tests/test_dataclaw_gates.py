@@ -13,7 +13,6 @@ PROFILE = "enterprise/company_profile.csv"
 
 CATALOG = Catalog(
     headers={OPS: ["bmCode", "secondTargetNum", "targetName", "value"], PROFILE: ["bmCode", "province"]},
-    values=frozenset({"营收金额"}),
 )
 TASK_PROMPT = "Which province had the highest total   operating revenue in Shanghai's peer group?"
 MILESTONES = {
@@ -38,7 +37,6 @@ def _divergence(**overrides):
         index=1,
         divergence="filtered on one targetName spelling",
         needed="filter on secondTargetNum",
-        scope="multi_column",
         columns=[ColumnRef(OPS, "secondTargetNum"), ColumnRef(OPS, "targetName")],
         fact="one secondTargetNum has several targetName spellings",
         category="同一指标有多个名字",
@@ -262,20 +260,16 @@ def test_missed_milestones_from_process_score():
     assert missed_milestones(None) == set()
     assert missed_milestones({"gpr": {}}) == set()
 
-def test_scope_must_match_tables_and_columns():
-    result = _check(_divergence(scope="file"))
-    assert result.structural
-    assert any("SCOPE says file" in r and "multi_column" in r for r in result.reasons)
+
+def test_scope_is_not_required():
+    result = _check(_divergence())
+    assert result.status == ACCEPTED, result.reasons
 
 
-def test_translated_string_needs_semantic_match():
-    result = _check(_divergence(reproduced=[Reproduction("Top province by revenue", "北京市", 2, 2, 2)]))
-    assert result.status == REJECTED and result.structural is False
-    assert any("SEMANTIC_MATCH" in r for r in result.reasons)
-    ok = _divergence(reproduced=[Reproduction("Top province by revenue", "北京市", 2, 2, 2, "Chinese name")])
-    assert _check(ok).status == ACCEPTED
-
-
-def test_cell_values_in_rule_body_are_rejected():
-    result = _check(_divergence(ensure="Select 营收金额 and every other spelling."))
-    assert any("ENSURE" in r and "营收金额" in r for r in result.reasons)
+def test_cell_values_are_allowed_in_every_rule_field():
+    d = _divergence(
+        ensure="Select 营收金额 and every other spelling of the indicator.",
+        when_to_check="The question asks for 营收金额 in 2022.",
+        context="营收金额 is one of several spellings.",
+    )
+    assert _check(d).status == ACCEPTED

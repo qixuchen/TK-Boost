@@ -107,8 +107,7 @@ def main() -> int:
     catalog = load_catalog(args.data_dir, _REPO_ROOT / "tmp/dataclaw_cache")
     emit()
     emit(f"catalog: {len(catalog.headers)} files, "
-         f"{sum(len(c) for c in catalog.headers.values())} columns, "
-         f"{len(catalog.values):,} cell values of 3-40 chars ({time.time() - started:.1f}s)")
+         f"{sum(len(c) for c in catalog.headers.values())} columns ({time.time() - started:.1f}s)")
 
     if rows:
         by_size = sorted(rows, key=lambda r: len(r["compressed"]))

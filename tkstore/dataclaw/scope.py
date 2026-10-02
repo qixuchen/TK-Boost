@@ -1,4 +1,4 @@
-"""TABLES / COLUMNS parsing and SCOPE derivation shared by divergences and rules.
+"""TABLES / COLUMNS parsing, SCOPE derivation and existence checks for divergences.
 
 A TABLES entry is a file path relative to DataClaw's ``database/`` directory
 ending in ``.csv`` or ``.json``, used when a fact concerns the whole file. A
@@ -8,12 +8,9 @@ COLUMNS entry is ``<file>.<column>``. Both empty means a generic rule.
 from __future__ import annotations
 
 import re
-from typing import Mapping, NamedTuple
+from typing import NamedTuple
 
 from .catalog import Catalog
-
-SCOPES = ("column", "multi_column", "file", "cross_table", "generic")
-BODY_FIELDS = ("ensure", "when_to_check", "context")
 
 _FILE = re.compile(r"^.+\.(?:csv|json)$")
 _COLUMN = re.compile(r"^(?P<file>.+?\.(?:csv|json))\.(?P<column>.+)$")
@@ -82,32 +79,3 @@ def validate_refs(tables: list[str], columns: list[ColumnRef], catalog: Catalog)
         elif not catalog.has_column(ref.file, ref.column):
             errors.append(f"column {ref.column} does not exist in {ref.file}")
     return errors
-
-
-def check_body(rule: Mapping[str, str], catalog: Catalog) -> list[str]:
-    """Report cell values in the body fields; concrete values belong in EXAMPLE_USAGE."""
-    errors: list[str] = []
-    for field in BODY_FIELDS:
-        hits = catalog.find_cell_values(rule.get(field) or "")
-        if hits:
-            errors.append(
-                f"{field.upper()} contains cell values {', '.join(hits)}; "
-                "name only files and columns here and move concrete values to EXAMPLE_USAGE"
-            )
-    return errors
-
-
-def check_scope_consistency(
-    declared: str, tables: list[str], columns: list[ColumnRef]
-) -> str | None:
-    """Return an error message for the reflector/generator, or None if consistent."""
-    scope = (declared or "").strip().lower()
-    if scope not in SCOPES:
-        return f"SCOPE {declared!r} is not one of {', '.join(SCOPES)}"
-    derived = derive_scope(tables, columns)
-    if scope != derived:
-        return (
-            f"SCOPE says {scope} but TABLES and COLUMNS imply {derived}; "
-            "fix SCOPE, TABLES or COLUMNS so they agree"
-        )
-    return None

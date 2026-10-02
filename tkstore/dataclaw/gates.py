@@ -20,7 +20,7 @@ from .catalog import Catalog
 from .milestones import MISMATCH, SEMANTIC, UNVERIFIABLE, compare, find_milestone
 from .probe import ProbeLines
 from .reflector_io import Divergence, Evidence, Reproduction
-from .scope import check_body, check_scope_consistency, validate_refs
+from .scope import validate_refs
 
 ACCEPTED = "accepted"
 REJECTED = "rejected"
@@ -170,22 +170,17 @@ def check_structure(
 ) -> list[str]:
     """Reasons a data divergence is malformed; resolved pointers get their lines filled in."""
     reasons = list(d.errors)
-    for name, value in (("SCOPE", d.scope), ("FACT", d.fact)):
-        if not value.strip():
-            reasons.append(f"{name} is missing")
+    if not d.fact.strip():
+        reasons.append("FACT is missing")
     if not d.evidence:
         reasons.append("EVIDENCE is missing; cite a probe whose output shows the fact")
     if not d.reproduced:
         reasons.append("REPRODUCED is missing; reproduce at least one missed milestone")
     reasons.extend(_resolve_all("EVIDENCE", d.evidence, probes))
     reasons.extend(validate_refs(d.tables, d.columns, catalog))
-    if d.scope.strip():
-        scope_error = check_scope_consistency(d.scope, d.tables, d.columns)
-        if scope_error:
-            reasons.append(scope_error)
     for r in d.reproduced:
         reasons.extend(_reproduction_form(r, probes, milestones, missed))
-    reasons.extend(_check_rule_fields(d, catalog))
+    reasons.extend(_check_rule_fields(d))
     reasons.extend(_check_basis(d, task_prompt))
     if not d.generality:
         reasons.append(
@@ -220,8 +215,8 @@ def check_divergence(
     return GateResult(d, REJECTED if reasons else ACCEPTED, reasons)
 
 
-def _check_rule_fields(d: Divergence, catalog: Catalog) -> list[str]:
-    reasons = [
+def _check_rule_fields(d: Divergence) -> list[str]:
+    return [
         f"{name} is missing"
         for name, value in (
             ("NEEDED", d.needed),
@@ -233,10 +228,6 @@ def _check_rule_fields(d: Divergence, catalog: Catalog) -> list[str]:
         )
         if not value.strip()
     ]
-    reasons.extend(check_body(
-        {"ensure": d.ensure, "when_to_check": d.when_to_check, "context": d.context}, catalog
-    ))
-    return reasons
 
 
 def _check_basis(d: Divergence, task_prompt: str) -> list[str]:

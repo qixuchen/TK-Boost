@@ -93,6 +93,13 @@ def test_data_divergence_fields():
     assert d.kind == "data"
 
 
+def test_scope_is_derived_from_tables_and_columns_not_read():
+    (d,) = parse_turn(f"<final>\n{DATA_BLOCK.replace('  TABLES:', '  SCOPE: column\n  TABLES:')}</final>").divergences
+    assert d.errors == []
+    assert d.scope == "multi_column"
+    assert d.tables == []
+
+
 def test_basis_instance_generality_and_rule_fields():
     (d,) = parse_turn(f"<final>\n{DATA_BLOCK}{RULE_FIELDS}</final>").divergences
     assert d.errors == []

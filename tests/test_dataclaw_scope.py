@@ -4,7 +4,6 @@ import pytest
 
 from tkstore.dataclaw.scope import (
     ColumnRef,
-    check_scope_consistency,
     derive_scope,
     parse_columns,
     parse_tables,
@@ -83,19 +82,3 @@ def test_parse_tables_rejects_non_files(text):
 )
 def test_derive_scope(tables, columns, scope):
     assert derive_scope(tables, columns) == scope
-
-
-def test_consistent_scope_passes():
-    columns = [ColumnRef(OPS, "targetName"), ColumnRef(OPS, "value")]
-    assert check_scope_consistency("multi_column", [], columns) is None
-    assert check_scope_consistency("  Multi_Column ", [], columns) is None
-
-
-def test_inconsistent_scope_reports_both_scopes():
-    error = check_scope_consistency("column", [PROFILE], [ColumnRef(OPS, "bmCode")])
-    assert error is not None
-    assert "column" in error and "cross_table" in error
-
-
-def test_unknown_declared_scope_is_an_error():
-    assert check_scope_consistency("table", [], [ColumnRef(OPS, "value")]) is not None
