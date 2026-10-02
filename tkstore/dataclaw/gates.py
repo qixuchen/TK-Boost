@@ -14,6 +14,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, Iterator, Mapping
 
 from .catalog import Catalog
@@ -69,6 +70,18 @@ def _scalars(value: Any) -> Iterator[Any]:
         yield value
 
 
+def _decimals(value: int | float) -> int:
+    exponent = Decimal(repr(value)).normalize().as_tuple().exponent
+    return max(0, -exponent) if isinstance(exponent, int) else 0
+
+
+def _same_number(printed: float, reported: int | float) -> bool:
+    """``reported`` equals ``printed`` or ``printed`` rounded to the decimals ``reported`` was written with."""
+    if math.isclose(printed, reported, rel_tol=1e-9, abs_tol=1e-12):
+        return True
+    return math.isclose(round(printed, _decimals(reported)), reported, rel_tol=1e-9, abs_tol=1e-12)
+
+
 def _missing_from_output(value: Any, output: str) -> list[str]:
     squashed = _squash(output)
     numbers = None
@@ -78,7 +91,7 @@ def _missing_from_output(value: Any, output: str) -> list[str]:
             found = str(scalar).lower() in squashed.lower()
         elif isinstance(scalar, (int, float)):
             numbers = _numbers_in(output) if numbers is None else numbers
-            found = any(math.isclose(n, scalar, rel_tol=1e-9, abs_tol=1e-12) for n in numbers)
+            found = any(_same_number(n, scalar) for n in numbers)
         else:
             found = _squash(str(scalar)) in squashed
         if not found:

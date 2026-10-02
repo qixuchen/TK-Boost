@@ -140,6 +140,48 @@ def test_reproduced_with_list_and_dict_values():
     assert second.value == {"Real Estate": 416}
 
 
+def _pointer_block(line):
+    (d,) = parse_turn(f"<final>DIVERGENCE: d\nNEEDED: n\n{line}\nKIND: data\n</final>").divergences
+    return d
+
+
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        ("EVIDENCE: P1:L1-L35, P1:L37-L53", [(1, 1, 35), (1, 37, 53)]),
+        ("EVIDENCE: P2:L1; P1:L1-L2", [(2, 1, 1), (1, 1, 2)]),
+        ("EVIDENCE: P8:L1-P8:L2", [(8, 1, 2)]),
+        ("EVIDENCE: P1:L22-28", [(1, 22, 28)]),
+    ],
+)
+def test_unambiguous_pointer_variants_are_accepted(line, expected):
+    d = _pointer_block(line)
+    assert d.errors == []
+    assert [(e.probe, e.start, e.end) for e in d.evidence] == expected
+
+
+def test_generality_accepts_several_pointers_on_one_line():
+    d = _pointer_block("GENERALITY: P1:L22-P1:L28, P3:L2")
+    assert d.errors == [] and [(g.probe, g.start, g.end) for g in d.generality] == [(1, 22, 28), (3, 2, 2)]
+
+
+def test_reproduced_accepts_the_range_variants():
+    d = _pointer_block('REPRODUCED: milestone "k" = 3 FROM P2:L4-6')
+    assert d.errors == [] and [(r.probe, r.start, r.end) for r in d.reproduced] == [(2, 4, 6)]
+
+
+def test_range_across_two_probes_is_an_error():
+    d = _pointer_block("EVIDENCE: P1:L1-P2:L3")
+    assert any("P1:L1-P2:L3" in e and "one probe" in e for e in d.errors), d.errors
+    assert d.evidence == []
+
+
+def test_one_bad_pointer_in_a_list_is_reported_and_the_rest_kept():
+    d = _pointer_block("EVIDENCE: P1:L2, the output")
+    assert [(e.probe, e.start) for e in d.evidence] == [(1, 2)]
+    assert any("'the output'" in e for e in d.errors), d.errors
+
+
 @pytest.mark.parametrize(
     "line, fragment",
     [

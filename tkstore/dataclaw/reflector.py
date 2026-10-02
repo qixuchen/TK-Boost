@@ -224,17 +224,22 @@ def _verdict_message(results: list[GateResult], *, probes_left: int, finals_left
     return "\n".join(lines)
 
 
-def _call(llm: LLM, messages: list[dict[str, str]], stage: str, calls: list[dict[str, Any]]) -> LLMReply:
-    """Call the LLM and log its stats."""
+def _call(
+    llm: LLM, messages: list[dict[str, str]], stage: str, calls: list[dict[str, Any]], divergence: int | None = None
+) -> LLMReply:
+    """Call the LLM and log its stats; a judge call also keeps its divergence index and reply text."""
     raw = llm(messages)
     reply = raw if isinstance(raw, LLMReply) else LLMReply(raw)
-    calls.append({
+    entry = {
         "stage": stage,
         "finish_reason": reply.finish_reason,
         "timed_out": reply.timed_out,
         "elapsed_s": reply.elapsed_s,
         "text_chars": len(reply.text),
-    })
+    }
+    if divergence is not None:
+        entry.update(divergence=divergence, text=reply.text)
+    calls.append(entry)
     return reply
 
 
@@ -391,7 +396,7 @@ def _judge_reproduction(
     messages = build_reproduction_messages(v.divergence, session.records, loaded, catalog)
     reply = None
     for _ in range(JUDGE_ATTEMPTS):
-        reply = _call(llm, messages, "judge_reproduction", result.llm_calls)
+        reply = _call(llm, messages, "judge_reproduction", result.llm_calls, v.divergence.index)
         verdicts = parse_reproduction_judge(reply.text, len(claims))
         if verdicts is not None:
             reasons = [f"REPRODUCTION JUDGE: {x.reason}" for x in verdicts if x.verdict == "mismatch"]
@@ -404,17 +409,27 @@ def _judge_reproduction(
 def _judge(
     v: GateResult, llm: LLM, session: ProbeSession, result: ReflectionResult, loaded: LoadedRun, catalog: Catalog
 ) -> GateResult:
-    """Generality judge on a divergence that passed the reproduction judge; an unparseable reply is retried once."""
+    """Generality judge on a divergence that passed the reproduction judge: majority of up to
+    GENERALITY_VOTES votes, stopping once one side has a majority; an unparseable vote is retried once."""
     messages = build_judge_messages(v.divergence, session.records, loaded, catalog)
-    reply = None
-    for _ in range(JUDGE_ATTEMPTS):
-        reply = _call(llm, messages, "judge_generality", result.llm_calls)
-        verdict, reason = parse_judge(reply.text)
+    accepts, rejects = 0, []
+    for _ in range(GENERALITY_VOTES):
+        for _ in range(JUDGE_ATTEMPTS):
+            reply = _call(llm, messages, "judge_generality", result.llm_calls, v.divergence.index)
+            verdict, reason = parse_judge(reply.text)
+            if verdict is not None:
+                break
+        else:
+            return GateResult(v.divergence, JUDGE_ERROR, [f"judge reply had no VERDICT line: {reply.text[:200]!r}"])
         if verdict == "accept":
+            accepts += 1
+        else:
+            rejects.append(f"GENERALITY JUDGE: {reason}")
+        if 2 * accepts > GENERALITY_VOTES:
             return v
-        if verdict == "reject":
-            return GateResult(v.divergence, REJECTED, [f"GENERALITY JUDGE: {reason}"])
-    return GateResult(v.divergence, JUDGE_ERROR, [f"judge reply had no VERDICT line: {reply.text[:200]!r}"])
+        if 2 * len(rejects) > GENERALITY_VOTES:
+            return GateResult(v.divergence, REJECTED, rejects)
+    raise AssertionError("GENERALITY_VOTES must be odd")
 
 
 def _identity(result: GateResult) -> tuple:

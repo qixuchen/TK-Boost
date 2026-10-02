@@ -112,10 +112,10 @@ MISSING_DATA_UNDERSTANDING:
   COLUMNS: <file>.<column>[, <file>.<column> ...]
   FACT: <one column-level fact about the data>
 CATEGORY: <the number and name of the hint above, or "Other">
-EVIDENCE: P<n>:L<a>   or   P<n>:L<a>-L<b>
-REPRODUCED: milestone "<key>" = <JSON value> FROM P<n>:L<a>
+EVIDENCE: P<n>:L<a>   or   P<n>:L<a>-L<b>[, P<m>:L<c> ...]
+REPRODUCED: milestone "<key>" = <JSON value> FROM P<n>:L<a>   (one pointer)
 SEMANTIC_MATCH: <why the value means the same as gold; only when the wording differs>
-GENERALITY: P<n>:L<a>   or   P<n>:L<a>-L<b>
+GENERALITY: P<n>:L<a>   or   P<n>:L<a>-L<b>[, P<m>:L<c> ...]
 ENSURE: <what a future agent should do>
 WHEN_TO_CHECK: <the shape of question that needs this rule>
 TRIGGER: <the phrase of this task that called for this knowledge>

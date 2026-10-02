@@ -333,13 +333,13 @@ How BASIS shapes the rule:
 - 只判两点：规则是否只对个别实体成立（包括 `GENERALITY` probe 只在本题实体上显示了该性质）；`BASIS` 为
   `gold_only` 时 `ENSURE` 是否把 gold 的选择写成了固定动作。
 - 输入：divergence 的各字段与规则字段，以及每个 `GENERALITY` probe 的命令和输出（输出截断到 4000 字符、
-  保留头尾）；不给题面、轨迹和 gold。
+  保留头尾）；不给题面、轨迹和 gold。（5.7 节改为加题面、gold 与全部 probe。）
 - 回复格式为两行 `VERDICT: accept | reject` 与 `REASON: <一句话>`。`reject` 时该 divergence 记为打回，
   理由以 `GENERALITY JUDGE: <REASON>` 出现在 `HARNESS VERDICT` 里。
 - 回复为空或找不到 `VERDICT` 行时重试一次；仍失败则记为 `judge_error`：不接受、不打回、不计入被打回的
   divergence，写进输出记录的 `judge_errors`，留待人工查看。
 - 默认用反思 agent 的同一个模型；`scripts/dataclaw_reflect.py --judge-model` 可另指定。每次判断调用都记入
-  `llm_calls`，用 `stage: "judge"` 与反思调用（`stage: "reflect"`）区分；判断调用不占 `max_turns`。
+  `llm_calls`，用 `stage: "judge"`（修订二起改名 `judge_generality`，见 5.7 节）与反思调用（`stage: "reflect"`）区分；判断调用不占 `max_turns`。
 - 同一 `<final>` 里有多条 divergence 通过确定性闸门时，每条各调一次判断；与已接受的 divergence 重复
   （`FACT`、`TABLES`、`COLUMNS` 相同）的不再判断。
 
@@ -348,7 +348,117 @@ harness 查不了 `GENERALITY` 的 probe 是否真的证明了通用性、`gold_
 （`INSTANCE` 与 `FACT` 分开写、6.5 节对例子的要求）；通用性判断目前不检查例子（决策 48），修订后试跑
 若泄漏仍常见再考虑。
 
-**预算不变**：每个 run 最多 20 次 probe、3 次 `<final>`，试跑后再看是否需要调整。
+**预算不变**：每个 run 最多 20 次 probe、3 次 `<final>`，试跑后再看是否需要调整。（`<final>` 上限已由
+5.7 节改为默认 5 次。）
+
+### 5.7 修订二：引用方式、两个判官与预算（`gpt51_low_sample` 试跑之后，待实施）
+
+**试跑与发现。** 用 GPT-5.1、`--reasoning-effort low` 在 6 条开发集轨迹（`task_009`、`task_218`、
+`task_352`、`task_383`、`task_464`、`task_477`）上跑反思，产物在
+`tmp/dataclaw_dev/reflect/gpt51_low_sample/`。`task_009`、`task_218`、`task_352`、`task_383` 各接受 1 条
+（`task_352` 另记 1 条 `gold_suspect`）；`task_464` 被打回后改交 `NO_DATA_DIVERGENCE`，没有产出；
+`task_477` 3 次 `<final>` 都被打回，以 `final_budget` 结束。逐条对照 probe 输出与 gold，发现：
+
+- **复现靠数字巧合通过（`task_383`）。** gold 的「有政策省份前20%企业数（家）」是 5；probe 打印的 5 是
+  有政策省份（天津市、湖南省）的有效企业总数，按 gold 的 `steps` 这一组应有 21 家、前 20% 才是 5 家。
+  `SEMANTIC_MATCH` 里的「ceil(21×0.2)=5」中的 21 是从 gold 的 `steps` 抄来的，probe 里没有。harness 只
+  检查值是否出现在整段 probe 输出的任意位置、与 gold 是否相等，查不出两者是不是同一个量；小整数在输出里
+  几乎总能找到。
+- **把 gold 的口径选择标成 `BASIS: data`（`task_218`、`task_352`、`task_383`、`task_477`）。** probe 只证明
+  两个数据源或两个 `targetName` 的结果不同，`ENSURE` 却写成「用 A，不用 B」。`task_352` 最明显：两个
+  `targetName` 只差一个「和」字，题面是英文，两者与题面一样匹配，`NEEDED` 是按 gold 倒推的。通用性判断
+  的第 2 条只在 `BASIS: gold_only` 时生效，而且判断看不到题面和 gold，于是都放过了。
+- **正文取值检查让规则说不清用哪个指标。** `ENSURE` 不能写出 `targetName` 的取值，只能写
+  「the appropriate enterprise-count targetName」「one specific revenue-type targetName」。
+- **`task_477` 三次全是格式错误。** 第 1 次一个 probe 都没跑，就引用 `probe#32`、`probe#25`，内容实为
+  被分析 agent 轨迹里的 `OUTPUT #32`、`OUTPUT #25`（轨迹与 probe 结果都用「#数字」编号）；第 2、3 次给
+  摘录两端加了双引号，与 probe 输出对不上；第 1 次与 `task_464` 都因 `SCOPE` 与 `TABLES`、`COLUMNS` 推出
+  的范围不一致被打回。另外报出的单元格取值「202」只是「2022」的子串。
+- **`task_464` 被打回后放弃。** 20 次 probe 只用了 2 次，却以「不再跑 probe 就无法修正」为由改交
+  `NO_DATA_DIVERGENCE`，记录里的结束原因是 `done`。打回消息只写「Resubmit a `<final>`」和剩余的
+  `<final>` 次数，没提 probe 还能用。
+
+根源是协议把 harness 能自己完成的记账交给模型（逐字抄输出、记 probe 编号、填 `SCOPE`），记错时与实质
+错误一样扣 `<final>` 次数；判断复现与口径又缺少题面和 gold。修改如下。
+
+**一、引用与结构（解决 `task_477`、`task_464` 暴露的问题）**
+
+1. **行号指针。** `PROBE_RESULT` 给每行加行号，行号按完整输出编；发给反思 agent 的截断视图标明省略了
+   哪几行。`EVIDENCE`、`GENERALITY` 写成 `P<n>:L<a>` 或 `P<n>:L<a>-L<b>`，`REPRODUCED` 写成
+   `milestone "<key>" = <JSON 值> FROM P<n>:L<a>`。harness 检查所指 probe 和行存在、且在反思 agent 看到的
+   视图里，再把原文回填进记录与判官的输入。`REPRODUCED` 的值须出现在所指的行里，不再是整段输出里。
+   加引号、空白差异、长数字抄错、编造输出都不会再出现，不必单独做「去掉外层引号」的容错。
+2. **probe 编号改为 `P<n>`**，与轨迹的 `CALL #n`、`OUTPUT #n` 区分；指向不存在的 probe 时，退回理由列出
+   已运行的 probe，并说明 `P<n>` 只编号反思 agent 自己的 `<probe>`。
+3. **`SCOPE` 由 harness 推出。** 不再要求反思 agent 填写，按 `TABLES`、`COLUMNS` 用 `derive_scope` 推出
+   后写入记录。
+4. **结构错误立即退回，不扣 `<final>` 次数**，另设单独的上限（参数）。结构错误指：无法解析、必填字段缺失、
+   指针指向不存在或看不到的 probe 行、`REPRODUCED` 的值不在所指行里、`REPRODUCED` 的 key 不是 gold
+   milestone、文件或列不存在、`BASIS` 不是三者之一、`BASIS_QUOTE` 不在题面里、还没跑过任何 probe 就提交
+   `data` divergence。只有实质错误扣 `<final>`：值与 gold 不符、milestone 已被 agent 达成、复现判官或
+   通用性判官拒绝。
+5. **打回消息写明剩余的 probe 次数与 `<final>` 次数**，并说明可以先跑 probe 再重交。
+6. **新增结束原因 `abandoned_after_reject`。** 本次 run 之前有 divergence 被打回，之后提交的 `<final>`
+   只含 `NO_DATA_DIVERGENCE`（没有任何 `data` divergence）时，`stop_reason` 记为
+   `abandoned_after_reject`，不再记为 `done`，便于统计。
+7. **`<final>` 上限默认改为 5 次**（`scripts/dataclaw_reflect.py --max-finals` 与 `ReflectorConfig` 的默认
+   值）。格式错误不再扣次数，但同一条 divergence 可能先后被确定性检查、复现判官、通用性判官各退回一次。
+
+**二、取消正文取值检查。** `ENSURE`、`WHEN_TO_CHECK`、`CONTEXT` 不再检查单元格取值（取代 6.3、6.4 节的
+取值检查与决策 7、21、44 的相应部分）。`Catalog` 只需保留表头，供文件与列的存在性检查；反思 prompt 删掉
+「不要写取值、取值移到 `EXAMPLE_USAGE`」的要求。防止规则过于针对具体取值，改由通用性判官负责（见下），
+后续试跑重点检查这一风险。
+
+**三、通用性判官：扩充输入与判断。**
+
+- 输入在 divergence 与规则字段之外，加题面（含 Output guidelines）、gold 的 `answer`、`steps`、`milestone`，
+  以及全部 probe 的代码与完整输出（6 条试跑的 probe 输出合计只有 229–4,329 字符），不再只给 `GENERALITY`
+  引用的 probe。
+- 第 1 条改为可操作的测试：把规则正文里来自题面或本题实体的每个取值（公司、行业、年份、阈值等）换成同一列
+  的其他取值，规则是否仍成立、仍说得通；不成立即拒绝。可以点名某个指标（`targetName` 的取值），但整条
+  规则只陈述某一个指标自身的事实时仍拒绝。
+- 第 2 条不再只看反思 agent 标的 `BASIS`：`ENSURE` 规定的做法能在 gold 的 `steps` 里找到，而 probe 只证明
+  了「两种做法结果不同」，没有证明数据逼出了这种做法时，拒绝，并要求改标 `gold_only` 或按 `gold_only` 的
+  要求改写。
+
+**四、新增复现判官。** 确定性检查之后、通用性判官之前，对每条 `data` divergence 调一次 LLM，判断每条
+`REPRODUCED` 引用的行算的量是否就是 milestone 所指的量。
+
+- 输入：题面（含 Output guidelines）；gold 的 `answer`、完整 `milestone` 字典（标出本条声称复现的 key）与
+  `steps`（milestone 没有单独的说明字段，492 个 gold 文件都只有 `id`、`question`、`guidelines`、`answer`、
+  `metadata`、`steps`、`steps_num`、`milestone`，`steps` 就是各 milestone 的来历）；process judge 对各
+  milestone 的 `details`；每条 `REPRODUCED` 的 key、gold 值、声称的值与回填的引用行；`SEMANTIC_MATCH`；
+  `DIVERGENCE`、`NEEDED`、`INSTANCE`；全部 probe 的代码与完整输出。被分析 agent 的轨迹默认不给
+  （6 条试跑为 38,000–224,000 字符），复现判断用不到。
+- probe 代码是关键输入：输出里的标签是反思 agent 自己写的，不能当作证据，只有代码说明这个数是怎么算的。
+- prompt 写明：只有 probe 输出能支撑复现，取自 gold `steps` 或题面的数字不算。
+- 回复对每条 `REPRODUCED` 先写两行描述再下结论：`PROBE_QUANTITY`（probe 代码实际算的是什么：哪些行、
+  什么筛选、什么聚合）、`MILESTONE_QUANTITY`（按题面与 `steps`，这个 milestone 算的是什么），然后
+  `VERDICT: match | mismatch` 与 `REASON`。任一条 `mismatch` 即打回，理由以
+  `REPRODUCTION JUDGE: <REASON>` 发回，扣一次 `<final>`；无法解析时的处理同通用性判官（重试一次，仍失败
+  记为 `judge_error`）。判官调用在 `llm_calls` 里用不同的 `stage` 区分。
+- 确定性比较保留为前置过滤：值与 gold 按现有规则相等（数值 1%）、值在引用行里、milestone 未被达成。
+- `SEMANTIC_MATCH` 不再是闸门要求的字段，只是反思 agent 给复现判官的说明；文本 milestone 是否语义一致
+  也交给复现判官（取代决策 20 中「由反思 agent 做语义判断」）。
+
+**修订后的流程。** 规则始终由反思 agent 写，两个判官只给 accept / reject 和一句理由，不改写规则。
+
+1. 反思 agent 拿到题面、压缩轨迹、outcome 与 process judge 的结论、gold 答案与 `steps`、未达成的
+   milestone、全库表头；
+2. 跑 probe（`P1`、`P2`……，输出带行号），最多 20 次；
+3. 提交 `<final>`，每条 `data` divergence 带规则字段，引用都是行号指针；
+4. 结构检查：不通过立即退回，不扣 `<final>`；
+5. 确定性实质检查：不通过退回，扣一次 `<final>`；
+6. 复现判官：`mismatch` 退回，扣一次 `<final>`；
+7. 通用性判官：`reject` 退回，扣一次 `<final>`；
+8. 全部通过的 divergence 连同规则入库。
+
+第 4–7 步退回时，消息写明剩余 probe 与 `<final>` 次数；反思 agent 可以先补跑 probe，再提交只含被退回
+条目的 `<final>`，已通过的保留、不再判断。`gold_suspect`、`non_data` 只记录，不进判官。
+
+**实施顺序。** 先做「一」（改了 `REPRODUCED` 的格式，复现判官要用），再做「二」和「三」，最后做「四」；
+每项单独走一次 TDD 循环。改完后在这 6 条与 `task_011`、`task_231` 上重跑，统计以 `final_budget` 和
+`abandoned_after_reject` 结束的比例，人工检查规则是否过于针对具体取值。
 
 ---
 
@@ -839,6 +949,19 @@ data/dataclaw_dev/
 
 第 7 步未开始。
 
+**阶段 C（修订二）：引用方式、两个判官与预算**（设计见 5.7 节；第 1–4 步已实现，全量测试 742 passed、
+1 skipped；第 5 步待三份 prompt 确认后重跑）
+
+在 `gpt51_low_sample` 的 6 条上试跑后定下。按 TDD 实现，顺序：
+
+1. 引用与结构：probe 输出带行号、`P<n>` 编号与行号指针（`reflector_io.py` 解析、`gates.py` 检查与回填、
+   `probe.py` 的视图）；`SCOPE` 由 harness 推出；结构错误不扣 `<final>`、另设上限；打回消息写明剩余
+   probe 次数；结束原因 `abandoned_after_reject`；`--max-finals` 默认 5。
+2. 取消正文取值检查，`Catalog` 只保留表头；反思 prompt 删去相应要求。
+3. 通用性判官的输入加题面、gold 与全部 probe，prompt 按 5.7 节改写第 1、2 条。
+4. 新增复现判官与其 prompt；`SEMANTIC_MATCH` 不再是闸门字段。
+5. 在 6 条 `gpt51_low_sample` 与 `task_011`、`task_231` 上重跑，统计结束原因，人工检查规则。
+
 退出条件：两份 prompt 定稿；在上述 3 道题上试跑，人工确认规则是列级的、`gold_only` 的规则没有把 gold
 的选择写成固定动作、例子不陈述具体实体事实。
 
@@ -855,16 +978,20 @@ data/dataclaw_dev/
 
 ### 9.4 开发完成后的正式运行
 
-1. **定 split。** 在 492 道题上按 `category × level` 分层随机切分，开发集题目不作特殊处理；
-2. **跑 train 上的裸 OpenClaw。** 用现有 `run_batch.py`，每题一次，独立的 `OUTPUT_SUBDIR`；
+1. **定 split。** 已完成（决策 52）：按 `category × level` 分层 1:1，test 246 道，train 分成
+   `train_a`、`train_b` 各 123 道，开发集题目不作特殊处理；文件与生成方式见 `dataclaw.md` 7.5 节；
+2. **跑 train 上的裸 OpenClaw。** 用现有 `run_batch.py`，每题一次，独立的 `OUTPUT_SUBDIR`；先跑
+   `train_a`，判错轨迹不够再跑 `train_b`；
 3. **全量 populate。** 用阶段 A–D 的代码处理 train 上所有判错 run，生成正式 store；
 4. **B0 注入与评测。** 按 `dataclaw.md` 5.5 节实现只给 agent 的注入与 `knowledge_receipt.json`，逐 run
    做送达验收；A、B0 分别用不同 `OUTPUT_SUBDIR` 在 test 上各跑一次。
 
 ### 9.5 注意事项
 
-- **agent 模型保持 glm-5.2。** 开发集是 glm-5.2 的轨迹；正式 train / test 若换模型，错误分布会变，
-  开发期调好的 prompt 不一定适用。
+- **agent 模型改为 gpt-5.1，judge 用 deepseek-v4-flash**（决策 53），两者都走 TK-Boost `.env` 里
+  同一个端点，配置与冒烟测试见 `dataclaw.md` 7.5 节。开发集是 glm-5.2 的轨迹，换模型后错误分布会变，
+  开发期调好的 prompt 不一定适用，跑完 `train_a` 后要先看判错轨迹的类型是否与开发集相近。OpenClaw
+  调 gpt-5.1 时不发送 reasoning 参数，agent 实际不推理。
 - **历史轨迹来自同一镜像。** 开发集由 `dataclaw:0.1.0`（OpenClaw 2026.3.24）产出，`chat.jsonl` 格式与
   新 run 一致；其 `score.json` 是当时 judge 的判定，开发期直接沿用。
 - **开发期 store 不是最终 store。** 只用于检查链路与 prompt 是否合理。
@@ -883,7 +1010,7 @@ data/dataclaw_dev/
 | 4 | 验证 | 复现受影响的 milestone 值才进入规则生成；由 harness 按 `_numbers_match`（1%）、集合、逐 key 比对 |
 | 5 | 非数据类错误 | 跳过 |
 | 6 | 粒度 | 正文只出现文件名、列名；具体值只在 `EXAMPLE_USAGE`；所有列同一规则 |
-| 7 | 自动检查 | 正文不含单元格值（≥3 字符）、列名真实存在；不合规最多重写两次 |
+| 7 | 自动检查 | 正文不含单元格值（≥3 字符）、列名真实存在；不合规最多重写两次（取值检查已被决策 61 取消） |
 | 8 | gold 扫描 | 不设硬闸门 |
 | 9 | test 侧诊断 | 暂不做 |
 | 10 | 合并去重 | 每组一次 LLM 调用；按 `TABLES` 的 `(file, None)` 与 `COLUMNS` 的 `(file, column)` 组成的集合分组；接受跨组残留重复 |
@@ -891,23 +1018,23 @@ data/dataclaw_dev/
 | 12 | B2 跨表返回时机 | 探查到任意一个涉及文件即返回 |
 | 13 | 不采用 | operation tags；按列分类个体 / 标签值；固定禁用名单 |
 | 14 | 范围 | `column` / `multi_column` / `file` / `cross_table` / `generic` 五类，在 divergence、规则、存储中显式记录；harness 按 `TABLES` 与 `COLUMNS` 推出并校验 |
-| 15 | 硬闸门 | 证据须为真实 probe 输出的子串；列名须存在；复现值由 harness 比对；`non_data`、`gold_suspect` 不进第二阶段 |
+| 15 | 硬闸门 | 证据须为真实 probe 输出的子串；列名须存在；复现值由 harness 比对；`non_data`、`gold_suspect` 不进第二阶段（证据引用方式已被决策 54 取代） |
 | 16 | 规则与工具 | 规则描述要检查的数据特性，不写具体库或命令调用 |
 | 17 | 开发顺序 | 先在历史轨迹开发集上开发阶段 A–D，产物合理后再定 split、跑全量 train 与全量 populate |
 | 18 | 开发集 | 归档中 33 个判错的裸 glm-5.2 run（27 道题），拷贝到 `data/dataclaw_dev/runs/`（git 忽略），`manifest.csv` 提交 |
 | 19 | 开发集与 split | 互不约束；正式实验重新跑 train 并重新 populate，开发期规则不进入最终 store |
-| 20 | 字符串 milestone | 规整后相等即一致，否则由反思 agent 做语义判断（prompt 提示「不要求逐字一致，但语义须几乎完全一致」）；数值部分仍由 harness 判定 |
-| 21 | 正文取值检查 | 纯数字也算单元格取值；与文件名、列名相同的取值除外 |
+| 20 | 字符串 milestone | 规整后相等即一致，否则由反思 agent 做语义判断（prompt 提示「不要求逐字一致，但语义须几乎完全一致」）；数值部分仍由 harness 判定（语义判断已由决策 64 改为复现判官负责） |
+| 21 | 正文取值检查 | 纯数字也算单元格取值；与文件名、列名相同的取值除外（已被决策 61 取消） |
 | 22 | 代码位置 | `tkstore/dataclaw/` 子包，测试为 `tests/test_dataclaw_*.py` |
 | 23 | 表和列分开存 | divergence 与规则输出写 `TABLES` 和 `COLUMNS` 两个字段，存储有 `tables`、`columns`，另存推出的 `files`；取消 `<file>.all` 写法（见 6.2） |
 | 24 | `WHEN_TO_CHECK` 生成 | 规则生成时在 `TRIGGER` 中摘出来源题目的触发原句，再抽象成问法形状；合并时比较同组各来源的问法取共同点（见 6.2、第 7 节） |
 | 25 | 轨迹压缩 | 工具输出截断到 2000 字符、保留头尾；思考保留 5000 字符；命令原样保留 |
-| 26 | 反思预算 | 每个 run 最多 20 次 probe；最多提交 3 次 `<final>`；probe 超时 60 秒；发给 LLM 的 probe 输出截断到 4000 字符、保留头尾（均为参数） |
+| 26 | 反思预算 | 每个 run 最多 20 次 probe；最多提交 3 次 `<final>`；probe 超时 60 秒；发给 LLM 的 probe 输出截断到 4000 字符、保留头尾（均为参数；`<final>` 上限已被决策 60 改为 5 次） |
 | 27 | 探查容器网络 | 断网（`--network none`） |
 | 28 | 复现用的 milestone | 只能用 `process_score.json` 中 `achieved=false` 的 milestone |
 | 29 | `CATEGORY` 字段 | divergence 输出加 `CATEGORY`（11.2 节类别名或「其他」），不参与闸门，只用于统计 |
 | 30 | 试跑 run | `task_049`、`task_218`、`task_195`、`task_206`、`task_011` |
-| 31 | `REPRODUCED` 格式 | `milestone "<key>" = <JSON 值> FROM probe#<m>`，可多行；字符串不逐字一致时跟 `SEMANTIC_MATCH`；值须出现在所引 probe 的输出里 |
+| 31 | `REPRODUCED` 格式 | `milestone "<key>" = <JSON 值> FROM probe#<m>`，可多行；字符串不逐字一致时跟 `SEMANTIC_MATCH`；值须出现在所引 probe 的输出里（已被决策 54 取代） |
 | 32 | 反思模型的约束 | 上下文至少 1M token；具体模型待定 |
 | 33 | 阶段 C 输入 | 阶段 B 已接受的 divergence 导出为 `data/dataclaw_dev/divergences.jsonl` 并提交；候选规则输出到 git 忽略的 `tmp/dataclaw_dev/rules/`（已被决策 39 取代） |
 | 34 | 规则形态 | 每条 divergence 生成且只生成 1 条英文 `DATA_RULE`，不生成 `GENERIC_RULE`；生成步骤不接受 `NO_RULE`（「单次 LLM 调用、不探库」已被决策 39 取代） |
@@ -920,20 +1047,39 @@ data/dataclaw_dev/
 | 41 | `BASIS` | `NEEDED` 须标明依据：`data`（数据逼出来的）、`task`（题面决定，附 `BASIS_QUOTE` 原句，harness 检查是题面子串）、`gold_only`（只有 gold 这么选）。prompt 写明三项定义和例子，并说明 `BASIS` 对规则的约束；`task` 与 `gold_only` 的分界：只读题面的细心分析者会不会做同样的选择 |
 | 42 | `gold_only` 的规则 | `ENSURE` 不能把 gold 的选择写成固定动作，只写「这个维度要按题目确定」；gold 的做法可以出现在 `EXAMPLE_USAGE`，但要注明这只是某道题的约定 |
 | 43 | 通用性的验证 | `KIND: data` 必须有 `GENERALITY` probe（harness 检查 probe 与摘录）；确定性闸门通过后调 LLM 做通用性判断，不合格按闸门打回，占用一次 `<final>` 额度 |
-| 44 | 并入后的检查范围 | 沿用现有的正文取值检查（`ENSURE`、`WHEN_TO_CHECK`、`CONTEXT`）；`FACT` 不做取值检查；不设「不能出现 gold 值」的检查 |
+| 44 | 并入后的检查范围 | 沿用现有的正文取值检查（`ENSURE`、`WHEN_TO_CHECK`、`CONTEXT`）；`FACT` 不做取值检查；不设「不能出现 gold 值」的检查（取值检查已被决策 61 取消） |
 | 45 | `non_data` 定义 | 暂不修改 |
-| 46 | 反思预算 | 并入后暂不修改（20 次 probe、3 次 `<final>`），试跑后再看 |
+| 46 | 反思预算 | 并入后暂不修改（20 次 probe、3 次 `<final>`），试跑后再看（`<final>` 上限已被决策 60 改为 5 次） |
 | 47 | 修订后的试跑 | `task_011`、`task_185`、`task_231` |
-| 48 | 通用性判断的范围 | 只判两点：规则是否只对个别实体成立；`gold_only` 的规则是否把 gold 的选择写成固定动作。不检查例子 |
+| 48 | 通用性判断的范围 | 只判两点：规则是否只对个别实体成立；`gold_only` 的规则是否把 gold 的选择写成固定动作。不检查例子（输入与第 1、2 条已由决策 62 修订） |
 | 49 | 判断回复无法解析 | 为空或没有 `VERDICT` 行时重试一次；仍失败记为 `judge_error`，不接受、不打回，写进 `judge_errors` |
 | 50 | `NEEDED` 与 `INSTANCE` | `KIND: data` 时两者都是必填项，缺失即打回 |
 | 51 | 反思与判断的模型 | 用 `.env` 配置的 GPT-5.1；`scripts/dataclaw_reflect.py` 默认 `--reasoning-effort low`（`omit` 为不发送），`--judge-model` 另指定判断模型时沿用同样的推理设置 |
+| 52 | train / test split | 按 `category × level` 分层 1:1（seed 0）：test 246 道；train 再分层对半成 `train_a`、`train_b` 各 123 道，先跑 `train_a`，不够再跑 `train_b`；文件在 `data/splits/dataclaw_*.txt` |
+| 53 | 正式运行的模型 | agent 用 gpt-5.1，judge 用 deepseek-v4-flash，同一端点；取代 9.5 节原先的「agent 保持 glm-5.2」 |
+| 54 | 引用方式 | probe 输出带行号；`EVIDENCE`、`GENERALITY` 写 `P<n>:L<a>[-L<b>]`，`REPRODUCED` 写 `FROM P<n>:L<a>`，harness 回填原文；`REPRODUCED` 的值须在所指行里（取代决策 15 的「子串」与决策 31 的 `FROM probe#<m>`；见 5.7 节） |
+| 55 | probe 编号 | 改为 `P<n>`，与轨迹的 `CALL #n`、`OUTPUT #n` 区分 |
+| 56 | `SCOPE` | 不再由反思 agent 填写，由 harness 按 `TABLES`、`COLUMNS` 推出 |
+| 57 | 结构错误 | 立即退回、不扣 `<final>` 次数，另设单独上限；只有实质错误（值不符、milestone 已达成、判官拒绝）扣次数；范围见 5.7 节 |
+| 58 | 打回消息 | 写明剩余 probe 与 `<final>` 次数，并说明可以先跑 probe 再重交 |
+| 59 | 结束原因 `abandoned_after_reject` | 之前有 divergence 被打回、之后的 `<final>` 只含 `NO_DATA_DIVERGENCE` 时使用，不记为 `done` |
+| 60 | `<final>` 上限 | 默认 5 次（取代决策 26、46 中的 3 次） |
+| 61 | 正文取值检查 | 取消（取代决策 7、21、44 中的取值检查）；`Catalog` 只保留表头；过于针对具体取值的风险由通用性判官负责，后续试跑重点检查 |
+| 62 | 通用性判官 | 输入加题面、gold 的 `answer`、`steps`、`milestone` 与全部 probe；第 1 条改为「换成同列其他取值是否仍成立」的测试，可以点名指标；第 2 条不再只看 `BASIS`，`ENSURE` 的做法出自 gold `steps` 而 probe 只证明结果不同即拒绝（修订决策 48） |
+| 63 | 复现判官 | 确定性检查之后、通用性判官之前调一次 LLM，按题面、gold `steps` 与 probe 代码判断引用行算的量是否就是 milestone 所指的量；取自 gold `steps` 的数字不算复现；`mismatch` 打回、扣一次 `<final>` |
+| 64 | `SEMANTIC_MATCH` | 不再是闸门字段，只作给复现判官的说明；文本 milestone 的语义判断交给复现判官（修订决策 20） |
+| 65 | 通用性判官与 `BASIS` | 判官 prompt 写入 `data`、`task`、`gold_only` 的定义（与反思 prompt 同义）；第 2 条豁免 `BASIS_QUOTE` 引用的题面措辞确实要求的做法，由判官对照题面核实，否则正当的 `task` 规则会因做法出现在 gold `steps` 里被误判为照搬 gold |
+| 66 | 判官的字段释义 | 字段含义集中写在 `prompts/divergence_fields.md`，两个判官的 system prompt 只嵌入各自看得到的字段：通用性判官 17 个（`DIVERGENCE` 到 `EXAMPLE_USAGE`），复现判官 5 个（`DIVERGENCE`、`NEEDED`、`INSTANCE`、`REPRODUCED`、`SEMANTIC_MATCH`）；`BASIS` 三个取值的定义也在其中 |
+| 67 | 判官的表头与第 1 条两步 | 两个判官都拿到全库表头（19 个文件、251 列，3,598 字符），用来确认「同一列」并读懂 probe 代码取的列；判官不能自己跑 probe。通用性判官第 1 条拆成 a 措辞（换值后是否说得通）与 b 证据（只凭 probe 输出判断，输出没覆盖同列其他取值即拒绝，并说明需要什么 probe） |
+| 68 | 保存判官回复 | `llm_calls` 里每次判官调用（`judge_reproduction`、`judge_generality`）都记下 `divergence` 序号与完整回复 `text`，通过的也记，供事后核查判官理由；`rev2_gpt51_low` 这一轮没有保存，理由只能重放 |
+| 69 | 通用性判官多数表决 | 最多 3 票，一方过半即停（两票一致就不投第三票）；每票无法解析时重试一次，仍失败整条记为 `judge_error`；拒绝时发回每张拒绝票的理由。依据：对 `rev2_gpt51_low` 的输入重放，task_352 的通用性判官 6 次里 5 次拒绝、1 次通过（正式运行恰是通过），task_383 的 5 次里 4 次通过、1 次拒绝 |
+| 70 | 指针的宽松写法 | EVIDENCE 与 GENERALITY 一行可写多个指针，以逗号或分号分隔，每个都单独解析，坏的报错、好的保留；范围另接受 `P1:L22-P1:L28`（两端同一 probe）与 `P1:L22-28`；两端不是同一 probe（`P1:L1-P2:L3`）仍是结构错误。REPRODUCED 仍只引一处，但接受同样的范围写法。依据：`rev2_gpt51_low` 中 task_009、task_218 以 `format_budget` 结束，被拒的格式正是这几种 |
+| 71 | 数值按报告精度舍入核对 | 结构检查核对 REPRODUCED 的数值是否在引用行上时，引用行上的数按报告值的小数位舍入后相等也算出现（`0.455843` 对 `0.4558`；整数报告值按整数舍入）。依据：task_009 报告 `0.4558`、引用行印 `0.455843` 而被拒 |
 
 ### 待定
 
 - 三份 prompt（反思、规则生成、合并）的最终文本（第 5.3、6.2 节为草稿；合并 prompt 尚未起草），
   **必须逐条确认**；
-- train 占 492 道题的比例；
 - 反思 agent 已改用 GPT-5.1（决策 51），决策 32 的「上下文至少 1M token」是否随之放宽待确认；合并使用的
   模型；
 - `WHEN_TO_CHECK` 的离线过宽检查（统计每条命中哪些题目），B1、B2 之前再定；
@@ -945,6 +1091,10 @@ data/dataclaw_dev/
   `non_data`；
 - 反思 prompt 与通用性判断 prompt 的最终文本（5.6 节为 `BASIS` 部分的草稿），必须逐条确认；
 - 阶段 B 的缺口：divergence 引用的文件应出现在它所引 probe 的命令或输出里，暂未检查。
+- 5.7 节的结构错误单独上限取多少（决策 57）；
+- 是否把规则正文里出现的单元格取值列给通用性判官作提示（不作闸门），需要为此保留 `Catalog` 的取值集合；
+- 复现判官是否需要被分析 agent 轨迹中 `DIVERGENCE` 点名的 `CALL`（默认不给）；
+- 复现判官与通用性判官 prompt 的最终文本，必须逐条确认。
 
 ---
 

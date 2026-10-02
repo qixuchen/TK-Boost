@@ -29,7 +29,7 @@ _TEXT_FIELDS = (
     "ENSURE", "WHEN_TO_CHECK", "TRIGGER", "CONTEXT", "EXAMPLE_USAGE",
 )
 _FIELD_LINE = re.compile(rf"^\s*({'|'.join(_FIELDS)}):\s?(.*)$")
-_POINTER = r"P(\d+):L(\d+)(?:-L(\d+))?"
+_POINTER = r"P(\d+):L(\d+)(?:\s*-\s*(?:P(\d+):)?L?(\d+))?"
 _ONE_POINTER = re.compile(rf"^{_POINTER}$")
 _REPRODUCED = re.compile(rf'^milestone\s+"(.*)"\s*=\s*(.*?)\s+FROM\s+{_POINTER}\s*$', re.DOTALL)
 _OLD_REPRODUCED = re.compile(r'^milestone\s+".*"\s*=.*\sFROM\s+probe#', re.DOTALL)
@@ -116,8 +116,14 @@ def _field_entries(block: str) -> list[tuple[str, str]]:
 
 
 def _span(key: str, match: re.Match, offset: int, errors: list[str]) -> tuple[int, int, int] | None:
-    """(probe, first line, last line) from the three pointer groups starting at ``offset``."""
-    probe, start, end = (match.group(offset + i) for i in range(3))
+    """(probe, first line, last line) from the four pointer groups starting at ``offset``."""
+    probe, start, end_probe, end = (match.group(offset + i) for i in range(4))
+    if end_probe is not None and end_probe != probe:
+        errors.append(
+            f"{key} range {match.group(0).strip()} spans two probes; a range covers lines of one probe, "
+            "so cite each probe separately"
+        )
+        return None
     first, last = int(start), int(end) if end else int(start)
     if first < 1 or last < first:
         span = f"L{first}-L{last}" if end else f"L{first}"
@@ -127,14 +133,18 @@ def _span(key: str, match: re.Match, offset: int, errors: list[str]) -> tuple[in
 
 
 def _pointer_list(key: str, value: str, errors: list[str]) -> list[Evidence]:
-    """One pointer; a range is lines of that probe."""
-    match = _ONE_POINTER.match(value.strip())
-    if not match:
-        hint = _OLD_POINTER_HINT if value.lstrip().startswith("probe#") else ""
-        errors.append(f"{key} must be written as P<n>:L<a> or P<n>:L<a>-L<b>, got {value!r}{hint}")
-        return []
-    span = _span(key, match, 1, errors)
-    return [Evidence(*span)] if span else []
+    """Pointers separated by commas or semicolons; a malformed one is reported, the others kept."""
+    pointers = []
+    for part in (p.strip() for p in re.split(r"[,;]", value)):
+        match = _ONE_POINTER.match(part)
+        if not match:
+            hint = _OLD_POINTER_HINT if part.startswith("probe#") else ""
+            errors.append(f"{key} must be written as P<n>:L<a> or P<n>:L<a>-L<b>, got {part!r}{hint}")
+            continue
+        span = _span(key, match, 1, errors)
+        if span:
+            pointers.append(Evidence(*span))
+    return pointers
 
 
 def _parse_block(index: int, block: str) -> Divergence:

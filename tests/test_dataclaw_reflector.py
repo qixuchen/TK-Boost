@@ -261,7 +261,7 @@ def test_mixed_final_uses_a_final_and_skips_the_malformed_divergence(loaded):
     feedback = llm.calls[2][-1]["content"]
     assert "outside the output" in feedback and "does not match gold" in feedback
     assert result.finals == 2 and result.format_retries == 0
-    assert len(judge.generality.calls) == 1
+    assert len(judge.generality.calls) == 2
 
 
 def test_verdict_tells_how_many_probes_and_finals_are_left(loaded):
@@ -324,7 +324,7 @@ def test_non_data_divergence_is_logged(loaded):
 
 def test_llm_replies_are_used_and_their_stats_recorded(loaded):
     replies = [LLMReply(PROBE_TURN, "stop", False, 12.5), LLMReply(GOOD_FINAL, "stop", False, 30.0)]
-    judge = Judges(generality=[LLMReply(JUDGE_ACCEPT, "stop", False, 4.0)],
+    judge = Judges(generality=[LLMReply(JUDGE_ACCEPT, "stop", False, 4.0), LLMReply(JUDGE_ACCEPT, "stop", False, 5.0)],
                    reproduction=[LLMReply(REPRO_MATCH, "stop", False, 3.0)])
     result, _, _ = _reflect(loaded, replies, judge=judge)
     assert len(result.accepted) == 1
@@ -333,12 +333,44 @@ def test_llm_replies_are_used_and_their_stats_recorded(loaded):
         ("reflect", "stop", 30.0, False),
         ("judge_reproduction", "stop", 3.0, False),
         ("judge_generality", "stop", 4.0, False),
+        ("judge_generality", "stop", 5.0, False),
     ]
     assert result.llm_calls[0]["text_chars"] == len(PROBE_TURN)
 
 
+def test_judge_replies_are_saved_with_their_divergence(loaded):
+    judge = Judges(generality=[JUDGE_ACCEPT, "VERDICT: accept\nREASON: second vote"])
+    result, _, _ = _reflect(loaded, [PROBE_TURN, GOOD_FINAL], judge=judge)
+    judged = [c for c in result.llm_calls if c["stage"] != "reflect"]
+    assert [(c["stage"], c["divergence"], c["text"]) for c in judged] == [
+        ("judge_reproduction", 1, REPRO_MATCH),
+        ("judge_generality", 1, JUDGE_ACCEPT),
+        ("judge_generality", 1, "VERDICT: accept\nREASON: second vote"),
+    ]
+    assert all("text" not in c for c in result.llm_calls if c["stage"] == "reflect")
 
 
+def test_generality_judge_takes_the_majority_of_three_votes(loaded):
+    judge = Judges(generality=[JUDGE_ACCEPT, JUDGE_REJECT, JUDGE_ACCEPT])
+    result, _, _ = _reflect(loaded, [PROBE_TURN, GOOD_FINAL], judge=judge)
+    assert len(judge.generality.calls) == 3 and len(result.accepted) == 1
+
+
+def test_generality_majority_reject_sends_back_every_rejecting_reason(loaded):
+    other = "VERDICT: reject\nREASON: no probe covers other indicators"
+    judge = Judges(generality=[JUDGE_REJECT, JUDGE_ACCEPT, other])
+    result, _, _ = _reflect(loaded, [PROBE_TURN, GOOD_FINAL], judge=judge, max_finals=1)
+    assert len(judge.generality.calls) == 3 and result.accepted == []
+    assert result.rejected[0].reasons == [
+        "GENERALITY JUDGE: only true for one named company",
+        "GENERALITY JUDGE: no probe covers other indicators",
+    ]
+
+
+def test_two_agreeing_votes_skip_the_third(loaded):
+    judge = Judges(generality=[JUDGE_REJECT, JUDGE_REJECT, JUDGE_ACCEPT])
+    result, _, _ = _reflect(loaded, [PROBE_TURN, GOOD_FINAL], judge=judge, max_finals=1)
+    assert len(judge.generality.calls) == 2 and result.accepted == []
 
 
 def test_judge_sees_the_divergence_rule_and_generality_probe(loaded):
@@ -460,7 +492,7 @@ def test_reproduction_judge_is_told_what_its_fields_mean_and_only_those(loaded):
 
 
 def test_judge_rejection_is_sent_back_and_fix_is_accepted(loaded):
-    judge = Judges(generality=[JUDGE_REJECT, JUDGE_ACCEPT])
+    judge = Judges(generality=[JUDGE_REJECT, JUDGE_REJECT, JUDGE_ACCEPT, JUDGE_ACCEPT])
     result, llm, _ = _reflect(loaded, [PROBE_TURN, GOOD_FINAL, GOOD_FINAL], judge=judge)
     feedback = llm.calls[2][-1]["content"]
     assert "REJECTED" in feedback and "GENERALITY JUDGE: only true for one named company" in feedback
@@ -468,17 +500,17 @@ def test_judge_rejection_is_sent_back_and_fix_is_accepted(loaded):
 
 
 def test_judge_rejection_uses_up_the_final_budget(loaded):
-    judge = Judges(generality=[JUDGE_REJECT])
+    judge = Judges(generality=[JUDGE_REJECT, JUDGE_REJECT])
     result, _, _ = _reflect(loaded, [PROBE_TURN, GOOD_FINAL], judge=judge, max_finals=1)
     assert result.stop_reason == "final_budget"
     assert result.accepted == []
-    assert result.rejected[0].reasons == ["GENERALITY JUDGE: only true for one named company"]
+    assert result.rejected[0].reasons == ["GENERALITY JUDGE: only true for one named company"] * 2
 
 
 def test_unparseable_judge_reply_is_retried_once(loaded):
     judge = Judges(generality=["", JUDGE_ACCEPT])
     result, _, _ = _reflect(loaded, [PROBE_TURN, GOOD_FINAL], judge=judge)
-    assert len(result.accepted) == 1 and len(judge.generality.calls) == 2
+    assert len(result.accepted) == 1 and len(judge.generality.calls) == 3
 
 
 def test_judge_failing_twice_is_a_judge_error_not_sent_back(loaded):
@@ -493,13 +525,13 @@ def test_judge_failing_twice_is_a_judge_error_not_sent_back(loaded):
 def test_divergence_failing_the_gates_is_not_judged(loaded):
     judge = Judges()
     result, _, _ = _reflect(loaded, [PROBE_TURN, WRONG_VALUE_FINAL, GOOD_FINAL], judge=judge)
-    assert judge.order == ["reproduction", "generality"] and len(result.accepted) == 1
+    assert judge.order == ["reproduction", "generality", "generality"] and len(result.accepted) == 1
 
 
 def test_reproduction_judge_runs_before_the_generality_judge(loaded):
     judge = Judges()
     result, _, _ = _reflect(loaded, [PROBE_TURN, GOOD_FINAL], judge=judge)
-    assert judge.order == ["reproduction", "generality"] and len(result.accepted) == 1
+    assert judge.order == ["reproduction", "generality", "generality"] and len(result.accepted) == 1
 
 
 def test_reproduction_judge_sees_the_claim_the_code_and_the_gold(loaded):
@@ -538,7 +570,7 @@ def test_reproduction_mismatch_is_sent_back_and_uses_a_final(loaded):
     result, llm, _ = _reflect(loaded, [PROBE_TURN, GOOD_FINAL, GOOD_FINAL], judge=judge)
     feedback = llm.calls[2][-1]["content"]
     assert "REJECTED" in feedback and "REPRODUCTION JUDGE: the probe counts rows, not companies" in feedback
-    assert judge.order == ["reproduction", "reproduction", "generality"]
+    assert judge.order == ["reproduction", "reproduction", "generality", "generality"]
     assert len(result.accepted) == 1 and result.finals == 2 and result.format_retries == 0
 
 

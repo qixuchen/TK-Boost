@@ -189,6 +189,16 @@ def test_value_off_by_more_than_one_percent_is_rejected():
     assert any("does not match gold" in r and "1004" in r for r in result.reasons)
 
 
+def test_value_rounded_to_its_reported_decimals_is_on_the_line():
+    probes = {**PROBES, 4: ProbeLines.full("normalized 0.455843")}
+    d = _divergence(reproduced=[Reproduction("Number of companies", 0.4558, 4, 1, 1)])
+    assert not any("does not appear" in r for r in _check(d, probes=probes).reasons)
+
+
+def test_value_that_rounds_differently_is_not_on_the_line():
+    probes = {**PROBES, 4: ProbeLines.full("normalized 0.455943")}
+    d = _divergence(reproduced=[Reproduction("Number of companies", 0.4558, 4, 1, 1)])
+    assert any("0.4558 does not appear in P4:L1" in r for r in _check(d, probes=probes).reasons)
 
 
 def test_rounded_value_within_tolerance_is_accepted():
