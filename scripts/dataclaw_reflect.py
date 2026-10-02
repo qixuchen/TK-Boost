@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tasks", default=",".join(PILOT_TASKS),
                         help="comma-separated task_id prefixes (default: the five pilot tasks)")
     parser.add_argument("--model", help="litellm model id; required unless --dry-run")
-    parser.add_argument("--judge-model", help="litellm model id of the generality judge (default: --model)")
+    parser.add_argument("--judge-model", help="litellm model id of the reproduction and generality judges (default: --model)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-probes", type=int, default=20)
     parser.add_argument("--max-finals", type=int, default=5,

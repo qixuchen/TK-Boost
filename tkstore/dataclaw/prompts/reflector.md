@@ -168,8 +168,9 @@ Rules for the block:
   (e.g. "广东省"). For a dict milestone, report it under the gold keys. You
   may give several REPRODUCED lines.
 - Strings need not match gold verbatim, but must mean almost exactly the same
-  thing (广东省 and Guangdong Province do). When the wording differs, add a
-  SEMANTIC_MATCH line right after that REPRODUCED line.
+  thing (广东省 and Guangdong Province do). When the wording differs, you may
+  add a SEMANTIC_MATCH line right after that REPRODUCED line to explain it to
+  the reviewer.
 - non_data and gold_suspect blocks need only DIVERGENCE, NEEDED and KIND.
 - If you found no data divergence at all, write inside <final> a line
   NO_DATA_DIVERGENCE: <reason>, optionally followed by non_data or
@@ -307,15 +308,31 @@ Examples that are not acceptable:
 
 The harness, not you, decides whether a divergence is verified. It checks that
 every cited probe and line exists and was shown to you, that each REPRODUCED
-value appears on its cited line, that the files and columns exist, and it compares numbers with gold at
-1% relative tolerance. For a data divergence it also checks that NEEDED, BASIS,
+value appears on its cited line, that the files and columns exist, and it
+compares numbers with gold at 1% relative tolerance. For a data divergence it
+also checks that NEEDED, BASIS,
 INSTANCE, GENERALITY, ENSURE, WHEN_TO_CHECK, CONTEXT and EXAMPLE_USAGE are
 present, that BASIS is one of the three values, and that BASIS_QUOTE appears in
-the task when BASIS is task. A divergence that passes all of this goes to a
-reviewer who sees the divergence, the rule and the GENERALITY probes (not the
-task or the reference) and rejects the rule if it holds only for individual
-entities, or if a gold_only rule states the reference's choice as a fixed
-action.
+the task when BASIS is task. A divergence that passes all of this goes to two
+reviewers, who both see the task, the reference answer with its gold steps and
+milestones, the files and their columns, and every probe you ran. They cannot
+run probes themselves; what your probes printed is all the evidence they have.
+
+The first reviewer checks each REPRODUCED line. It reads the code of your
+probes, not the labels they print, and rejects the divergence when the probe
+computes a different quantity from the one the milestone stands for (a count of
+rows for a count of companies, one year for all years), or when the value is
+not computed from the data, such as a number copied from the gold steps or the
+task into the command.
+
+The second reviewer also sees the divergence and the rule. It
+replaces the task's values in the rule by other values of the same columns and
+rejects the rule if it no longer makes sense, or if no probe output shows the
+property for other values of those columns (so make your GENERALITY probes
+print them). It also rejects the rule if ENSURE prescribes the
+reference's choice from the gold steps while neither the probes show that the
+data forces it nor the BASIS_QUOTE wording of the task requires it, whatever
+BASIS says.
 
 The harness replies with a verdict for each divergence. Accepted divergences
 are kept. If a rejection needs new evidence, run more probes first; then

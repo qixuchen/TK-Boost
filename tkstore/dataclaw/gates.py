@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Mapping
 
 from .catalog import Catalog
-from .milestones import MISMATCH, SEMANTIC, UNVERIFIABLE, compare, find_milestone
+from .milestones import MISMATCH, UNVERIFIABLE, compare, find_milestone
 from .probe import ProbeLines
 from .reflector_io import Divergence, Evidence, Reproduction
 from .scope import validate_refs
@@ -151,11 +151,6 @@ def _reproduction_substance(r: Reproduction, milestones: dict[str, Any], missed:
         reasons.append(f'REPRODUCED "{key}" = {r.value!r} does not match gold {expected!r}')
     elif verdict == UNVERIFIABLE:
         reasons.append(f'milestone "{key}" cannot be verified by the harness; reproduce another one')
-    elif verdict == SEMANTIC and not (r.semantic_match or "").strip():
-        reasons.append(
-            f'REPRODUCED "{key}" = {r.value!r} differs in wording from gold {expected!r}; '
-            "add a SEMANTIC_MATCH line explaining why they mean the same thing"
-        )
     return reasons
 
 

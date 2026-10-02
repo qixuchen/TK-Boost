@@ -19,19 +19,31 @@ from typing import Any, Callable
 from .catalog import Catalog
 from .devset import LoadedRun
 from .gates import ACCEPTED, LOGGED, REJECTED, GateResult, check_divergence, missed_milestones
-from .probe import ProbeRecord, ProbeSession
-from .reflector_io import Divergence, parse_turn
-from .trajectory import compress, truncate_middle
+from .milestones import find_milestone
+from .probe import ProbeRecord, ProbeSession, numbered_view
+from .reflector_io import Divergence, Evidence, Reproduction, parse_turn
+from .trajectory import compress
 
 LLM = Callable[[list[dict[str, str]]], "str | LLMReply"]
 PROMPT_PATH = Path(__file__).with_name("prompts") / "reflector.md"
 JUDGE_PROMPT_PATH = Path(__file__).with_name("prompts") / "reflector_judge.md"
+REPRODUCTION_PROMPT_PATH = Path(__file__).with_name("prompts") / "reflector_judge_reproduction.md"
+FIELDS_PATH = Path(__file__).with_name("prompts") / "divergence_fields.md"
+GENERALITY_JUDGE_FIELDS = (
+    "DIVERGENCE", "NEEDED", "BASIS", "BASIS_QUOTE", "INSTANCE", "SCOPE", "TABLES", "COLUMNS", "FACT",
+    "CATEGORY", "EVIDENCE", "GENERALITY", "ENSURE", "WHEN_TO_CHECK", "TRIGGER", "CONTEXT", "EXAMPLE_USAGE",
+)
+REPRODUCTION_JUDGE_FIELDS = ("DIVERGENCE", "NEEDED", "INSTANCE", "REPRODUCED", "SEMANTIC_MATCH")
+_FIELD_ENTRY = re.compile(r"^- ([A-Z_]+): ", re.MULTILINE)
 JUDGE_ERROR = "judge_error"
 JUDGE_ATTEMPTS = 2
-JUDGE_PROBE_CHARS = 4000
+GENERALITY_VOTES = 3
+JUDGE_PROBE_CHARS = 8000
 EXTRA_TURNS = 3
 _VERDICT = re.compile(r"^\s*VERDICT:\s*(accept|reject)\b", re.IGNORECASE | re.MULTILINE)
 _REASON = re.compile(r"^\s*REASON:\s*(.*)", re.MULTILINE | re.DOTALL)
+_REPRO_BLOCK = re.compile(r"^\s*REPRODUCED\s+(\d+)\s*$", re.MULTILINE)
+_REPRO_FIELD = re.compile(r"^\s*(PROBE_QUANTITY|MILESTONE_QUANTITY|VERDICT|REASON):\s*(.*)$", re.MULTILINE)
 EMPTY_REPLY_NUDGE = (
     "EMPTY REPLY: your previous reply was cut off before any text. Do not deliberate at length; "
     "reply now with one short PLAN and one <probe>, or with your <final>."
@@ -134,26 +146,41 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _user_message(loaded: LoadedRun, catalog: Catalog, config: ReflectorConfig) -> str:
-    gold = loaded.gold
-    process = (loaded.process_score or {}).get("gpr") or {}
-    details = process.get("details") or []
-    missed = missed_milestones(loaded.process_score)
-    milestones = gold.get("milestone") or {}
+def _process(loaded: LoadedRun) -> dict[str, Any]:
+    return (loaded.process_score or {}).get("gpr") or {}
 
-    steps = "\n".join(f"{i}. {s}" for i, s in enumerate(gold.get("steps") or [], 1))
-    judged = "\n".join(
+
+def _steps(gold: dict[str, Any]) -> str:
+    return "\n".join(f"{i}. {s}" for i, s in enumerate(gold.get("steps") or [], 1))
+
+
+def _judged(loaded: LoadedRun) -> str:
+    return "\n".join(
         f"- {d['key']} (expected {_json(d.get('expected'))}): "
         f"{'achieved' if d.get('achieved') else 'MISSED'} - {d.get('reason', '')}"
-        for d in details
+        for d in _process(loaded).get("details") or []
     )
-    missed_lines = "\n".join(
-        f"- {key} = {_json(value)}" for key, value in milestones.items() if key in missed
-    ) or "- (none)"
-    files = "\n".join(
+
+
+def _files(catalog: Catalog) -> str:
+    return "\n".join(
         f"{name}: {', '.join(columns)}" if columns else f"{name}: (JSON file; reference it under TABLES)"
         for name, columns in catalog.headers.items()
     )
+
+
+def _user_message(loaded: LoadedRun, catalog: Catalog, config: ReflectorConfig) -> str:
+    gold = loaded.gold
+    process = _process(loaded)
+    missed = missed_milestones(loaded.process_score)
+    milestones = gold.get("milestone") or {}
+
+    steps = _steps(gold)
+    judged = _judged(loaded)
+    missed_lines = "\n".join(
+        f"- {key} = {_json(value)}" for key, value in milestones.items() if key in missed
+    ) or "- (none)"
+    files = _files(catalog)
     trajectory = compress(
         loaded.trajectory,
         max_output_chars=config.max_output_chars,
@@ -198,6 +225,7 @@ def _verdict_message(results: list[GateResult], *, probes_left: int, finals_left
 
 
 def _call(llm: LLM, messages: list[dict[str, str]], stage: str, calls: list[dict[str, Any]]) -> LLMReply:
+    """Call the LLM and log its stats."""
     raw = llm(messages)
     reply = raw if isinstance(raw, LLMReply) else LLMReply(raw)
     calls.append({
@@ -208,6 +236,11 @@ def _call(llm: LLM, messages: list[dict[str, str]], stage: str, calls: list[dict
         "text_chars": len(reply.text),
     })
     return reply
+
+
+def _pointer(p: Evidence | Reproduction) -> str:
+    span = f"L{p.start}" if p.start == p.end else f"L{p.start}-L{p.end}"
+    return f"P{p.probe}:{span}"
 
 
 def _divergence_text(d: Divergence) -> str:
@@ -226,11 +259,8 @@ def _divergence_text(d: Divergence) -> str:
         f"FACT: {d.fact}",
         f"CATEGORY: {d.category}",
     ]
-    def _pointer(p):
-        span = f"L{p.start}" if p.start == p.end else f"L{p.start}-L{p.end}"
-        return f"P{p.probe}:{span} → {p.excerpt}"
-    lines += [f"EVIDENCE: {_pointer(e)}" for e in d.evidence]
-    lines += [f"GENERALITY: {_pointer(g)}" for g in d.generality]
+    lines += [f"EVIDENCE: {_pointer(e)} → {e.excerpt}" for e in d.evidence]
+    lines += [f"GENERALITY: {_pointer(g)} → {g.excerpt}" for g in d.generality]
     lines += [
         f"ENSURE: {d.ensure}",
         f"WHEN_TO_CHECK: {d.when_to_check}",
@@ -241,21 +271,107 @@ def _divergence_text(d: Divergence) -> str:
     return "\n".join(lines)
 
 
-def build_judge_messages(d: Divergence, probes: dict[int, ProbeRecord]) -> list[dict[str, str]]:
-    cited = []
-    for number in dict.fromkeys(g.probe for g in d.generality):
-        record = probes.get(number)
-        if record is not None:
-            output = truncate_middle(record.output, JUDGE_PROBE_CHARS) if record.output else "(no output)"
-            cited.append(f"probe#{number}: {record.command}\n{output}")
+def _probe_text(record: ProbeRecord) -> str:
+    output = numbered_view(record.output, JUDGE_PROBE_CHARS)[0] if record.output else "(no output)"
+    return f"P{record.number}: {record.command}\n{output}"
+
+
+def _gold_sections(loaded: LoadedRun, catalog: Catalog) -> list[str]:
+    gold = loaded.gold
+    return [
+        f"## Task given to the agent\n{loaded.prompt}",
+        f"## Gold answer\n{_json(gold.get('answer'))}",
+        f"## Gold steps\n{_steps(gold)}",
+        f"## Gold milestones\n{_json(gold.get('milestone') or {})}",
+        f"## Files under ./database/ and their columns\n{_files(catalog)}",
+    ]
+
+
+def _probes_section(probes: list[ProbeRecord]) -> str:
+    return "## Every probe the reflector ran (command and line-numbered output)\n" + "\n\n".join(
+        _probe_text(r) for r in probes
+    )
+
+
+def field_meanings(names: tuple[str, ...]) -> str:
+    """The entries of divergence_fields.md for ``names``, in that order."""
+    text = FIELDS_PATH.read_text(encoding="utf-8")
+    heads = list(_FIELD_ENTRY.finditer(text))
+    entries = {
+        head.group(1): text[head.start():(heads[i + 1].start() if i + 1 < len(heads) else len(text))].rstrip()
+        for i, head in enumerate(heads)
+    }
+    return "\n".join(entries[name] for name in names)
+
+
+def _judge_system(path: Path, names: tuple[str, ...]) -> str:
+    return Template(path.read_text(encoding="utf-8")).substitute(fields=field_meanings(names))
+
+
+def build_judge_messages(
+    d: Divergence, probes: list[ProbeRecord], loaded: LoadedRun, catalog: Catalog
+) -> list[dict[str, str]]:
     user = "\n\n".join([
+        *_gold_sections(loaded, catalog),
         f"## Divergence and rule\n{_divergence_text(d)}",
-        "## GENERALITY probes (command and output)\n" + "\n\n".join(cited),
+        _probes_section(probes),
     ])
     return [
-        {"role": "system", "content": JUDGE_PROMPT_PATH.read_text(encoding="utf-8")},
+        {"role": "system", "content": _judge_system(JUDGE_PROMPT_PATH, GENERALITY_JUDGE_FIELDS)},
         {"role": "user", "content": user},
     ]
+
+
+def _claim_text(i: int, r: Reproduction, milestones: dict[str, Any]) -> str:
+    key, expected = find_milestone(milestones, r.key) or (r.key, None)
+    line = f'REPRODUCED {i}: milestone "{key}" (gold {_json(expected)}) = {_json(r.value)} FROM {_pointer(r)} → {r.excerpt}'
+    return f"{line}\n  SEMANTIC_MATCH: {r.semantic_match}" if r.semantic_match else line
+
+
+def build_reproduction_messages(
+    d: Divergence, probes: list[ProbeRecord], loaded: LoadedRun, catalog: Catalog
+) -> list[dict[str, str]]:
+    milestones = loaded.gold.get("milestone") or {}
+    user = "\n\n".join([
+        *_gold_sections(loaded, catalog),
+        f"## Process judge on each milestone\n{_judged(loaded)}",
+        f"## Divergence\nDIVERGENCE: {d.divergence}\nNEEDED: {d.needed}\nINSTANCE: {d.instance}",
+        "## Claims to judge (cited lines filled in by the harness)\n"
+        + "\n".join(_claim_text(i, r, milestones) for i, r in enumerate(d.reproduced, 1)),
+        _probes_section(probes),
+    ])
+    return [
+        {"role": "system", "content": _judge_system(REPRODUCTION_PROMPT_PATH, REPRODUCTION_JUDGE_FIELDS)},
+        {"role": "user", "content": user},
+    ]
+
+
+@dataclass(frozen=True)
+class ReproductionVerdict:
+    probe_quantity: str
+    milestone_quantity: str
+    verdict: str
+    reason: str
+
+
+def parse_reproduction_judge(text: str, count: int) -> list[ReproductionVerdict] | None:
+    """One verdict per REPRODUCED claim, in order; None unless every claim has a match/mismatch VERDICT."""
+    text = text or ""
+    heads = list(_REPRO_BLOCK.finditer(text))
+    blocks: dict[int, dict[str, str]] = {}
+    for i, head in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        blocks[int(head.group(1))] = {k: v.strip() for k, v in _REPRO_FIELD.findall(text[head.end():end])}
+    verdicts = []
+    for n in range(1, count + 1):
+        fields = blocks.get(n, {})
+        verdict = fields.get("VERDICT", "").rstrip(".").lower()
+        if verdict not in ("match", "mismatch"):
+            return None
+        verdicts.append(ReproductionVerdict(
+            fields.get("PROBE_QUANTITY", ""), fields.get("MILESTONE_QUANTITY", ""), verdict, fields.get("REASON", "")
+        ))
+    return verdicts
 
 
 def parse_judge(text: str) -> tuple[str | None, str]:
@@ -265,12 +381,34 @@ def parse_judge(text: str) -> tuple[str | None, str]:
     return (verdict.group(1).lower() if verdict else None, reason.group(1).strip() if reason else "")
 
 
-def _judge(v: GateResult, llm: LLM, session: ProbeSession, result: ReflectionResult) -> GateResult:
-    """Generality judge on a divergence that passed the deterministic gates; retried once."""
-    messages = build_judge_messages(v.divergence, {r.number: r for r in session.records})
+def _judge_reproduction(
+    v: GateResult, llm: LLM, session: ProbeSession, result: ReflectionResult, loaded: LoadedRun, catalog: Catalog
+) -> GateResult:
+    """Reproduction judge on a divergence that passed the deterministic gates; retried once."""
+    claims = v.divergence.reproduced
+    if not claims:
+        return v
+    messages = build_reproduction_messages(v.divergence, session.records, loaded, catalog)
     reply = None
     for _ in range(JUDGE_ATTEMPTS):
-        reply = _call(llm, messages, "judge", result.llm_calls)
+        reply = _call(llm, messages, "judge_reproduction", result.llm_calls)
+        verdicts = parse_reproduction_judge(reply.text, len(claims))
+        if verdicts is not None:
+            reasons = [f"REPRODUCTION JUDGE: {x.reason}" for x in verdicts if x.verdict == "mismatch"]
+            return GateResult(v.divergence, REJECTED, reasons) if reasons else v
+    return GateResult(
+        v.divergence, JUDGE_ERROR, [f"reproduction judge reply had no verdict per claim: {reply.text[:200]!r}"]
+    )
+
+
+def _judge(
+    v: GateResult, llm: LLM, session: ProbeSession, result: ReflectionResult, loaded: LoadedRun, catalog: Catalog
+) -> GateResult:
+    """Generality judge on a divergence that passed the reproduction judge; an unparseable reply is retried once."""
+    messages = build_judge_messages(v.divergence, session.records, loaded, catalog)
+    reply = None
+    for _ in range(JUDGE_ATTEMPTS):
+        reply = _call(llm, messages, "judge_generality", result.llm_calls)
         verdict, reason = parse_judge(reply.text)
         if verdict == "accept":
             return v
@@ -294,7 +432,7 @@ def _handle_turn(
     milestones: dict[str, Any],
     missed: set[str],
     seen: set[tuple],
-    task_prompt: str,
+    loaded: LoadedRun,
     judge_llm: LLM,
 ) -> str | None:
     """Act on one non-empty reply; return the feedback, or None once the run is over."""
@@ -311,13 +449,16 @@ def _handle_turn(
     outputs = {r.number: session.lines(r) for r in session.records}
     verdicts = [
         check_divergence(
-            d, probes=outputs, catalog=catalog, milestones=milestones, missed=missed, task_prompt=task_prompt
+            d, probes=outputs, catalog=catalog, milestones=milestones, missed=missed, task_prompt=loaded.prompt
         )
         for d in turn.divergences
     ]
     for i, v in enumerate(verdicts):
         if v.status == ACCEPTED and _identity(v) not in seen:
-            v = verdicts[i] = _judge(v, judge_llm, session, result)
+            v = _judge_reproduction(v, judge_llm, session, result, loaded, catalog)
+            if v.status == ACCEPTED:
+                v = _judge(v, judge_llm, session, result, loaded, catalog)
+            verdicts[i] = v
             if v.status == ACCEPTED:
                 seen.add(_identity(v))
                 result.accepted.append(v)
@@ -369,7 +510,7 @@ def reflect(
         milestones=loaded.gold.get("milestone") or {},
         missed=missed_milestones(loaded.process_score),
         seen=set(),
-        task_prompt=loaded.prompt,
+        loaded=loaded,
         judge_llm=judge_llm or llm,
     )
     start = tick()

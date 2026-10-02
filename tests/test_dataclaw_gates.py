@@ -111,6 +111,9 @@ def test_data_divergence_needs_every_field(overrides, fragment):
     assert any(fragment in r for r in result.reasons), result.reasons
 
 
+def test_scope_is_not_required():
+    assert _check(_divergence(scope="")).status == ACCEPTED
+
 
 def test_citing_a_probe_never_run_lists_the_probes_that_were():
     result = _check(_divergence(evidence=[Evidence(9, 1, 1)]))
@@ -193,6 +196,15 @@ def test_rounded_value_within_tolerance_is_accepted():
     assert _check(d).status == ACCEPTED
 
 
+def test_translated_string_is_left_to_the_reproduction_judge():
+    without = _check(_divergence(reproduced=[Reproduction("Top province by revenue", "北京市", 2, 2, 2)]))
+    assert without.status == ACCEPTED, without.reasons
+
+    with_it = _check(
+        _divergence(reproduced=[Reproduction("Top province by revenue", "北京市", 2, 2, 2, "北京市 is Beijing")])
+    )
+    assert with_it.status == ACCEPTED, with_it.reasons
+
 
 def test_list_elements_must_all_appear_on_the_cited_lines():
     ok = _divergence(reproduced=[Reproduction("Provinces", ["北京市", "上海市"], 2, 2, 3, "Chinese names")])
@@ -243,6 +255,18 @@ def test_generality_must_cite_an_existing_probe():
     assert any("GENERALITY cites P9" in r for r in result.reasons), result.reasons
 
 
+def test_cell_values_are_allowed_in_every_rule_field():
+    d = _divergence(
+        ensure="Select 营收金额 and every other spelling of the indicator.",
+        when_to_check="The question asks for 营收金额 in 2022.",
+        context="营收金额 is one of several spellings.",
+        trigger="营收金额 of Beijing",
+        example_usage="营收金额 vs 营业收入金额",
+        fact="营收金额 is one of several spellings",
+        instance="the agent kept only 营收金额",
+    )
+    assert _check(d).status == ACCEPTED, _check(d).reasons
+
 
 def test_non_data_needs_none_of_the_new_fields():
     d = Divergence(index=1, divergence="flipped the subtraction", needed="2022 minus 2021", kind="non_data")
@@ -259,17 +283,3 @@ def test_missed_milestones_from_process_score():
     assert missed_milestones(process) == {"A", "C"}
     assert missed_milestones(None) == set()
     assert missed_milestones({"gpr": {}}) == set()
-
-
-def test_scope_is_not_required():
-    result = _check(_divergence())
-    assert result.status == ACCEPTED, result.reasons
-
-
-def test_cell_values_are_allowed_in_every_rule_field():
-    d = _divergence(
-        ensure="Select 营收金额 and every other spelling of the indicator.",
-        when_to_check="The question asks for 营收金额 in 2022.",
-        context="营收金额 is one of several spellings.",
-    )
-    assert _check(d).status == ACCEPTED
