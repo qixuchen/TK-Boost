@@ -990,11 +990,108 @@ data/dataclaw_dev/
 
 - **agent 模型改为 gpt-5.1，judge 用 deepseek-v4-flash**（决策 53），两者都走 TK-Boost `.env` 里
   同一个端点，配置与冒烟测试见 `dataclaw.md` 7.5 节。开发集是 glm-5.2 的轨迹，换模型后错误分布会变，
-  开发期调好的 prompt 不一定适用，跑完 `train_a` 后要先看判错轨迹的类型是否与开发集相近。OpenClaw
-  调 gpt-5.1 时不发送 reasoning 参数，agent 实际不推理。
+  开发期调好的 prompt 不一定适用，跑完 `train_a` 后要先看判错轨迹的类型是否与开发集相近。agent 用
+  medium 推理（`OPENCLAW_THINKING=medium`，见 `dataclaw.md` 7.5 节）：low 下 4 道冒烟题有 3 道很快
+  放弃（其中一次是 `exec` 带了 `host: "sandbox"` 而报错），medium 下同样三道 `train_a` 题答对 2 道、
+  另一道算完给出错误答案。`host: "sandbox"` 这类环境造成的失败在反思阶段应归为非数据错误。
 - **历史轨迹来自同一镜像。** 开发集由 `dataclaw:0.1.0`（OpenClaw 2026.3.24）产出，`chat.jsonl` 格式与
   新 run 一致；其 `score.json` 是当时 judge 的判定，开发期直接沿用。
 - **开发期 store 不是最终 store。** 只用于检查链路与 prompt 是否合理。
+
+### 9.6 自我注入测试：规则能否修好挖出它的那道题
+
+**目的。** 把一条接受的规则注入挖出它的那道题，看 agent 能否因此做对。这是上限式检查：做对只说明
+规则的知识足以修好这次失败，不说明规则对别的题有用。
+
+**题目。** `rev2_gpt51_low` 重跑中有接受规则的 5 题：task_009、task_011、task_218、task_231、
+task_383，每题一条规则。task_352、task_464、task_477 没有规则，不参加。
+
+**注入哪些字段。** 只注入 `WHEN_TO_CHECK`、`ENSURE`、`CONTEXT`。逐条对照题面与 gold 后发现，
+`EXAMPLE_USAGE` 是泄露 gold 的主要位置：task_383 写明「one task's convention (the gold here) is to
+treat all 专用设备制造业 firms with country=="中国" and positive revenue as the universe」，task_218 写明
+「as this task's gold solution does」，task_231 的「in Shanghai 用分省行、泛指行业用全国行」正好对应
+本题两边，等于给出解法。因此 `EXAMPLE_USAGE` 不注入。`INSTANCE`、`FACT`、`TRIGGER`、`DIVERGENCE`、
+`NEEDED` 含本题的值或题面原话，也不注入。
+
+三个字段照 reflector 记录里接受的 divergence 原文填入，不做人工删减或改写；每题的规则文件由
+记录自动生成，runner 只读这些文件。原文里残留的问题照样注入。
+
+**规则来源只取最新一轮。** `build-rules` 只读 `--reflect-dir` 指定的那一个目录下的 `*.json`，不进子
+目录；写之前清空输出目录里旧的 `*.md` 与 `index.json`。本次来源是 `tmp/dataclaw_dev/reflect/rev2_gpt51_low`，
+生成 5 个规则文件（`data/dataclaw_dev/self_inject/rules/<task_id>.md`），`index.json` 记来源目录、
+每题的规则 id 与 BASIS。
+
+**注入方式。** DataClaw 仓库不改，注入由 TK-Boost 的包装脚本完成
+（`scripts/dataclaw_self_inject.py`，逻辑在 `tkstore/dataclaw/self_inject.py`）：
+
+- 包装脚本先设 `OUTPUT_SUBDIR`，再导入 `dataclaw.eval.run_batch`：`OUTPUT_DIR` 在导入时读取，
+  `.env` 里的 `OUTPUT_SUBDIR=output` 不会覆盖已设的值；
+- 对每题复制一份 task，把副本的 `prompt` 换成 `task.prompt + "\n\n" + 规则块`，交给 `run_single_task`，
+  于是只有它进入 `/tmp/agent_prompt.txt`；
+- `run_single_task` 把同一个 `task.prompt` 也传给 `grade_task`，所以运行期间临时替换
+  `run_batch.grade_task`，把 `task_prompt` 换回原始题面。读代码确认：outcome judge 只读
+  `task_prompt` 和 agent 最后一条 assistant 文本（`grading.py` 的 `_final_assistant_text`），process
+  judge 只读 assistant 步骤和工具结果（`process_grading.py` 的 `build_gpr_judge_prompt`）与
+  `gold_file`，两者都不读 transcript 的第一条 user 消息，因此看不到规则。替换不是线程安全的，逐题串行；
+- 每个 run 目录写 `knowledge_receipt.json`：规则文件路径与 SHA-256、规则 id、BASIS、注入文本、注入
+  文本的 SHA-256 与字符数、送达是否通过及原因；
+- suite 里有题找不到规则文件时，开跑前报错退出，不按裸跑处理；
+- 两组靠不同的 `OUTPUT_SUBDIR` 区分：裸跑 `output_rules_self_bare`，注入 `output_rules_self_inject`。
+  run 目录名与裸跑相同（包装脚本改不了目录名）。
+
+运行：
+
+```bash
+cd ~/TK-Boost
+python scripts/dataclaw_self_inject.py build-rules --reflect-dir tmp/dataclaw_dev/reflect/rev2_gpt51_low
+SUITE=$(python -c "import json;print(','.join(json.load(open('data/dataclaw_dev/self_inject/rules/index.json'))['tasks']))")
+
+# 裸跑组（7.5 节的写法）
+(cd ~/DataClaw && OUTPUT_SUBDIR=output_rules_self_bare python dataclaw/eval/run_batch.py --suite "$SUITE")
+# 注入组；模型与 judge 默认取 DataClaw .env 的 DEFAULT_MODEL、JUDGE_MODEL
+python scripts/dataclaw_self_inject.py run --suite "$SUITE"
+# 对照表
+python scripts/dataclaw_self_inject.py report
+```
+
+规则块模板。它排在题面的 Output guidelines 之后，所以末尾重申输出格式以题面为准：
+
+```text
+<原始 task.prompt，原样不动>
+
+[DATABASE NOTES]
+The notes below come from earlier analyses of this same database. They describe
+pitfalls in the data files, not answers to the question above. For each note:
+1. Read "Applies when". If it does not describe the question above, ignore the note.
+2. If it applies, carry out "Check" before computing the quantity it concerns.
+3. "Why" states the data property behind the note; verify it in the data if in doubt.
+4. If the question explicitly requires something different, follow the question.
+
+Note 1
+Applies when: <WHEN_TO_CHECK>
+Check: <ENSURE>
+Why: <CONTEXT>
+[END DATABASE NOTES]
+
+The answer must still follow the output guidelines in the question above.
+```
+
+**评测方案。**
+
+- agent 用 DataClaw `.env` 里的 `DEFAULT_MODEL=gpt-5.1`，judge 用 `JUDGE_MODEL=deepseek-v4-flash`，
+  均保持不变；
+- 两组：裸跑（原始题面）与注入（题面加规则块），每题每组各一次，共 10 个 run，两组用不同的
+  `OUTPUT_SUBDIR`；
+- 规则挖自 glm-5.2 的轨迹，gpt-5.1 未必犯同样的错，所以裸跑组不能省：裸跑已做对的题，注入组的结果
+  不能说明规则有效；
+- 验收：注入组每个 run 跑完立即检查 `chat.jsonl` 的第一条 user 消息是否包含 receipt 里的注入文本
+  （去掉首尾空白后）。不要求整条消息的 hash 相等：OpenClaw 在消息前加时间戳（如
+  `[Fri 2026-07-10 07:36 UTC] `），bash 的 `$(cat ...)` 去掉末尾换行。不通过时 receipt 记
+  `delivery_ok: false` 与原因，`<OUTPUT_DIR>/self_inject_failures.jsonl` 追加一行，`run` 以非零码
+  退出、后面的题不再跑；`report` 再核对一次，不通过的 run 不计分；
+- 报告：每题两组的得分（task_383 按 part 得分），按 BASIS 分开列。gold_only 规则（task_218、task_231、
+  task_383）的 ENSURE 只要求「两种都查、按题意选」，不说选哪个，注入后仍做错不一定说明规则写错；
+- 每组只跑一次，agent 的随机性无法排除，单题结果只作为线索，不作为规则有效与否的结论。
 
 ---
 

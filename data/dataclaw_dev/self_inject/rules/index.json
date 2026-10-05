@@ -1,0 +1,50 @@
+{
+  "source": "/home/qchenax/TK-Boost/tmp/dataclaw_dev/reflect/rev2_gpt51_low",
+  "tasks": {
+    "task_009_comprehensive_decision_hard_hard003": {
+      "file": "task_009_comprehensive_decision_hard_hard003.md",
+      "ids": [
+        "task_009__10f33b__1"
+      ],
+      "basis": [
+        "data"
+      ]
+    },
+    "task_011_comprehensive_decision_hard_hard005": {
+      "file": "task_011_comprehensive_decision_hard_hard005.md",
+      "ids": [
+        "task_011__b794e1__1"
+      ],
+      "basis": [
+        "data"
+      ]
+    },
+    "task_218_enterprise_industry_analysis_medium_medium033": {
+      "file": "task_218_enterprise_industry_analysis_medium_medium033.md",
+      "ids": [
+        "task_218__90a8be__1"
+      ],
+      "basis": [
+        "gold_only"
+      ]
+    },
+    "task_231_enterprise_industry_analysis_medium_medium046": {
+      "file": "task_231_enterprise_industry_analysis_medium_medium046.md",
+      "ids": [
+        "task_231__cb7b97__1"
+      ],
+      "basis": [
+        "gold_only"
+      ]
+    },
+    "task_383_hypothesis_verification_hard_hard011": {
+      "file": "task_383_hypothesis_verification_hard_hard011.md",
+      "ids": [
+        "task_383__376d6e__1"
+      ],
+      "basis": [
+        "gold_only"
+      ]
+    }
+  }
+}
