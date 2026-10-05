@@ -265,8 +265,9 @@ DataClaw 没有 SQL 这一层抽象（任务是对 CSV/JSON 做分析），TK-Bo
 
 1. 在 492 个 task 上先生成并提交固定的 train / test split；不从已有 70 个历史 task
    覆盖中反推划分。因为规则从 train 的 gold 和失败中学习，split 必须先于 populate 固定。
-   可以随机切分，但按 `category × level` 分层：7 个 category、easy / medium / hard 的组合
-   分布不平衡，最小的 `comprehensive_decision × easy` 只有 6 题。
+   按 `category × level` 分层随机切分：7 个 category、easy / medium / hard 的组合
+   分布不平衡，最小的 `comprehensive_decision × easy` 只有 6 题。**已定为 1:1**，train 再对半
+   分成先跑的 `train_a` 和备用的 `train_b`，文件与生成方式见 7.5 节。
 2. 训练轨迹应运行**裸 OpenClaw**。`with_skill` 失败轨迹已经受旧 skill 影响，不能作为
    “基础 agent 犯了什么错”的无偏来源。已有 96 份裸 glm-5.2 run 可以先做 adapter /
    populate 的 smoke test，正式结果仍应在固定 train 集上重跑并记录模型版本。
@@ -583,7 +584,7 @@ OpenClaw 的 system prompt 只列出 skill 的名字、描述和位置，正文�
 ```bash
 cd ~/DataClaw
 
-# A：裸 agent；runner 参数中的 suite 在实际 split 生成后替换。
+# A：裸 agent；TEST_SUITE 的取法见 7.5 节。
 OUTPUT_SUBDIR=output_tkboost_dataclaw_A \
 python dataclaw/eval/run_batch.py \
   --model "$MODEL" --suite "$TEST_SUITE" --runs 1
@@ -638,6 +639,108 @@ process 分；只想补缺失项时改为 `--only-missing-gpr`。
 ls ~/archive/DA_Workflow/output | head
 ls ~/archive/DA_Workflow/output/task_054_comprehensive_decision_medium_medium029/
 ```
+
+### 7.5 train / test split 与 train 轨迹收集
+
+**划分。** 492 道题按 `category × level` 分层，每层一半进 test、一半进 train；train 再用同样的
+方法对半分成 `train_a`（先跑）和 `train_b`（`train_a` 的判错轨迹不够时再跑）。奇数层多出的
+一道轮流分给两边，所以三份大小是整数：
+
+| 文件（`TK-Boost/data/splits/`） | 题数 |
+| --- | --- |
+| `dataclaw_test.txt` | 246 |
+| `dataclaw_train_a.txt` | 123 |
+| `dataclaw_train_b.txt` | 123 |
+
+由 `python scripts/dataclaw_make_split.py`（默认 `--seed 0`，读 `~/DataClaw/tasks/`）生成，
+不要手改；逻辑在 `tkstore/dataclaw/split.py`，测试为 `tests/test_dataclaw_split.py`。每层在
+三份之间相差不超过 1 道，例如最小的 `comprehensive_decision × easy`（6 道）分成 3 / 2 / 1。
+开发集的 27 道题不作特殊处理，落在 test 11 道、`train_a` 9 道、`train_b` 7 道；它们参与过
+prompt 调试，统计 test 结果时可以另报去掉这 11 道后的数字。
+
+**模型。** agent 用 `gpt-5.1`，judge 用 `deepseek-v4-flash`，两者都走 TK-Boost `.env` 里同一个
+`https://api.openlux.ai/v1` 端点和同一个 key。`~/DataClaw/.env` 中的相关项：
+
+```text
+DEFAULT_MODEL=gpt-5.1
+OPENCLAW_CUSTOM_BASE_URL=https://api.openlux.ai/v1
+OPENCLAW_CUSTOM_MODEL_ID=gpt-5.1
+JUDGE_MODEL=deepseek-v4-flash
+JUDGE_CUSTOM_BASE_URL=https://api.openlux.ai/v1
+JUDGE_CUSTOM_API_KEY=${OPENCLAW_CUSTOM_API_KEY}
+JUDGE_CUSTOM_MODEL_ID=deepseek-v4-flash
+```
+
+`JUDGE_CUSTOM_*` 不能省：`grading.py:78` 用 `resolve_qualified_model` 在容器的 `openclaw.json`
+里找 judge 模型，只有设置了 `JUDGE_CUSTOM_*`，`run_batch.py` 才会把它注册进去；否则找不到，
+OpenClaw 退回 agent 的模型。2026-08-25 那次 `task_001` 试跑就是这样失败的：judge 实际由
+`glm-5.2` 回答，5 次都没给出分数（`Judge failed after 5 attempts`）。
+
+**推理级别。** `~/DataClaw/.env` 设 `OPENCLAW_THINKING=medium`（low 的结果见下文冒烟测试）。OpenClaw（pi-ai
+`openai-completions.js:341`）只有在 thinking level 非空、模型条目 `reasoning: true`、
+`compat.supportsReasoningEffort` 为真时才发送 `reasoning_effort`，而 onboard 给自定义模型写的是
+`reasoning: false`，pi 的 `setThinkingLevel` 会把不支持推理的模型压成 `off`。所以这个变量同时控制两处
+（`~/DataClaw` 本地改动，测试在 `tests/dataclaw/test_thinking_level.py`）：
+`_patch_main_model_capabilities` 把 agent 模型标成 `reasoning: true`；`run_batch.build_agent_bash` 给
+`openclaw agent` 加 `--thinking low`。judge 模型由 `register_custom_provider` 注册，仍是
+`reasoning: false`。不设这个变量时行为与上游相同：端点对 `gpt-5.1` 默认不推理（直接调用端点、不带
+参数时 `reasoning_tokens` 为 0）。生效与否看 `chat.jsonl` 里 `thinking_level_change` 事件的
+`thinkingLevel`。
+
+**冒烟测试（2026-10-02）。** `OUTPUT_SUBDIR=output_smoke` 跑 `task_001`：agent 98 秒、16 次请求、
+输出 662 token，`chat.jsonl` 中 16 条回复均为 `gpt-5.1`；outcome judge 与 process judge 的回复
+均为 `deepseek-v4-flash`，第 1 次就给出分数，写出 `score.json` 和 `process_score.json`。这道题
+`gpt-5.1` 答了 “No relevant data found”，判 0 分（gold 为江苏省；同题 2026-08-25 的 `glm-5.2`
+答对）。全程 149 秒。
+
+同日加 `OPENCLAW_THINKING=low` 后再跑（`output_smoke_low2`）：`thinkingLevel` 为 `low`，agent 90 秒、
+4 次请求、输出 846 token，仍答 “No relevant data found”。原因不是推理：`gpt-5.1` 第一次 `exec` 自己
+带了参数 `host: "sandbox"`，容器里没有 sandbox 运行时，OpenClaw 报
+`exec host=sandbox is configured, but sandbox runtime is unavailable`；之后它改用 `read` 猜了 4 个
+不存在的文件名就放弃了。OpenClaw 的逻辑是：agent 不传 `host` 时命令直接在容器里执行，显式传
+`sandbox` 则报错，改 `tools.exec.host` 也只是换一条报错，配置层面无法让它忽略这个参数。开发集 33 个
+`glm-5.2` run 的 962 次工具调用里没有一次传 `host`。另外两次未开推理的 run（`exec` 正常）也都是
+grep 几次后放弃，答 “No relevant data found”。
+
+**low 与 medium 的对比。** 从 `train_a` 取三道题：`task_187`（enterprise_industry_analysis，medium）、
+`task_315`（enterprise_industry_policy_analysis，medium）、`task_471`（risk_assessment，hard）。
+
+| 题目 | low（2026-10-02，`output_smoke_3`） | medium（2026-10-05，`output_smoke_3_medium`） |
+| --- | --- | --- |
+| `task_187` | 0 分；223 秒，26 次请求，输出 4,404 token | 1 分；281 秒，30 次请求，输出 10,508 token |
+| `task_315` | 0 分，7 次请求后答 “No relevant data found” | 1 分；301 秒，24 次请求，输出 14,225 token |
+| `task_471` | 0 分，7 次请求后答「未查询到相关数据」 | 0 分，算完给出错误答案（GPR 0.55）；566 秒，44 次请求，输出 30,882 token |
+
+low 下两道放弃的题都是一次尝试没拿到结果就停：`task_315` 题面的公司名是拼音，agent 猜了中文名 grep
+不到，没有查 `bilingual_translation_english_chinese.json`；`task_471` 一条 awk 没输出就放弃。medium 下
+三道都没有放弃，也没有工具报错，因此定为 medium。代价是每题 280–566 秒，按此估计 `train_a` 串行
+约 10–20 小时（3 道题推算，未实测）。
+
+**运行。** 串行运行（`.env` 的 `DEFAULT_PARALLEL=1`），每一批用自己的 `OUTPUT_SUBDIR`：
+
+```bash
+cd ~/DataClaw
+SPLITS=/home/qchenax/TK-Boost/data/splits
+TRAIN_A=$(grep -v '^#' $SPLITS/dataclaw_train_a.txt | paste -sd,)
+
+OUTPUT_SUBDIR=output_train_a python dataclaw/eval/run_batch.py --suite "$TRAIN_A"
+# 中断后续跑：同一条命令加 --resume
+OUTPUT_SUBDIR=output_train_a python dataclaw/eval/run_batch.py --suite "$TRAIN_A" --resume
+```
+
+`train_b` 与 test 同理，分别用 `output_train_b` 和 7.3 节的输出目录。
+
+**续跑的行为**（读 `run_batch.py:155-195, 933-1085` 得出）：
+
+- 每道题成功后，把已完成的列表原子写入 `<OUTPUT_DIR>/progress_<model-slug>.json`；Ctrl-C 后
+  已完成的题保留，正在跑的那道题丢弃（`finally` 删除容器，输出目录留下但不完整）。
+- `--resume` 要求 `--model`、`--suite` 字符串和 `--runs` 与进度文件完全一致，所以 `--suite`
+  每次都要从同一个 split 文件生成。
+- `--suite` 要写完整的 task id（如 `task_001_comprehensive_decision_easy_easy001`），README 中
+  `task_001,task_002` 的写法会报 `Unknown task IDs`。
+- 出错的题（API 错误、outcome 或 process 打分失败）不记入进度，续跑时整道重跑，并新建一个 run
+  目录，旧目录保留；所以同一道题可能有多个 run 目录，取用时要选有 `score.json` 的那个。
+- 整批没有任何出错时才删除进度文件。
 
 ---
 
