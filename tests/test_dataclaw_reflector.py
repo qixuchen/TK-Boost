@@ -232,6 +232,16 @@ def test_default_budget_is_five_finals_and_three_format_retries():
     assert config.max_turns == config.max_probes + 5 + 3 + 3
 
 
+def test_gold_value_no_probe_printed_uses_a_final_not_a_format_retry(loaded):
+    judge = Judges()
+    outputs = {1: "Y_EC_5 营收金额 1004\nY_EC_5 营业收入金额 2700"}
+    result, llm, _ = _reflect(loaded, [PROBE_TURN, GOOD_FINAL, NO_DIVERGENCE_FINAL], judge=judge, outputs=outputs)
+    feedback = llm.calls[2][-1]["content"]
+    assert "REJECTED" in feedback and "taken from the gold" in feedback
+    assert result.finals == 2 and result.format_retries == 0
+    assert judge.order == []
+
+
 def test_substantive_rejection_is_sent_back_and_uses_a_final(loaded):
     result, llm, _ = _reflect(loaded, [PROBE_TURN, WRONG_VALUE_FINAL, GOOD_FINAL])
     feedback = llm.calls[2][-1]["content"]
@@ -247,10 +257,11 @@ def test_format_rejection_does_not_use_a_final(loaded):
     assert len(result.accepted) == 1 and result.finals == 1 and result.format_retries == 1
 
 
-def test_final_before_any_probe_is_a_format_error(loaded):
+def test_data_final_before_any_probe_copies_gold_and_uses_a_final(loaded):
     result, llm, _ = _reflect(loaded, [GOOD_FINAL, PROBE_TURN, GOOD_FINAL])
-    assert "no probe has been run yet" in llm.calls[1][-1]["content"]
-    assert len(result.accepted) == 1 and result.finals == 1 and result.format_retries == 1
+    feedback = llm.calls[1][-1]["content"]
+    assert "no probe has been run yet" in feedback and "taken from the gold" in feedback
+    assert len(result.accepted) == 1 and result.finals == 2 and result.format_retries == 0
 
 
 def test_mixed_final_uses_a_final_and_skips_the_malformed_divergence(loaded):

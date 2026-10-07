@@ -56,9 +56,10 @@ def _divergence(**overrides):
     return Divergence(**base)
 
 
-def _check(d, probes=PROBES):
+def _check(d, probes=PROBES, agent_calls=0):
     return check_divergence(
-        d, probes=probes, catalog=CATALOG, milestones=MILESTONES, missed=MISSED, task_prompt=TASK_PROMPT
+        d, probes=probes, catalog=CATALOG, milestones=MILESTONES, missed=MISSED, task_prompt=TASK_PROMPT,
+        agent_calls=agent_calls,
     )
 
 
@@ -119,13 +120,50 @@ def test_citing_a_probe_never_run_lists_the_probes_that_were():
     result = _check(_divergence(evidence=[Evidence(9, 1, 1)]))
     assert result.structural
     reason = next(r for r in result.reasons if "P9" in r)
-    assert "never run" in reason and "P1, P2, P3" in reason and "CALL #n" in reason
+    assert "never run" in reason and "P1, P2, P3" in reason and "A<n>" in reason
+    assert "A9 is the agent's command" not in reason
+
+
+def test_citing_an_unrun_probe_numbered_like_an_agent_command_names_that_command():
+    result = _check(_divergence(evidence=[Evidence(27, 1, 8)]), agent_calls=28)
+    assert result.structural
+    reason = next(r for r in result.reasons if "P27" in r)
+    assert "never run" in reason and "A27 is the agent's command" in reason and "replay" in reason
 
 
 def test_citing_before_any_probe_says_none_has_run():
     result = _check(_divergence(), probes={})
-    assert result.structural
     assert any("no probe has been run yet" in r for r in result.reasons), result.reasons
+    assert any("taken from the gold" in r for r in result.reasons), result.reasons
+    assert not result.structural
+
+
+def test_gold_value_cited_from_an_unrun_probe_is_a_substantive_rejection():
+    result = _check(_divergence(reproduced=[Reproduction("Growth rate", 0.1234, 5, 20, 20)]))
+    assert result.status == REJECTED and not result.structural
+    reason = next(r for r in result.reasons if "Growth rate" in r)
+    assert "no probe output you have seen prints this value" in reason and "taken from the gold" in reason
+    assert not any("REPRODUCED cites P5" in r for r in result.reasons), result.reasons
+
+
+def test_gold_value_on_no_line_of_a_probe_that_ran_is_a_substantive_rejection():
+    result = _check(_divergence(reproduced=[Reproduction("Growth rate", 0.1234, 3, 1, 1)]))
+    assert result.status == REJECTED and not result.structural
+    assert any("taken from the gold" in r for r in result.reasons), result.reasons
+
+
+def test_gold_value_only_on_omitted_lines_counts_as_unseen():
+    probes = {**PROBES, 1: ProbeLines(PROBES[1].lines, frozenset({1, 3}))}
+    result = _check(_divergence(evidence=[Evidence(1, 1, 1)]), probes=probes)
+    assert not result.structural
+    assert any("taken from the gold" in r for r in result.reasons), result.reasons
+
+
+def test_gold_string_in_english_on_a_chinese_line_asks_for_the_data_wording():
+    result = _check(_divergence(reproduced=[Reproduction("Top province by revenue", "Beijing", 2, 2, 2)]))
+    assert result.status == REJECTED and result.structural
+    reason = next(r for r in result.reasons if "Beijing" in r)
+    assert "北京市,1.2E+12" in reason and "own wording" in reason and "SEMANTIC_MATCH" in reason
 
 
 def test_line_outside_the_output_is_rejected():
@@ -136,8 +174,9 @@ def test_line_outside_the_output_is_rejected():
 
 def test_line_omitted_from_the_view_cannot_be_cited():
     lines = PROBES[1].lines
-    probes = {**PROBES, 1: ProbeLines(lines, frozenset({1, 3}))}
-    result = _check(_divergence(), probes=probes)
+    probes = {**PROBES, 1: ProbeLines(lines, frozenset({1, 3})), 4: ProbeLines.full("count 1004")}
+    d = _divergence(reproduced=[Reproduction("Number of companies", 1004, 4, 1, 1)])
+    result = _check(d, probes=probes)
     assert result.structural
     assert any("P1:L2" in r and "omitted" in r for r in result.reasons), result.reasons
 
@@ -158,7 +197,8 @@ def test_unknown_milestone_key_lists_the_missed_ones():
 def test_reproduced_value_must_be_on_the_cited_line():
     result = _check(_divergence(reproduced=[Reproduction("Number of companies", 1004, 1, 3, 3)]))
     assert result.status == REJECTED and result.structural
-    assert any("1004 does not appear in P1:L3" in r for r in result.reasons), result.reasons
+    reason = next(r for r in result.reasons if "1004 does not appear in P1:L3" in r)
+    assert "it appears at P1:L2" in reason
 
 
 def test_achieved_milestone_is_a_substantive_rejection():
@@ -198,7 +238,10 @@ def test_value_rounded_to_its_reported_decimals_is_on_the_line():
 def test_value_that_rounds_differently_is_not_on_the_line():
     probes = {**PROBES, 4: ProbeLines.full("normalized 0.455943")}
     d = _divergence(reproduced=[Reproduction("Number of companies", 0.4558, 4, 1, 1)])
-    assert any("0.4558 does not appear in P4:L1" in r for r in _check(d, probes=probes).reasons)
+    result = _check(d, probes=probes)
+    assert result.structural
+    reason = next(r for r in result.reasons if "0.4558 does not appear in P4:L1" in r)
+    assert "no probe output you have seen prints it" in reason
 
 
 def test_rounded_value_within_tolerance_is_accepted():

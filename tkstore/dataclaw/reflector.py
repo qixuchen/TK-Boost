@@ -464,7 +464,8 @@ def _handle_turn(
     outputs = {r.number: session.lines(r) for r in session.records}
     verdicts = [
         check_divergence(
-            d, probes=outputs, catalog=catalog, milestones=milestones, missed=missed, task_prompt=loaded.prompt
+            d, probes=outputs, catalog=catalog, milestones=milestones, missed=missed, task_prompt=loaded.prompt,
+            agent_calls=sum(len(step.calls) for step in loaded.trajectory.steps),
         )
         for d in turn.divergences
     ]

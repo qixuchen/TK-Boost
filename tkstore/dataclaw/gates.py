@@ -1,4 +1,4 @@
-"""Deterministic gates on the reflector's divergences (TK-Boost-adapt.md 5.5–5.7).
+"""Deterministic gates on the reflector's divergences (TK-Boost-adapt.md 5.5–5.8).
 
 Only ``KIND: data`` divergences are gated; ``non_data`` and ``gold_suspect`` are
 logged and produce no rule. The structural check comes first: parse errors,
@@ -6,7 +6,9 @@ missing fields, pointers that do not resolve to lines the reflector was shown,
 unknown files, columns or milestone keys. Resolved pointers get the cited lines
 filled in. A divergence that is structurally sound then goes through the
 substantive check against gold. Only substantive rejections use up a
-``<final>`` submission, so ``GateResult.structural`` tells the two apart.
+``<final>`` submission, so ``GateResult.structural`` tells the two apart. A
+REPRODUCED value that equals gold but that no line the reflector was shown
+prints is a substantive rejection, whatever else is wrong with the block.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from decimal import Decimal
 from typing import Any, Iterator, Mapping
 
 from .catalog import Catalog
-from .milestones import MISMATCH, UNVERIFIABLE, compare, find_milestone
+from .milestones import MATCH, MISMATCH, UNVERIFIABLE, compare, find_milestone
 from .probe import ProbeLines
 from .reflector_io import Divergence, Evidence, Reproduction
 from .scope import validate_refs
@@ -103,7 +105,9 @@ def _span(start: int, end: int) -> str:
     return f"L{start}" if start == end else f"L{start}-L{end}"
 
 
-def _resolve(name: str, pointer: Evidence | Reproduction, probes: Mapping[int, ProbeLines]) -> str | None:
+def _resolve(
+    name: str, pointer: Evidence | Reproduction, probes: Mapping[int, ProbeLines], agent_calls: int = 0
+) -> str | None:
     """Fill ``pointer.excerpt`` with the cited lines; return the reason when they cannot be cited."""
     cited = f"P{pointer.probe}:{_span(pointer.start, pointer.end)}"
     view = probes.get(pointer.probe)
@@ -111,10 +115,16 @@ def _resolve(name: str, pointer: Evidence | Reproduction, probes: Mapping[int, P
         ran = f"probes run so far: {', '.join(f'P{n}' for n in sorted(probes))}" if probes else (
             "no probe has been run yet"
         )
-        return (
+        reason = (
             f"{name} cites P{pointer.probe}, which was never run; {ran}. P<n> numbers your own "
-            "<probe> runs, not the agent's CALL #n; run a probe before citing its output"
+            "<probe> runs, not the agent's commands A<n>; run a probe before citing its output"
         )
+        if max(probes, default=0) < pointer.probe <= agent_calls:
+            reason += (
+                f". A{pointer.probe} is the agent's command; agent output cannot be cited, "
+                "replay it as a probe"
+            )
+        return reason
     if pointer.end > len(view.lines):
         return f"{name} {cited} is outside the output of P{pointer.probe}, which has {len(view.lines)} line(s)"
     if any(n not in view.visible for n in range(pointer.start, pointer.end + 1)):
@@ -126,12 +136,57 @@ def _resolve(name: str, pointer: Evidence | Reproduction, probes: Mapping[int, P
     return None
 
 
-def _resolve_all(name: str, pointers: list, probes: Mapping[int, ProbeLines]) -> list[str]:
-    return [reason for p in pointers if (reason := _resolve(name, p, probes))]
+def _resolve_all(name: str, pointers: list, probes: Mapping[int, ProbeLines], agent_calls: int = 0) -> list[str]:
+    return [reason for p in pointers if (reason := _resolve(name, p, probes, agent_calls))]
+
+
+def _visible_lines(probes: Mapping[int, ProbeLines]) -> Iterator[tuple[str, str]]:
+    for number in sorted(probes):
+        view = probes[number]
+        for line in sorted(view.visible):
+            yield f"P{number}:L{line}", view.lines[line - 1]
+
+
+def _locate(value: Any, probes: Mapping[int, ProbeLines]) -> list[str]:
+    """Visible lines that print the whole value."""
+    return [ref for ref, line in _visible_lines(probes) if not _missing_from_output(value, line)]
+
+
+def _seen(value: Any, probes: Mapping[int, ProbeLines]) -> bool:
+    """Every scalar of the value is printed on some line the reflector was shown."""
+    lines = [line for _, line in _visible_lines(probes)]
+    return all(any(not _missing_from_output(s, line) for line in lines) for s in _scalars(value))
+
+
+def _textual(value: Any) -> bool:
+    scalars = list(_scalars(value))
+    return bool(scalars) and all(isinstance(s, str) for s in scalars)
+
+
+def _where(value: Any, probes: Mapping[int, ProbeLines]) -> str:
+    found = _locate(value, probes)
+    if found:
+        return f"; it appears at {', '.join(found[:3])}"
+    return "; no probe output you have seen prints it"
+
+
+def _unsourced(r: Reproduction, milestones: dict[str, Any], probes: Mapping[int, ProbeLines]) -> str | None:
+    """The reason when a non-text value equals gold but no line the reflector was shown prints it."""
+    found = find_milestone(milestones, r.key)
+    if found is None or _textual(r.value) or _seen(r.value, probes):
+        return None
+    key, expected = found
+    if compare(expected, r.value) != MATCH:
+        return None
+    return (
+        f'REPRODUCED "{key}" = {r.value!r}: no probe output you have seen prints this value, yet it '
+        "equals the gold milestone, so it was taken from the gold rather than computed. Compute it "
+        "with a probe first and claim it only if the probe prints it"
+    )
 
 
 def _reproduction_form(r: Reproduction, probes: Mapping[int, ProbeLines], milestones: dict[str, Any],
-                       missed: set[str]) -> list[str]:
+                       missed: set[str], agent_calls: int = 0) -> list[str]:
     found = find_milestone(milestones, r.key)
     if found is None:
         return [
@@ -139,17 +194,19 @@ def _reproduction_form(r: Reproduction, probes: Mapping[int, ProbeLines], milest
             f"use one of the missed milestones: {', '.join(sorted(missed))}"
         ]
     key, _ = found
-    reason = _resolve("REPRODUCED", r, probes)
+    reason = _resolve("REPRODUCED", r, probes, agent_calls)
     if reason:
-        return [reason]
-    reasons = []
+        return [reason + _where(r.value, probes)]
     missing = _missing_from_output(r.value, r.excerpt)
-    if missing:
-        reasons.append(
-            f'REPRODUCED "{key}": {", ".join(missing)} does not appear in '
-            f"P{r.probe}:{_span(r.start, r.end)}; point at the line that prints the value"
-        )
-    return reasons
+    if not missing:
+        return []
+    reason = f'REPRODUCED "{key}": {", ".join(missing)} does not appear in P{r.probe}:{_span(r.start, r.end)}'
+    if _textual(r.value):
+        return [
+            f"{reason}; that line prints {r.excerpt!r}. Write the value in the data's own wording as "
+            "printed there, and add SEMANTIC_MATCH when it differs from gold"
+        ]
+    return [f"{reason}; point at the line that prints the value{_where(r.value, probes)}"]
 
 
 def _reproduction_substance(r: Reproduction, milestones: dict[str, Any], missed: set[str]) -> list[str]:
@@ -175,8 +232,13 @@ def check_structure(
     milestones: dict[str, Any],
     missed: set[str],
     task_prompt: str,
+    agent_calls: int = 0,
 ) -> list[str]:
-    """Reasons a data divergence is malformed; resolved pointers get their lines filled in."""
+    """Reasons a data divergence is malformed; resolved pointers get their lines filled in.
+
+    A claim whose value was taken from the gold is left to ``check_divergence``, which
+    rejects it on substance.
+    """
     reasons = list(d.errors)
     if not d.fact.strip():
         reasons.append("FACT is missing")
@@ -184,17 +246,18 @@ def check_structure(
         reasons.append("EVIDENCE is missing; cite a probe whose output shows the fact")
     if not d.reproduced:
         reasons.append("REPRODUCED is missing; reproduce at least one missed milestone")
-    reasons.extend(_resolve_all("EVIDENCE", d.evidence, probes))
+    reasons.extend(_resolve_all("EVIDENCE", d.evidence, probes, agent_calls))
     reasons.extend(validate_refs(d.tables, d.columns, catalog))
     for r in d.reproduced:
-        reasons.extend(_reproduction_form(r, probes, milestones, missed))
+        if _unsourced(r, milestones, probes) is None:
+            reasons.extend(_reproduction_form(r, probes, milestones, missed, agent_calls))
     reasons.extend(_check_rule_fields(d))
     reasons.extend(_check_basis(d, task_prompt))
     if not d.generality:
         reasons.append(
             "GENERALITY is missing; cite a probe showing the fact holds beyond the entities of this task"
         )
-    reasons.extend(_resolve_all("GENERALITY", d.generality, probes))
+    reasons.extend(_resolve_all("GENERALITY", d.generality, probes, agent_calls))
     return reasons
 
 
@@ -211,14 +274,17 @@ def check_divergence(
     milestones: dict[str, Any],
     missed: set[str],
     task_prompt: str,
+    agent_calls: int = 0,
 ) -> GateResult:
     if d.kind in ("non_data", "gold_suspect"):
         return GateResult(d, LOGGED, list(d.errors))
+    unsourced = [reason for r in d.reproduced if (reason := _unsourced(r, milestones, probes))]
     reasons = check_structure(
-        d, probes=probes, catalog=catalog, milestones=milestones, missed=missed, task_prompt=task_prompt
+        d, probes=probes, catalog=catalog, milestones=milestones, missed=missed, task_prompt=task_prompt,
+        agent_calls=agent_calls,
     )
-    if reasons:
-        return GateResult(d, REJECTED, reasons, structural=True)
+    if reasons or unsourced:
+        return GateResult(d, REJECTED, reasons + unsourced, structural=not unsourced)
     reasons = check_substance(d, milestones=milestones, missed=missed)
     return GateResult(d, REJECTED if reasons else ACCEPTED, reasons)
 
