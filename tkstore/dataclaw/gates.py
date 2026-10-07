@@ -31,6 +31,7 @@ LOGGED = "logged"
 BASES = ("data", "task", "gold_only")
 
 _NUMBER = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?(?:[eE][+-]?\d+)?")
+_LEADING_ZERO = re.compile(r"-?0\d")
 
 
 @dataclass
@@ -52,12 +53,17 @@ def _squash(text: str) -> str:
 
 
 def _numbers_in(text: str) -> list[float]:
+    """Each number in ``text``; ``364,263`` may be one number or two CSV columns, so it yields all three readings."""
     numbers = []
     for token in _NUMBER.findall(text):
-        try:
-            numbers.append(float(token.replace(",", "")))
-        except ValueError:
-            continue
+        readings = [token.replace(",", "")]
+        if "," in token:
+            readings += [part for part in token.split(",") if not _LEADING_ZERO.match(part)]
+        for reading in readings:
+            try:
+                numbers.append(float(reading))
+            except ValueError:
+                continue
     return numbers
 
 

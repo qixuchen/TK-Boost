@@ -221,6 +221,39 @@ def test_numbers_are_found_regardless_of_formatting():
     assert result.status == ACCEPTED, result.reasons
 
 
+CSV_MILESTONES = {"All firms": 364, "Private firms": 263, "State firms": 86, "Units": 4}
+CSV_PROBES = {
+    **PROBES,
+    4: ProbeLines.full("total_effective,private_effective,state_owned_effective\n364,263,86"),
+    5: ProbeLines.full("rows\n1,004"),
+}
+
+
+def _check_csv(reproduction):
+    return check_divergence(
+        _divergence(reproduced=[reproduction]), probes=CSV_PROBES, catalog=CATALOG,
+        milestones={**MILESTONES, **CSV_MILESTONES}, missed=MISSED | set(CSV_MILESTONES), task_prompt=TASK_PROMPT,
+    )
+
+
+@pytest.mark.parametrize("key", ["All firms", "Private firms", "State firms"])
+def test_each_column_of_a_csv_row_is_a_number_on_the_line(key):
+    result = _check_csv(Reproduction(key, CSV_MILESTONES[key], 4, 2, 2))
+    assert result.status == ACCEPTED, result.reasons
+
+
+def test_csv_value_on_another_line_is_located_rather_than_taken_from_the_gold():
+    result = _check_csv(Reproduction("Private firms", 263, 4, 1, 1))
+    assert result.status == REJECTED and result.structural
+    assert not any("taken from the gold" in r for r in result.reasons), result.reasons
+    assert any("it appears at P4:L2" in r for r in result.reasons), result.reasons
+
+
+def test_digits_after_a_thousands_comma_are_not_a_number_of_their_own():
+    result = _check_csv(Reproduction("Units", 4, 5, 2, 2))
+    assert any("taken from the gold" in r for r in result.reasons), result.reasons
+
+
 def test_value_off_by_more_than_one_percent_is_rejected():
     probes = {**PROBES, 4: ProbeLines.full("count 1020")}
     d = _divergence(reproduced=[Reproduction("Number of companies", 1020, 4, 1, 1)])
