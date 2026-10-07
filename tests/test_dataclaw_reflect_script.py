@@ -27,9 +27,9 @@ def _llms(script, *argv):
     return calls
 
 
-def test_reasoning_effort_defaults_to_low(script):
+def test_reasoning_effort_defaults_to_medium(script):
     calls = _llms(script, "--model", "m")
-    assert calls[0][1]["reasoning_effort"] == "low"
+    assert calls[0][1]["reasoning_effort"] == "medium"
 
 
 def test_reasoning_effort_can_be_left_to_the_gateway(script):

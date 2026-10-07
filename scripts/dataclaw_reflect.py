@@ -50,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--probe-timeout", type=int, default=60)
     parser.add_argument("--max-probe-chars", type=int, default=4000)
     parser.add_argument("--max-tokens", type=int, help="output token cap per LLM call (reasoning included)")
-    parser.add_argument("--reasoning-effort", choices=("none", "low", "medium", "high", "omit"), default="low",
+    parser.add_argument("--reasoning-effort", choices=("none", "low", "medium", "high", "omit"), default="medium",
                         help="sent as extra_body.reasoning_effort (omit: not sent); honoured by gpt-5.1, "
                              "ignored by glm-5.2 on the current gateway")
     parser.add_argument("--disable-thinking", action="store_true",

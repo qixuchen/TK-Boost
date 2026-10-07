@@ -1205,7 +1205,7 @@ The answer must still follow the output guidelines in the question above.
 | 48 | 通用性判断的范围 | 只判两点：规则是否只对个别实体成立；`gold_only` 的规则是否把 gold 的选择写成固定动作。不检查例子（输入与第 1、2 条已由决策 62 修订） |
 | 49 | 判断回复无法解析 | 为空或没有 `VERDICT` 行时重试一次；仍失败记为 `judge_error`，不接受、不打回，写进 `judge_errors` |
 | 50 | `NEEDED` 与 `INSTANCE` | `KIND: data` 时两者都是必填项，缺失即打回 |
-| 51 | 反思与判断的模型 | 用 `.env` 配置的 GPT-5.1；`scripts/dataclaw_reflect.py` 默认 `--reasoning-effort low`（`omit` 为不发送），`--judge-model` 另指定判断模型时沿用同样的推理设置 |
+| 51 | 反思与判断的模型 | 用 `.env` 配置的 GPT-5.1；`scripts/dataclaw_reflect.py` 默认 `--reasoning-effort medium`（`omit` 为不发送），`--judge-model` 另指定判断模型时沿用同样的推理设置 |
 | 52 | train / test split | 按 `category × level` 分层 1:1（seed 0）：test 246 道；train 再分层对半成 `train_a`、`train_b` 各 123 道，先跑 `train_a`，不够再跑 `train_b`；文件在 `data/splits/dataclaw_*.txt` |
 | 53 | 正式运行的模型 | agent 用 gpt-5.1，judge 用 deepseek-v4-flash，同一端点；取代 9.5 节原先的「agent 保持 glm-5.2」 |
 | 54 | 引用方式 | probe 输出带行号；`EVIDENCE`、`GENERALITY` 写 `P<n>:L<a>[-L<b>]`，`REPRODUCED` 写 `FROM P<n>:L<a>`，harness 回填原文；`REPRODUCED` 的值须在所指行里（取代决策 15 的「子串」与决策 31 的 `FROM probe#<m>`；见 5.7 节） |
