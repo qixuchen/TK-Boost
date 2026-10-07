@@ -257,11 +257,26 @@ def test_format_rejection_does_not_use_a_final(loaded):
     assert len(result.accepted) == 1 and result.finals == 1 and result.format_retries == 1
 
 
-def test_data_final_before_any_probe_copies_gold_and_uses_a_final(loaded):
-    result, llm, _ = _reflect(loaded, [GOOD_FINAL, PROBE_TURN, GOOD_FINAL])
+NON_DATA_FINAL = "<final>\nDIVERGENCE: subtracted the wrong way\nNEEDED: flip it\nKIND: non_data\n</final>"
+GOLD_SUSPECT_FINAL = NON_DATA_FINAL.replace("KIND: non_data", "KIND: gold_suspect")
+
+
+@pytest.mark.parametrize("first", [GOOD_FINAL, NON_DATA_FINAL, GOLD_SUSPECT_FINAL, NO_DIVERGENCE_FINAL])
+def test_any_final_before_any_probe_is_a_format_error(loaded, first):
+    judge = Judges()
+    result, llm, _ = _reflect(loaded, [first, PROBE_TURN, GOOD_FINAL], judge=judge)
     feedback = llm.calls[1][-1]["content"]
-    assert "no probe has been run yet" in feedback and "taken from the gold" in feedback
-    assert len(result.accepted) == 1 and result.finals == 2 and result.format_retries == 0
+    assert "FORMAT ERROR" in feedback and "you have run none" in feedback and "Send a <probe> first" in feedback
+    assert judge.order == ["reproduction", "generality", "generality"]
+    assert result.logged == [] and len(result.accepted) == 1
+    assert result.finals == 1 and result.format_retries == 1
+
+
+def test_finals_without_probes_end_at_the_format_budget(loaded):
+    judge = Judges()
+    result, _, _ = _reflect(loaded, [NON_DATA_FINAL] * 3, judge=judge)
+    assert result.stop_reason == "format_budget" and result.format_retries == 3
+    assert result.finals == 0 and result.logged == [] and judge.order == []
 
 
 def test_mixed_final_uses_a_final_and_skips_the_malformed_divergence(loaded):
@@ -327,8 +342,7 @@ def test_turn_cap_stops_a_stuck_reflector(loaded):
 
 
 def test_non_data_divergence_is_logged(loaded):
-    final = "<final>\nDIVERGENCE: subtracted the wrong way\nNEEDED: flip it\nKIND: non_data\n</final>"
-    result, _, _ = _reflect(loaded, [final])
+    result, _, _ = _reflect(loaded, [PROBE_TURN, NON_DATA_FINAL])
     assert result.accepted == [] and len(result.logged) == 1
     assert result.stop_reason == "done"
 

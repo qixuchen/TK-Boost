@@ -49,6 +49,10 @@ EMPTY_REPLY_NUDGE = (
     "reply now with one short PLAN and one <probe>, or with your <final>."
 )
 TIME_BUDGET_NOTE = "TIME BUDGET: this reflection has used up its time budget; send your <final> now."
+NO_PROBE_FINAL = (
+    "FORMAT ERROR: every conclusion, including NO_DATA_DIVERGENCE, non_data and gold_suspect, must rest "
+    "on probes you ran; you have run none. Send a <probe> first."
+)
 
 
 @dataclass
@@ -460,6 +464,13 @@ def _handle_turn(
         record = session.run(turn.command)
         result.probes_used += 1
         return session.llm_view(record)
+
+    if result.probes_used == 0:
+        result.format_retries += 1
+        if result.format_retries >= config.max_format_retries:
+            result.stop_reason = "format_budget"
+            return None
+        return NO_PROBE_FINAL
 
     outputs = {r.number: session.lines(r) for r in session.records}
     verdicts = [
