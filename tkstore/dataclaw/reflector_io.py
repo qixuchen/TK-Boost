@@ -34,9 +34,11 @@ _ONE_POINTER = re.compile(rf"^{_POINTER}$")
 _REPRODUCED = re.compile(rf'^milestone\s+"(.*)"\s*=\s*(.*?)\s+FROM\s+{_POINTER}\s*$', re.DOTALL)
 _OLD_REPRODUCED = re.compile(r'^milestone\s+".*"\s*=.*\sFROM\s+probe#', re.DOTALL)
 _OLD_POINTER_HINT = (
-    "; P<n> numbers your own probes (PROBE_RESULT P<n>), not the agent's CALL #n, "
+    "; P<n> numbers your own probes (PROBE_RESULT P<n>), not the agent's commands A<n>, "
     "and the harness copies the cited lines itself"
 )
+_AGENT_POINTER = re.compile(r"^A(\d+)\b")
+_REPRODUCED_FROM_AGENT = re.compile(r'^milestone\s+".*"\s*=.*\sFROM\s+(A\d+)\b', re.DOTALL)
 _PROBE = re.compile(r"<probe>(.*?)</probe>", re.DOTALL)
 _FINAL = re.compile(r"<final>(.*?)(?:</final>|$)", re.DOTALL)
 
@@ -132,11 +134,22 @@ def _span(key: str, match: re.Match, offset: int, errors: list[str]) -> tuple[in
     return int(probe), first, last
 
 
+def _agent_pointer_error(key: str, label: str) -> str:
+    return (
+        f"{key} cites {label}, the agent's command; agent output cannot be cited. "
+        "Replay the command as a <probe> and cite the P<n> it gets."
+    )
+
+
 def _pointer_list(key: str, value: str, errors: list[str]) -> list[Evidence]:
     """Pointers separated by commas or semicolons; a malformed one is reported, the others kept."""
     pointers = []
     for part in (p.strip() for p in re.split(r"[,;]", value)):
         match = _ONE_POINTER.match(part)
+        agent = _AGENT_POINTER.match(part)
+        if agent:
+            errors.append(_agent_pointer_error(key, f"A{agent.group(1)}"))
+            continue
         if not match:
             hint = _OLD_POINTER_HINT if part.startswith("probe#") else ""
             errors.append(f"{key} must be written as P<n>:L<a> or P<n>:L<a>-L<b>, got {part!r}{hint}")
@@ -166,6 +179,10 @@ def _parse_block(index: int, block: str) -> Divergence:
                 d.errors.append(str(exc))
         elif key == "REPRODUCED":
             match = _REPRODUCED.match(value)
+            agent = _REPRODUCED_FROM_AGENT.match(value)
+            if agent:
+                d.errors.append(_agent_pointer_error("REPRODUCED", agent.group(1)))
+                continue
             if not match:
                 hint = _OLD_POINTER_HINT if _OLD_REPRODUCED.match(value) else ""
                 d.errors.append(

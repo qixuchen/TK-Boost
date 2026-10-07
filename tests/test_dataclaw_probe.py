@@ -42,9 +42,18 @@ def test_llm_view_numbers_every_line():
     with ProbeSession(executor, timeout=60, max_llm_chars=4000) as session:
         record = session.run("cat small")
         lines = session.lines(record)
-    assert session.llm_view(record) == "PROBE_RESULT P1 (exit 0):\nL1| a,b\nL2| 1,2"
+    assert session.llm_view(record) == "PROBE_RESULT P1 (exit 0; probes you have run: P1):\nL1| a,b\nL2| 1,2"
     assert lines.lines == ("a,b", "1,2")
     assert lines.visible == frozenset({1, 2})
+
+
+def test_llm_view_header_lists_the_probes_run_so_far():
+    executor = FakeExecutor([ExecResult("x", 0, False), ExecResult("y", 1, False), ExecResult("z", 0, False)])
+    with ProbeSession(executor, timeout=60, max_llm_chars=4000) as session:
+        session.run("a")
+        session.run("b")
+        third = session.run("c")
+    assert session.llm_view(third).splitlines()[0] == "PROBE_RESULT P3 (exit 0; probes you have run: P1-P3):"
 
 
 def test_long_output_keeps_whole_head_and_tail_lines_but_record_does_not():

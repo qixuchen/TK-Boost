@@ -123,7 +123,11 @@ def compress(
     max_thinking_chars: int = 5000,
     keep_thinking: bool = True,
 ) -> str:
-    """Render the trajectory as numbered steps; CALL numbers are global so they can be cited."""
+    """Render the trajectory as numbered steps; agent commands are A1, A2, ... across all steps.
+
+    The A prefix keeps them apart from the reflector's own probes P1, P2, ..., which
+    are the only outputs a divergence may cite.
+    """
     lines: list[str] = []
     call_number = 0
     for step in trajectory.steps:
@@ -134,11 +138,11 @@ def compress(
             lines.append(f"TEXT: {step.text}")
         for call in step.calls:
             call_number += 1
-            lines.append(f"CALL #{call_number} {call.name}: {call.command}")
+            lines.append(f"AGENT CMD A{call_number} {call.name}: {call.command}")
             if call.result is None:
-                lines.append(f"OUTPUT #{call_number}: (no result)")
+                lines.append(f"AGENT OUTPUT A{call_number}: (no result)")
             else:
-                lines.append(f"OUTPUT #{call_number}:\n{truncate_middle(call.result, max_output_chars)}")
+                lines.append(f"AGENT OUTPUT A{call_number}:\n{truncate_middle(call.result, max_output_chars)}")
         lines.append("")
     lines.append(f"FINAL ANSWER: {trajectory.final_answer}")
     return "\n".join(lines) + "\n"

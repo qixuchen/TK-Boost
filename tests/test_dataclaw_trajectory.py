@@ -105,9 +105,11 @@ def test_truncate_middle_keeps_head_and_tail():
 
 def test_compress_numbers_calls_globally_and_truncates_outputs(chat_path):
     text = compress(parse_chat(chat_path), max_output_chars=4, max_thinking_chars=500)
-    assert "CALL #1 exec: head -3 a.csv" in text
-    assert "CALL #2 exec: grep 半导体 b.csv" in text
-    assert "CALL #3 exec: wc -l c.csv" in text
+    assert "AGENT CMD A1 exec: head -3 a.csv" in text
+    assert "AGENT CMD A2 exec: grep 半导体 b.csv" in text
+    assert "AGENT CMD A3 exec: wc -l c.csv" in text
+    assert "AGENT OUTPUT A1:" in text and "AGENT OUTPUT A3: (no result)" in text
+    assert "CALL #" not in text and "OUTPUT #" not in text
     assert "(no result)" in text
     assert "A-OUTPUT" not in text and "chars omitted" in text
     assert "THINKING: Look at the files first." in text

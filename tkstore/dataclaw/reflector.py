@@ -188,7 +188,7 @@ def _user_message(loaded: LoadedRun, catalog: Catalog, config: ReflectorConfig) 
     )
     return "\n\n".join([
         f"## Task given to the agent\n{loaded.prompt}",
-        f"## Agent trajectory (compressed; CALL #n numbers the agent's commands)\n{trajectory}",
+        f"## Agent trajectory (compressed; A<n> numbers the agent's commands, which you cannot cite)\n{trajectory}",
         f"## Outcome judge\n{loaded.score.get('notes', '')}",
         "## Process judge\n"
         f"break_point: {process.get('break_point')}\n"

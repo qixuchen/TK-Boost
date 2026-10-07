@@ -1,4 +1,4 @@
-- DIVERGENCE: what the analysed agent did, and at which of its commands. CALL #n
+- DIVERGENCE: what the analysed agent did, and at which of its commands. A<n>
   numbers the agent's commands in its trajectory; it is unrelated to the
   reflector's probes P1, P2, ...
 - NEEDED: what this task needed instead, in terms of files, columns and

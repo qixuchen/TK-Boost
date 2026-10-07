@@ -14,7 +14,7 @@ OPS = "enterprise/company_operation_status.csv"
 CATALOG = Catalog(headers={OPS: ["bmCode", "secondTargetNum", "targetName", "value"]})
 
 GOOD_FINAL = f"""<final>
-DIVERGENCE: CALL #1 kept only one targetName spelling
+DIVERGENCE: A1 kept only one targetName spelling
 NEEDED: filter by secondTargetNum
 MISSING_DATA_UNDERSTANDING:
   TABLES:
@@ -163,7 +163,7 @@ def test_system_prompt_asks_for_every_field_the_gates_require(loaded):
 def test_system_prompt_describes_line_pointers_not_copied_excerpts(loaded):
     system = build_messages(loaded, CATALOG, ReflectorConfig())[0]["content"]
     assert "EVIDENCE: P<n>:L<a>" in system and "FROM P<n>:L<a>" in system
-    assert "PROBE_RESULT P<n>" in system and "CALL #n" in system
+    assert "PROBE_RESULT P<n>" in system and "A<n>" in system and "CALL #" not in system
     assert "probe#" not in system and "SCOPE:" not in system
     assert "format retries" in system
 
@@ -200,7 +200,7 @@ def test_messages_carry_every_input(loaded):
     user = messages[1]["content"]
     for fragment in [
         "Which province has the highest revenue?",
-        "CALL #1 exec: grep 营收金额 x.csv",
+        "AGENT CMD A1 exec: grep 营收金额 x.csv",
         "FINAL ANSWER: Guangdong",
         "Agent answered Guangdong, gold is Beijing.",
         "breaks at M1",
@@ -217,7 +217,7 @@ def test_messages_carry_every_input(loaded):
 def test_probe_then_accepted_final(loaded):
     result, llm, executor = _reflect(loaded, [PROBE_TURN, GOOD_FINAL])
     assert executor.commands == ["cut -d, -f3,4 ./database/x.csv | sort | uniq -c"]
-    assert "PROBE_RESULT P1 (exit 0):\nL1| Y_EC_5 营收金额 1004" in llm.calls[1][-1]["content"]
+    assert "PROBE_RESULT P1 (exit 0; probes you have run: P1):\nL1| Y_EC_5 营收金额 1004" in llm.calls[1][-1]["content"]
     (accepted,) = result.accepted
     assert accepted.divergence.fact == "one secondTargetNum has several targetName spellings"
     assert accepted.divergence.evidence[0].excerpt == "Y_EC_5 营收金额 1004"
@@ -547,7 +547,7 @@ def test_reproduction_judge_sees_the_claim_the_code_and_the_gold(loaded):
         '"Number of companies": 2778',
         "Number of companies (expected 2778): MISSED - used 1004",
         'REPRODUCED 1: milestone "Number of companies" (gold 2778) = 2778 FROM P1:L2 → Y_EC_5 营业收入金额 2778',
-        "DIVERGENCE: CALL #1 kept only one targetName spelling",
+        "DIVERGENCE: A1 kept only one targetName spelling",
         "NEEDED: filter by secondTargetNum",
         "INSTANCE: the agent kept only the spelling",
         "P1: cut -d, -f3,4 ./database/x.csv | sort | uniq -c",

@@ -28,15 +28,16 @@ Each turn, send exactly one of:
 (b) your conclusions: a <final> ... </final> block (see "Output").
 
 The harness runs the probe from /tmp_workspace (so paths are ./database/<file>)
-and replies with PROBE_RESULT P<n>, every output line prefixed with its number:
+and replies with PROBE_RESULT P<n>, every output line prefixed with its number;
+the header also lists the probes you have run so far:
 
-    PROBE_RESULT P2 (exit 0):
+    PROBE_RESULT P2 (exit 0; probes you have run: P1-P2):
     L1| industry,rows
     L2| 制造业,812
 
 Your probes are numbered P1, P2, ... in the order you run them. This is not the
-agent's numbering: CALL #n and OUTPUT #n in the trajectory are the agent's
-commands, and you cannot cite them; replay a command as a probe to cite what it
+agent's numbering: AGENT CMD A<n> and AGENT OUTPUT A<n> in the trajectory are
+the agent's commands, and you cannot cite them; replay a command as a probe to cite what it
 prints. Long outputs keep their first and last lines and replace the middle with
 [L<a>-L<b> omitted], so print aggregates rather than raw rows. Budget: at most
 $max_probes probes and $max_finals <final> submissions that are rejected on
@@ -44,7 +45,7 @@ substance; a <final> rejected only for format errors (an unparseable line, a
 missing field, a pointer to a line that does not exist) does not count against
 them, but you have at most $max_format_retries such format retries.
 
-- You may replay any agent command (CALL #<n> in the trajectory) verbatim to see
+- You may replay any agent command (A<n> in the trajectory) verbatim to see
   exactly what it produced and why it went wrong.
 - Prefer aggregate probes: group-by counts, distinct values per key, row counts
   before and after a filter, comparing a summary table with a value recomputed
@@ -102,7 +103,7 @@ contradicts what the data shows. Do not use such a gold milestone as proof.
 ## Output
 
 <final>
-DIVERGENCE: <at which step (CALL #n) the agent did what>
+DIVERGENCE: <at which agent command (A<n>) the agent did what>
 NEEDED: <what this task needed instead>
 BASIS: data | task | gold_only
 BASIS_QUOTE: <words copied from the task; only when BASIS is task>
@@ -128,7 +129,7 @@ DIVERGENCE: <next one> ...
 
 What each field says:
 
-- DIVERGENCE describes only what the agent did, at which CALL. Do not put the
+- DIVERGENCE describes only what the agent did, at which A<n>. Do not put the
   correct values here.
 - NEEDED says what this task needed instead, in terms of files, columns and
   operations. Say it for this task only; whether it applies to other tasks is

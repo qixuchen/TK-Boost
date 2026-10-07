@@ -210,7 +210,24 @@ def test_malformed_lines_become_block_errors(line, fragment):
 def test_old_pointer_style_is_explained():
     (d,) = parse_turn("<final>DIVERGENCE: d\nNEEDED: n\nEVIDENCE: probe#2 → x\nKIND: data\n</final>").divergences
     (error,) = d.errors
-    assert "CALL #n" in error
+    assert "A<n>" in error and "CALL #" not in error
+
+
+@pytest.mark.parametrize(
+    "line, key",
+    [
+        ("EVIDENCE: A27:L1", "EVIDENCE"),
+        ("GENERALITY: P1:L2, A21:L1-L9", "GENERALITY"),
+        ('REPRODUCED: milestone "k" = 3 FROM A27:L8', "REPRODUCED"),
+    ],
+)
+def test_agent_command_pointer_is_rejected_with_its_own_error(line, key):
+    (d,) = parse_turn(f"<final>DIVERGENCE: d\nNEEDED: n\n{line}\nKIND: data\n</final>").divergences
+    errors = [e for e in d.errors if "A2" in e]
+    assert len(errors) == 1, d.errors
+    assert errors[0].startswith(f"{key} cites A2") and "agent's command" in errors[0]
+    assert "replay" in errors[0].lower() and "<probe>" in errors[0]
+    assert d.reproduced == [] and all(p.probe != 27 for p in d.evidence)
 
 
 def test_block_without_kind_is_an_error():

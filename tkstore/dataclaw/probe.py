@@ -181,4 +181,5 @@ class ProbeSession:
     def llm_view(self, record: ProbeRecord) -> str:
         status = f"timed out after {self.timeout}s" if record.timed_out else f"exit {record.exit_code}"
         body = numbered_view(record.output, self.max_llm_chars)[0] if record.output else "(no output)"
-        return f"PROBE_RESULT P{record.number} ({status}):\n{body}"
+        run = "P1" if record.number == 1 else f"P1-P{record.number}"
+        return f"PROBE_RESULT P{record.number} ({status}; probes you have run: {run}):\n{body}"
