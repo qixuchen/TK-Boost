@@ -460,6 +460,55 @@ harness 查不了 `GENERALITY` 的 probe 是否真的证明了通用性、`gold_
 每项单独走一次 TDD 循环。改完后在这 6 条与 `task_011`、`task_231` 上重跑，统计以 `final_budget` 和
 `abandoned_after_reject` 结束的比例，人工检查规则是否过于针对具体取值。
 
+### 5.8 修订三：引用来源与先探查（train_a 抽样 20 个样本试跑之后）
+
+**试跑与发现。** 在 train_a 抽样的 20 个样本上跑反思（GPT-5.1，`reasoning_effort: low`），10 个样本没有
+产出规则。逐条阅读其中被打回的 `<final>` 与 probe 记录，发现反思 agent 多次引用自己没跑过的 probe：
+
+- **把 agent 的命令编号当成 probe 编号（`task_464`）。** 只跑了 2 次 probe，却引用 `P21`、`P25`、`P27`，
+  这些编号对应被分析 agent 轨迹里的第 21、25、27 条命令。轨迹当时用 `CALL #n`、`OUTPUT #n` 编号，
+  probe 用 `P<n>`，两者都是从 1 开始的整数，容易混用。
+- **预先引用下一次 probe，并填入 gold 值（`task_453`、`task_346`）。** `<final>` 里引用的 probe 编号
+  比已运行的最大编号大，`REPRODUCED` 的值与 gold milestone 相同，但没有任何 probe 输出打印过它。
+  `task_346` 还把 gold 的英文写法当作取值，而 probe 输出里是中文。
+- **一次 probe 都没跑就提交 `<final>`（`task_377`、`task_464`）。** §5.7 第 4 条只把零探查时提交 `data`
+  divergence 当作结构错误，`non_data`、`gold_suspect` 与 `NO_DATA_DIVERGENCE` 不受限制。
+
+原 harness 对这些情况只回复「probe never run」或「point at the line that prints the value」，全部算作格式
+重试，不扣 `<final>`；抄写 gold 值因此没有代价，退回消息也没有指出该引用哪一行。
+
+**改动。**
+
+1. **agent 命令改用 `A<n>` 编号。** 压缩轨迹写成 `AGENT CMD A<n> <name>: <cmd>` 与 `AGENT OUTPUT A<n>:`，
+   轨迹小标题注明 `A<n>` 不能引用。解析层遇到 `A27:L8` 这类指针时报专门的错误，要求把命令作为 probe
+   重跑后引用新的 `P<n>`。`PROBE_RESULT` 表头列出已运行的 probe，例如
+   `PROBE_RESULT P3 (exit 0; probes you have run: P1-P3):`。
+2. **harness 按错误根源反馈。** `REPRODUCED` 的值不在所引用的行里时，harness 在全部已运行 probe 的可见行里
+   查找这个值：
+   - 找到时，退回消息给出所在位置（如 `it appears at P2:L7`），仍算结构错误；
+   - 找不到、值不是字符串、且与 gold 相等时，判为「值取自 gold」，算实质错误，扣一次 `<final>`；
+   - 值是字符串时，仍算结构错误，消息附上所引用行的原文，提示按数据原文书写并加 `SEMANTIC_MATCH`；
+   - 其余情况为结构错误，消息说明没有任何已看到的 probe 输出打印过这个值。
+
+   引用的 `P<n>` 超出已运行范围、但不超过 agent 命令总数时，退回消息补一句 `A<n>` 是 agent 的命令、
+   不能引用。
+3. **任何 `<final>` 提交前都必须先探查。** 零探查时提交的 `<final>`，不论包含 `data`、`non_data`、
+   `gold_suspect` 还是只有 `NO_DATA_DIVERGENCE`，都不进入评审，按格式错误退回并计入格式重试；达到格式
+   重试上限时以 `format_budget` 结束。
+4. **prompt 补硬性规则。** `reflector.md` 在 How to work 里写明先探查的要求；在 Output 前新增 Hard rules：
+   只引用已收到的 `PROBE_RESULT`，`A<n>` 不能引用；`REPRODUCED` 的值只能抄自看到过的 probe 输出，不能
+   取自 gold；未打印却等于 gold 的值会被拒并扣 `<final>`；字符串按数据原文书写并加 `SEMANTIC_MATCH`。
+   模板里 `EVIDENCE`、`GENERALITY`、`REPRODUCED` 后加注释，What the harness checks 同步补充。
+
+本节取代 §5.7 第 2 条中「轨迹用 `CALL #n`、`OUTPUT #n`」的说法，并把 §5.7 第 4 条中「还没跑过任何 probe
+就提交 `data` divergence」扩大到所有类型的 `<final>`。「值取自 gold」从结构错误改为实质错误，也修改了
+§5.7 第 4 条对结构错误的列举。
+
+**不在本次范围。** `reasoning_effort` 的调整单独测；被打回后过早放弃（`abandoned_after_reject`、格式预算
+耗尽）先观察是否由 low 推理强度造成，暂不处理；不新增 `<replay>A<n></replay>` 动作。改完后在相同的
+20 个样本上以 low 重跑，对比引用未运行 probe 的次数、「值取自 gold」被拒次数、零探查 `<final>` 被拒次数、
+结构性拒绝次数、接受的规则数与 `stop_reason` 分布。
+
 ---
 
 ## 6. 第二阶段：生成规则

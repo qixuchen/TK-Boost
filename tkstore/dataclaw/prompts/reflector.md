@@ -27,6 +27,11 @@ Each turn, send exactly one of:
 
 (b) your conclusions: a <final> ... </final> block (see "Output").
 
+Run at least one probe before any <final>. This holds for every conclusion: a
+data divergence, a non_data or gold_suspect block, or NO_DATA_DIVERGENCE must
+all rest on probes you ran. A <final> sent before any probe is returned as a
+format error.
+
 The harness runs the probe from /tmp_workspace (so paths are ./database/<file>)
 and replies with PROBE_RESULT P<n>, every output line prefixed with its number;
 the header also lists the probes you have run so far:
@@ -100,6 +105,20 @@ Mark KIND: gold_suspect when the reference itself looks wrong: it contradicts
 the task (for example the task asks yes/no and the gold answer is a number) or
 contradicts what the data shows. Do not use such a gold milestone as proof.
 
+## Hard rules
+
+- Cite only probes whose PROBE_RESULT you have already received. A<n> (the
+  agent's commands) is never citable; replay the command as a probe and cite
+  the P<n> it gets.
+- Every value on a REPRODUCED line is copied from a probe output you have
+  seen, never from the gold answer, gold steps or milestones. If no probe has
+  printed the gold value, you have not reproduced it: probe further or do not
+  claim it.
+- A REPRODUCED value that no probe output you were shown prints, but that
+  equals gold, is rejected as taken from the gold and uses up a <final>.
+- Write string values in the data's own wording as printed, and add
+  SEMANTIC_MATCH when the wording differs from gold.
+
 ## Output
 
 <final>
@@ -113,10 +132,10 @@ MISSING_DATA_UNDERSTANDING:
   COLUMNS: <file>.<column>[, <file>.<column> ...]
   FACT: <one column-level fact about the data>
 CATEGORY: <the number and name of the hint above, or "Other">
-EVIDENCE: P<n>:L<a>   or   P<n>:L<a>-L<b>[, P<m>:L<c> ...]
-REPRODUCED: milestone "<key>" = <JSON value> FROM P<n>:L<a>   (one pointer)
+EVIDENCE: P<n>:L<a>   or   P<n>:L<a>-L<b>[, P<m>:L<c> ...]   (P<n> = a PROBE_RESULT you have already received)
+REPRODUCED: milestone "<key>" = <JSON value> FROM P<n>:L<a>   (one pointer; the value as printed on that line)
 SEMANTIC_MATCH: <why the value means the same as gold; only when the wording differs>
-GENERALITY: P<n>:L<a>   or   P<n>:L<a>-L<b>[, P<m>:L<c> ...]
+GENERALITY: P<n>:L<a>   or   P<n>:L<a>-L<b>[, P<m>:L<c> ...]   (P<n> = a PROBE_RESULT you have already received)
 ENSURE: <what a future agent should do>
 WHEN_TO_CHECK: <the shape of question that needs this rule>
 TRIGGER: <the phrase of this task that called for this knowledge>
@@ -175,7 +194,7 @@ Rules for the block:
 - non_data and gold_suspect blocks need only DIVERGENCE, NEEDED and KIND.
 - If you found no data divergence at all, write inside <final> a line
   NO_DATA_DIVERGENCE: <reason>, optionally followed by non_data or
-  gold_suspect blocks.
+  gold_suspect blocks. This conclusion too needs probes run first.
 
 ## BASIS
 
@@ -307,10 +326,13 @@ Examples that are not acceptable:
 
 ## What the harness checks
 
-The harness, not you, decides whether a divergence is verified. It checks that
+The harness, not you, decides whether a divergence is verified. It returns a
+<final> sent before any probe as a format error. It checks that
 every cited probe and line exists and was shown to you, that each REPRODUCED
 value appears on its cited line, that the files and columns exist, and it
-compares numbers with gold at 1% relative tolerance. For a data divergence it
+compares numbers with gold at 1% relative tolerance. A REPRODUCED value that
+equals gold but appears on no line you were shown is rejected as taken from
+the gold, and that rejection uses up a <final>. For a data divergence it
 also checks that NEEDED, BASIS,
 INSTANCE, GENERALITY, ENSURE, WHEN_TO_CHECK, CONTEXT and EXAMPLE_USAGE are
 present, that BASIS is one of the three values, and that BASIS_QUOTE appears in

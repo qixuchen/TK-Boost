@@ -168,6 +168,18 @@ def test_system_prompt_describes_line_pointers_not_copied_excerpts(loaded):
     assert "format retries" in system
 
 
+def test_system_prompt_states_the_hard_rules_on_sources(loaded):
+    system = build_messages(loaded, CATALOG, ReflectorConfig())[0]["content"]
+    assert "## Hard rules" in system
+    assert system.index("## Hard rules") < system.index("## Output")
+    assert "Run at least one probe before any <final>" in system
+    assert "Cite only probes whose PROBE_RESULT you have already received" in system
+    assert "never from the gold answer, gold steps or milestones" in system
+    assert "uses up a <final>" in system and "data's own wording" in system
+    assert "EVIDENCE: P<n>:L<a>   or   P<n>:L<a>-L<b>[, P<m>:L<c> ...]   (P<n> = a PROBE_RESULT you have" in system
+    assert "<at which agent command (A<n>) the agent did what>" in system
+
+
 def test_system_prompt_no_longer_bans_cell_values_in_the_rule_body(loaded):
     system = build_messages(loaded, CATALOG, ReflectorConfig())[0]["content"]
     assert "contain no\ncell value" not in system and "Any concrete cell value belongs in EXAMPLE_USAGE" not in system
